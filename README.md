@@ -11,3 +11,9 @@ harvenv makes a Claude Code harness configuration a reproducible property of a p
 ## Status
 
 Design phase. The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their trade-offs live in [docs/adr/](./docs/adr/). The implementation plan is the issue tracker — issues are thin vertical slices in dependency order.
+
+The launch recipe those decisions rest on is measured, not assumed — [spike 0001](./docs/spikes/0001-launch-recipe-verification.md) records what current Claude Code actually does, and `node scripts/verify-launch-recipe.ts` re-checks it on demand:
+
+```
+node scripts/verify-launch-recipe.ts   # exits non-zero if a behaviour the recipe needs has changed
+```
