@@ -1,0 +1,6 @@
+.DS_Store
+*.log
+
+# personal overlay + generated environment (once harv exists)
+harvenv.local.toml
+.harv/
