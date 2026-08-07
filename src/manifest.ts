@@ -6,12 +6,21 @@
  * Two of ADR 0004's Sources are readable here: git coordinates (repository,
  * optional ref, optional subdirectory) and local paths, which are allowed but
  * non-portable and flagged as such at Sync. Marketplace plugin pins parse far
- * enough to be rejected by name rather than ignored.
+ * enough to be rejected by name rather than ignored. Alongside the Components
+ * are the two tables that configure the session itself: `[settings]` and
+ * `[mcp]`.
+ *
+ * Parsing stops at shape: what a table has to *be* to be read at all. What its
+ * contents have to *mean* — that a settings key is one a Manifest may bind, that
+ * a server declares a transport Claude Code runs — belongs to the modules that
+ * generate the payloads, next to the measurements those rules come from.
  */
 
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { parse as parseToml, TomlError } from "smol-toml";
+
+import type { McpServerEntry } from "./mcp.ts";
 
 export const MANIFEST_FILENAME = "harvenv.toml";
 
@@ -81,6 +90,8 @@ export interface Manifest {
   skills: SkillEntry[];
   /** The Manifest's settings table, injected via `--settings` at launch. */
   settings: Record<string, unknown>;
+  /** The Manifest's MCP servers, injected via `--mcp-config` at launch. */
+  mcpServers: McpServerEntry[];
 }
 
 /** A Manifest that cannot be understood. Always actionable, always user-facing. */
@@ -109,6 +120,7 @@ export function loadManifest(manifestPath: string): Manifest {
     root,
     skills: parseSkills(raw.skills, root, manifestPath),
     settings: asTable(raw.settings, "settings", manifestPath) ?? {},
+    mcpServers: parseMcpServers(raw.mcp, manifestPath),
   };
 }
 
@@ -219,6 +231,30 @@ function requireString(value: unknown, key: string, where: string, name: string)
     );
   }
   return value;
+}
+
+/**
+ * `[mcp]` entries are named for the same reason skills are: the key becomes the
+ * `mcp__<server>__<tool>` prefix every one of that server's tools carries into
+ * the session, so it is vocabulary a teammate reads and types. The Component
+ * name rule keeps it to one conservative segment.
+ */
+function parseMcpServers(value: unknown, manifestPath: string): McpServerEntry[] {
+  const servers = asTable(value, "mcp", manifestPath);
+  if (!servers) return [];
+
+  return Object.entries(servers).map(([name, definition]) => {
+    const where = `[mcp.${name}] in ${manifestPath}`;
+    if (!isComponentName(name)) {
+      throw new ManifestError(`${where} is not a usable MCP server name: ${COMPONENT_NAME_RULE}.`);
+    }
+    if (!isTable(definition)) {
+      throw new ManifestError(
+        `${where} must be a table of server settings, e.g. [mcp.${name}] with command = "npx"`,
+      );
+    }
+    return { name, definition };
+  });
 }
 
 const isTable = (value: unknown): value is Record<string, unknown> =>

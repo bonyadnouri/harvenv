@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 
 import type { Manifest } from "../src/manifest.ts";
+import type { Env } from "../src/store.ts";
 import { run } from "../src/cli.ts";
 import { MISE_VERSION, MiseError } from "../src/mise.ts";
 import { currentPlatform } from "../src/platform.ts";
@@ -14,12 +15,20 @@ interface Recorded {
   exit: number;
   out: string;
   err: string;
-  launched: Array<{ manifest: Manifest; passthrough: string[] }>;
+  launched: Array<{ manifest: Manifest; passthrough: string[]; env: Env }>;
   mised: string[][];
 }
 
+interface Options {
+  /** What the stand-in `claude` and `mise` exit with. */
+  exitCode?: number;
+  /** Merged onto the Store pointer, for tests about `${VAR}` resolution. */
+  env?: Env;
+  hint?: string | null;
+}
+
 /** One project, one Store, one CLI — reused across the calls of a single test. */
-function harv(cwd: string, exitCode = 0, hint: string | null = null) {
+function harv(cwd: string, options: Options = {}) {
   const store = tempDir();
   const launched: Recorded["launched"] = [];
   const mised: string[][] = [];
@@ -29,22 +38,22 @@ function harv(cwd: string, exitCode = 0, hint: string | null = null) {
     let err = "";
     const exit = await run(argv, {
       cwd: from,
-      env: { HARV_HOME: store },
+      env: { HARV_HOME: store, ...options.env },
       stdout: (line) => {
         out += `${line}\n`;
       },
       stderr: (line) => {
         err += `${line}\n`;
       },
-      launch: async (manifest, passthrough) => {
-        launched.push({ manifest, passthrough });
-        return exitCode;
+      launch: async (manifest, passthrough, env) => {
+        launched.push({ manifest, passthrough, env });
+        return options.exitCode ?? 0;
       },
       runMise: async (args) => {
         mised.push(args);
-        return exitCode;
+        return options.exitCode ?? 0;
       },
-      updateHint: async () => hint,
+      updateHint: async () => options.hint ?? null,
     });
     return { exit, out, err, launched, mised };
   };
@@ -127,7 +136,7 @@ test("harv claude passes extra arguments through to claude", async () => {
 });
 
 test("harv claude adopts claude's exit code", async () => {
-  const cli = harv(project(), 42);
+  const cli = harv(project(), { exitCode: 42 });
   await cli(["sync"]);
 
   assert.equal((await cli(["claude"])).exit, 42);
@@ -183,9 +192,68 @@ test("harv claude rejects unusable settings before writing anything into the pro
   assert.equal(existsSync(join(root, ".claude")), false, "the project tree is untouched when launch cannot succeed");
 });
 
+test("harv claude rejects a personal-ergonomics key, naming the key and the rule", async () => {
+  const root = tempDir();
+  writeFileSync(join(root, "harvenv.toml"), '[settings]\nstatusLine = { type = "command", command = "~/bin/mine" }\n');
+
+  const { exit, err, launched } = await harv(root)(["claude"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /statusLine/, "names the offending key");
+  assert.match(err, /ADR 0005/, "names the rule");
+  assert.match(err, /Overlay/, "says where the setting does belong");
+  assert.deepEqual(launched, []);
+  assert.equal(existsSync(join(root, ".claude")), false, "a rejected Manifest leaves no trace");
+});
+
+test("harv claude rejects an unresolvable ${VAR} before writing anything into the project", async () => {
+  const root = tempDir();
+  writeFileSync(
+    join(root, "harvenv.toml"),
+    '[mcp.tickets]\ncommand = "npx"\nenv = { TOKEN = "${HARVENV_TEST_ABSENT}" }\n',
+  );
+
+  const { exit, err, launched } = await harv(root)(["claude"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /HARVENV_TEST_ABSENT/, "names the variable that is missing");
+  assert.match(err, /mcp\.tickets/, "names the server that referenced it");
+  assert.deepEqual(launched, []);
+  assert.equal(existsSync(join(root, ".claude")), false);
+});
+
+test("harv claude launches when every ${VAR} the Manifest references is set", async () => {
+  const root = tempDir();
+  writeFileSync(
+    join(root, "harvenv.toml"),
+    '[mcp.tickets]\ncommand = "npx"\nenv = { TOKEN = "${HARVENV_TEST_PRESENT}" }\n',
+  );
+
+  const { exit, launched } = await harv(root, { env: { HARVENV_TEST_PRESENT: "s3cret" } })(["claude"]);
+
+  assert.equal(exit, 0);
+  assert.equal(launched[0]?.manifest.mcpServers.length, 1);
+  assert.equal(
+    launched[0]?.env.HARVENV_TEST_PRESENT,
+    "s3cret",
+    "the session inherits the environment the references resolved from",
+  );
+});
+
 // ---------------------------------------------------------------------------
 // harv sync
 // ---------------------------------------------------------------------------
+
+test("harv sync refuses a personal-ergonomics key too, so the rule is not a launch-time afterthought", async () => {
+  const root = project('[settings]\ntheme = "dark"\n');
+
+  const { exit, err } = await harv(root)(["sync"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /theme/);
+  assert.match(err, /ADR 0005/);
+  assert.equal(existsSync(join(root, "harvenv.lock")), false, "a refused Manifest writes no Lockfile");
+});
 
 test("harv sync writes a Lockfile pinning the commit and content hash of a git Source", async () => {
   const repo = gitRepo({ "SKILL.md": skillFile("example") });
@@ -460,7 +528,7 @@ test("harv -v and harv version say the same thing", async () => {
 });
 
 test("the out-of-date hint goes to stderr, so --version stays machine-readable", async () => {
-  const { exit, out, err } = await harv(tempDir(), 0, "A newer harv is available: 9.9.9")(["--version"]);
+  const { exit, out, err } = await harv(tempDir(), { hint: "A newer harv is available: 9.9.9" })(["--version"]);
 
   assert.equal(exit, 0);
   assert.doesNotMatch(out, /newer harv/, "stdout is the answer");
@@ -475,7 +543,7 @@ test("harv --version works outside a harvenv project — it is what a clean mach
 });
 
 test("harv mise passes its arguments to the vendored engine and adopts the exit code", async () => {
-  const { exit, mised } = await harv(tempDir(), 3)(["mise", "ls", "--json"]);
+  const { exit, mised } = await harv(tempDir(), { exitCode: 3 })(["mise", "ls", "--json"]);
 
   assert.equal(exit, 3);
   assert.deepEqual(mised, [["ls", "--json"]]);

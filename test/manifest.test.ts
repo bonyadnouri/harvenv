@@ -194,3 +194,44 @@ test("loadManifest accepts the skill names Claude Code actually uses", () => {
     assert.equal(loadManifest(path).skills[0]?.name, name);
   }
 });
+
+test("loadManifest reads [mcp] server definitions verbatim, references and all", () => {
+  const path = manifestIn(
+    tempDir(),
+    '[mcp.tickets]\ncommand = "npx"\nargs = ["-y", "tickets-mcp"]\nenv = { TOKEN = "${TICKETS_TOKEN}" }\n\n' +
+      '[mcp.docs]\ntype = "http"\nurl = "https://mcp.example.com/mcp"\n',
+  );
+
+  assert.deepEqual(loadManifest(path).mcpServers, [
+    {
+      name: "tickets",
+      definition: { command: "npx", args: ["-y", "tickets-mcp"], env: { TOKEN: "${TICKETS_TOKEN}" } },
+    },
+    { name: "docs", definition: { type: "http", url: "https://mcp.example.com/mcp" } },
+  ]);
+});
+
+test("loadManifest gives a Manifest with no [mcp] section an empty server list", () => {
+  assert.deepEqual(loadManifest(manifestIn(tempDir(), "[settings]\nmodel = \"opus\"\n")).mcpServers, []);
+});
+
+test("loadManifest rejects an MCP server name that could not become a tool prefix", () => {
+  for (const name of ["..", "a/b", "-leading", "with space"]) {
+    const path = manifestIn(tempDir(), `[mcp]\n"${name}" = { command = "npx" }\n`);
+
+    assert.throws(
+      () => loadManifest(path),
+      (err: Error) => err instanceof ManifestError && /name/i.test(err.message),
+      `expected \`${name}\` to be rejected`,
+    );
+  }
+});
+
+test("loadManifest rejects an [mcp] entry that is not a table", () => {
+  const path = manifestIn(tempDir(), '[mcp]\ntickets = "npx tickets-mcp"\n');
+
+  assert.throws(
+    () => loadManifest(path),
+    (err: Error) => err instanceof ManifestError && /table/.test(err.message),
+  );
+});

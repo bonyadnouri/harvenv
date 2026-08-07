@@ -3,21 +3,26 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 
 import type { Manifest } from "../src/manifest.ts";
-import { buildLaunchArgs, generateSettings, SettingsError } from "../src/launch.ts";
+import { buildLaunchArgs } from "../src/launch.ts";
 import { tempDir } from "./helpers.ts";
 
-function manifestWith(settings: Record<string, unknown> = {}): Manifest {
+function manifestWith(overrides: Partial<Manifest> = {}): Manifest {
   const root = tempDir();
-  return { path: join(root, "harvenv.toml"), root, skills: [], settings };
+  return {
+    path: join(root, "harvenv.toml"),
+    root,
+    skills: [],
+    settings: {},
+    mcpServers: [],
+    ...overrides,
+  };
 }
 
-/** The value `--settings` was handed, parsed back. */
-function injectedSettings(args: string[]): unknown {
-  return JSON.parse(args[args.indexOf("--settings") + 1]!);
-}
+/** The value a flag was handed, parsed back. */
+const payload = (args: string[], flag: string): unknown => JSON.parse(args[args.indexOf(flag) + 1]!);
 
 test("buildLaunchArgs composes the ADR 0003 recipe", () => {
-  const args = buildLaunchArgs(manifestWith(), []);
+  const args = buildLaunchArgs(manifestWith(), [], {});
 
   assert.deepEqual(args, [
     "--setting-sources",
@@ -31,42 +36,57 @@ test("buildLaunchArgs composes the ADR 0003 recipe", () => {
 });
 
 test("buildLaunchArgs injects the Manifest's settings so they outrank both settings files", () => {
-  const args = buildLaunchArgs(manifestWith({ model: "opus", permissions: { defaultMode: "plan" } }), []);
+  const settings = { model: "opus", permissions: { defaultMode: "plan" } };
 
-  assert.deepEqual(injectedSettings(args), { model: "opus", permissions: { defaultMode: "plan" } });
+  const args = buildLaunchArgs(manifestWith({ settings }), [], {});
+
+  assert.deepEqual(payload(args, "--settings"), settings);
+});
+
+test("buildLaunchArgs injects the Manifest's MCP servers under strict mode", () => {
+  const manifest = manifestWith({
+    mcpServers: [{ name: "tickets", definition: { command: "npx", args: ["-y", "tickets-mcp"] } }],
+  });
+
+  const args = buildLaunchArgs(manifest, [], {});
+
+  assert.equal(args.includes("--strict-mcp-config"), true, "only Manifest servers exist in the session");
+  assert.deepEqual(payload(args, "--mcp-config"), {
+    mcpServers: { tickets: { command: "npx", args: ["-y", "tickets-mcp"] } },
+  });
+});
+
+test("buildLaunchArgs resolves ${VAR} from the environment it is handed", () => {
+  const manifest = manifestWith({
+    mcpServers: [{ name: "tickets", definition: { command: "npx", env: { TOKEN: "${TICKETS_TOKEN}" } } }],
+  });
+
+  const args = buildLaunchArgs(manifest, [], { TICKETS_TOKEN: "s3cret" });
+
+  assert.deepEqual(payload(args, "--mcp-config"), {
+    mcpServers: { tickets: { command: "npx", env: { TOKEN: "s3cret" } } },
+  });
+});
+
+test("buildLaunchArgs leaves the Manifest's own definition unresolved, so nothing can persist a secret", () => {
+  const definition = { command: "npx", env: { TOKEN: "${TICKETS_TOKEN}" } };
+  const manifest = manifestWith({ mcpServers: [{ name: "tickets", definition }] });
+
+  buildLaunchArgs(manifest, [], { TICKETS_TOKEN: "s3cret" });
+
+  assert.deepEqual(definition, { command: "npx", env: { TOKEN: "${TICKETS_TOKEN}" } });
 });
 
 test("buildLaunchArgs appends extra arguments after the recipe, unchanged", () => {
-  const args = buildLaunchArgs(manifestWith(), ["-p", "hi", "--resume", "--", "--settings", "nope"]);
+  const args = buildLaunchArgs(manifestWith(), ["-p", "hi", "--resume", "--", "--settings", "nope"], {});
 
   assert.deepEqual(args.slice(-6), ["-p", "hi", "--resume", "--", "--settings", "nope"]);
 });
 
 test("buildLaunchArgs never serves skills through --plugin-dir", () => {
-  const manifest = manifestWith();
-  manifest.skills = [
-    { name: "example-skill", source: { kind: "git", repo: "https://example.com/s.git" } },
-  ];
+  const manifest = manifestWith({
+    skills: [{ name: "example-skill", source: { kind: "git", repo: "https://example.com/s.git" } }],
+  });
 
-  assert.equal(buildLaunchArgs(manifest, []).includes("--plugin-dir"), false);
-});
-
-test("generateSettings emits an empty object when the Manifest sets nothing", () => {
-  assert.equal(generateSettings({}), "{}");
-});
-
-test("generateSettings rejects a permission mode the settings schema silently discards", () => {
-  assert.throws(
-    () => generateSettings({ permissions: { defaultMode: "manual" } }),
-    (err: Error) => err instanceof SettingsError && /manual/.test(err.message),
-  );
-});
-
-test("generateSettings accepts every permission mode a settings file honours", () => {
-  for (const mode of ["default", "acceptEdits", "plan", "auto", "dontAsk", "bypassPermissions"]) {
-    assert.equal(
-      JSON.parse(generateSettings({ permissions: { defaultMode: mode } })).permissions.defaultMode,
-      mode,
-    );
-  }
+  assert.equal(buildLaunchArgs(manifest, [], {}).includes("--plugin-dir"), false);
 });
