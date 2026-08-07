@@ -24,7 +24,7 @@ harv --version           # which harv, which mise, and whether you are behind
 
 ## Status
 
-Skills work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it. Settings and MCP servers are declared and binding. No Overlay, Toolchain or Doctor yet, and the remaining Components — agents, commands, plugin pins — are still ahead. mise ships inside harv but nothing drives it yet; `harv mise` reaches it for diagnosis.
+Skills work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding. No Overlay, Toolchain or Doctor yet, and the remaining Components — agents, commands, plugin pins — are still ahead. mise ships inside harv but nothing drives it yet; `harv mise` reaches it for diagnosis.
 
 The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their trade-offs live in [docs/adr/](./docs/adr/). The implementation plan is the issue tracker — issues are thin vertical slices in dependency order.
 
@@ -110,6 +110,22 @@ A Source declared by `path` is allowed and stays live — it is materialized str
 
 Materialized skills are harv's to manage: it records what it wrote, removes only what it recorded, and refuses to touch a `.claude/skills/` entry it did not create. `harv init` is what gitignores them.
 
+## Intercepting a bare `claude`
+
+Isolation is a launch recipe, so it applies only to sessions harv starts — type `claude` in a harvenv project and you get an un-isolated session that looks exactly like an isolated one ([ADR 0003](./docs/adr/0003-isolation-via-launch-flags.md)). The optional Shim closes that gap:
+
+```
+harv shim install        # puts a `claude` lookalike first on PATH
+harv shim status         # what `claude` resolves to, and what sits behind it
+harv shim uninstall      # takes it back off, PATH entry included
+```
+
+With it installed, `claude` inside a harvenv project is the session the Manifest describes, and `claude` anywhere else is Claude Code exactly as before — same arguments, same binary. It is never installed by default, and it never becomes a way to lose the tool it intercepts: the real claude is resolved from PATH at every invocation, so an upgrade that replaces or moves the binary needs no reinstall, and a harv that has gone missing costs you isolation — announced on stderr — rather than the session ([ADR 0011](./docs/adr/0011-shim-is-a-generated-shell-script-that-fails-open.md)).
+
+`HARV_NO_SHIM=1 claude` bypasses it, so [ADR 0005](./docs/adr/0005-manifest-settings-are-binding.md)'s visible escape hatch does not close when interception is on.
+
+Install writes the shim to `$HARV_HOME/bin` (`~/.harv/bin` by default) and adds one marked block to your shell's startup file — zsh, bash, fish or sh. `--shell none` writes the shim and leaves your dotfiles alone, if you would rather put the directory on PATH yourself. Uninstall removes exactly that block and refuses to delete a `claude` harv has no record of creating.
+
 ## Hacking on it
 
 Running from source needs Node ≥ 22.18 or Bun, `git` on PATH, and the repo's dependencies:
@@ -178,7 +194,14 @@ The sixth builds a binary and checks what shipping it promises: that it runs wit
 bun scripts/verify-packaging.ts          # add --all to build every platform
 ```
 
-All six take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store or `~/.claude`. The unit tests are separate and need no `claude` binary:
+The last does the second's job for the Shim: it installs one into a scratch `HARV_HOME`, types `claude` into a real shell inside and outside a harvenv project, and compares the resulting sessions against an unshimmed control. Its own last check re-reads the machine's dotfiles and `claude` and asserts the run left them exactly as it found them:
+
+```
+node scripts/verify-shim.ts              # exits non-zero if interception, uninstall or
+                                         # pass-through has stopped holding
+```
+
+All seven take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your `~/.claude`, or your shell's startup files. The unit tests are separate and need no `claude` binary:
 
 ```
 npm test

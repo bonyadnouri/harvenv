@@ -15,6 +15,7 @@
     "verify:sync": "node scripts/verify-sync-store.ts",
     "verify:settings": "node scripts/verify-manifest-settings.ts",
     "verify:tripwire": "node scripts/verify-tripwire.ts",
+    "verify:shim": "node scripts/verify-shim.ts",
     "verify:packaging": "bun scripts/verify-packaging.ts",
     "vendor:mise": "bun scripts/vendor-mise.ts",
     "build": "bun scripts/build.ts"

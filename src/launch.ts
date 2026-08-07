@@ -28,8 +28,14 @@ import { spawn } from "node:child_process";
 
 import { generateMcpConfig } from "./mcp.ts";
 import { generateSettings } from "./settings.ts";
+import { resolveRealClaude } from "./shim.ts";
 import { LAUNCHER_ENV } from "./tripwire.ts";
 import type { Manifest } from "./manifest.ts";
+
+/** A session that cannot be started at all — as opposed to one that fails. */
+export class LaunchError extends Error {
+  override name = "LaunchError";
+}
 
 /**
  * The full argv for `claude`, with the caller's own arguments left untouched.
@@ -68,6 +74,26 @@ export function launchEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Process
 }
 
 /**
+ * Claude Code itself, never a harv shim.
+ *
+ * With the Shim installed, `claude` on PATH *is* harv — and the shim's job
+ * inside a harvenv project is to run `harv claude`. Spawning by bare name here
+ * would hand the session straight back to the shim, forever. So the launcher
+ * resolves the same way the shim does, past every shim directory, and spawns
+ * the absolute path it finds. Without a shim installed this resolves to exactly
+ * what a bare `claude` would have run.
+ */
+export function claudeBinary(pathString: string): string {
+  const real = resolveRealClaude(pathString);
+  if (real === null) {
+    throw new LaunchError(
+      "claude was not found on PATH. Install Claude Code, or add it to PATH, and try again.",
+    );
+  }
+  return real;
+}
+
+/**
  * Hand the terminal to Claude Code and adopt its exit code. The session runs
  * from the project root so that project scope — and with it every materialized
  * Component — is the one the Manifest describes, even when harv was invoked
@@ -82,9 +108,12 @@ export function launch(
   // session still see the same environment — the marker is the only thing
   // either of them has that the launching shell did not.
   const sessionEnv = launchEnv(env);
+  // Resolved from the same environment the session will run in, so the binary
+  // harv starts is the one that PATH names — not the one harv's own happens to.
+  const binary = claudeBinary(sessionEnv.PATH ?? "");
 
   return new Promise((resolveExit, reject) => {
-    const child = spawn("claude", buildLaunchArgs(manifest, passthrough, sessionEnv), {
+    const child = spawn(binary, buildLaunchArgs(manifest, passthrough, sessionEnv), {
       cwd: manifest.root,
       env: sessionEnv,
       stdio: "inherit",

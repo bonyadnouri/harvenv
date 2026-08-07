@@ -1,11 +1,13 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { Manifest } from "../src/manifest.ts";
-import { buildLaunchArgs, launchEnv } from "../src/launch.ts";
+import { buildLaunchArgs, claudeBinary, LaunchError, launchEnv } from "../src/launch.ts";
+import { SHIM_RECORD_FILE } from "../src/shim.ts";
 import { LAUNCHER_ENV } from "../src/tripwire.ts";
-import { tempDir } from "./helpers.ts";
+import { fakeExecutable, tempDir } from "./helpers.ts";
 
 function manifestWith(overrides: Partial<Manifest> = {}): Manifest {
   const root = tempDir();
@@ -109,4 +111,28 @@ test("launchEnv redirects nothing about where Claude Code finds its configuratio
   const injected = Object.keys(launchEnv({ PATH: "/usr/bin" })).filter((key) => key !== "PATH");
 
   assert.deepEqual(injected, [LAUNCHER_ENV]);
+});
+
+test("claudeBinary spawns Claude Code itself, never the shim that invoked harv", () => {
+  const shimDir = tempDir();
+  fakeExecutable(shimDir, "claude", "shim");
+  writeFileSync(join(shimDir, SHIM_RECORD_FILE), '{"version":1,"kind":"harv-shim","entries":["claude"]}\n');
+  const realDir = tempDir();
+  fakeExecutable(realDir, "claude", "real");
+
+  assert.equal(claudeBinary(`${shimDir}:${realDir}`), join(realDir, "claude"));
+});
+
+test("claudeBinary resolves a plain PATH to what a bare `claude` would have run", () => {
+  const dir = tempDir();
+  fakeExecutable(dir, "claude", "real");
+
+  assert.equal(claudeBinary(dir), join(dir, "claude"));
+});
+
+test("claudeBinary says claude is missing rather than failing inside spawn", () => {
+  assert.throws(
+    () => claudeBinary(tempDir()),
+    (err: Error) => err instanceof LaunchError && /not found on PATH/.test(err.message),
+  );
 });
