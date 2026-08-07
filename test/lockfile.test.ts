@@ -117,7 +117,7 @@ test("readLockfile rejects a content hash that is not one", () => {
   const root = tempDir();
   writeFileSync(
     lockfilePath(root),
-    `version = 2\n\n[[skills]]\nname = "example"\nsource = "git"\ngit = "https://example.com/s.git"\ncommit = "${COMMIT}"\nhash = "sha256:../../etc"\n`,
+    `version = 3\n\n[[skills]]\nname = "example"\nsource = "git"\ngit = "https://example.com/s.git"\ncommit = "${COMMIT}"\nhash = "sha256:../../etc"\n`,
   );
 
   assert.throws(
@@ -130,7 +130,7 @@ test("readLockfile rejects a locked name that would escape the skills directory"
   const root = tempDir();
   writeFileSync(
     lockfilePath(root),
-    `version = 2\n\n[[skills]]\nname = "../agents"\nsource = "git"\ngit = "https://example.com/s.git"\ncommit = "${COMMIT}"\nhash = "${HASH}"\n`,
+    `version = 3\n\n[[skills]]\nname = "../agents"\nsource = "git"\ngit = "https://example.com/s.git"\ncommit = "${COMMIT}"\nhash = "${HASH}"\n`,
   );
 
   assert.throws(
@@ -143,7 +143,7 @@ test("readLockfile rejects a git entry with no commit to reproduce", () => {
   const root = tempDir();
   writeFileSync(
     lockfilePath(root),
-    `version = 2\n\n[[skills]]\nname = "example"\nsource = "git"\ngit = "https://example.com/s.git"\nhash = "${HASH}"\n`,
+    `version = 3\n\n[[skills]]\nname = "example"\nsource = "git"\ngit = "https://example.com/s.git"\nhash = "${HASH}"\n`,
   );
 
   assert.throws(
@@ -192,7 +192,7 @@ test("a Lockfile that pins plugins is not readable by a harv that predates them"
   const root = tempDir();
   writeLockfile(root, [], [pluginLock("superpowers")]);
 
-  assert.match(readFileSync(lockfilePath(root), "utf8"), /^version = 2$/m);
+  assert.match(readFileSync(lockfilePath(root), "utf8"), /^version = 3$/m);
 });
 
 test("readLockfile still reads a Lockfile written before plugins existed", () => {
@@ -225,7 +225,7 @@ test("readLockfile rejects a plugin pinned without a commit", () => {
   const root = tempDir();
   writeFileSync(
     lockfilePath(root),
-    `version = 2\n\n[[plugins]]\nname = "superpowers"\nmarketplace = "https://example.com/m.git"\nhash = "${HASH}"\n`,
+    `version = 3\n\n[[plugins]]\nname = "superpowers"\nmarketplace = "https://example.com/m.git"\nhash = "${HASH}"\n`,
   );
 
   assert.throws(
@@ -238,7 +238,7 @@ test("readLockfile rejects a plugin name that would escape the plugins directory
   const root = tempDir();
   writeFileSync(
     lockfilePath(root),
-    `version = 2\n\n[[plugins]]\nname = "../skills"\nmarketplace = "https://example.com/m.git"\ncommit = "${COMMIT}"\nhash = "${HASH}"\n`,
+    `version = 3\n\n[[plugins]]\nname = "../skills"\nmarketplace = "https://example.com/m.git"\ncommit = "${COMMIT}"\nhash = "${HASH}"\n`,
   );
 
   assert.throws(
@@ -251,7 +251,7 @@ test("readLockfile rejects a plugin hash that is not a content hash", () => {
   const root = tempDir();
   writeFileSync(
     lockfilePath(root),
-    `version = 2\n\n[[plugins]]\nname = "superpowers"\nmarketplace = "https://example.com/m.git"\ncommit = "${COMMIT}"\nhash = "sha256:../../etc"\n`,
+    `version = 3\n\n[[plugins]]\nname = "superpowers"\nmarketplace = "https://example.com/m.git"\ncommit = "${COMMIT}"\nhash = "sha256:../../etc"\n`,
   );
 
   assert.throws(
@@ -403,6 +403,18 @@ test("writeLockfile then readLockfile round-trips a pinned tool with its bin pat
   assert.deepEqual(readLockfile(root)?.tools, [pinnedTool()]);
 });
 
+test("a Lockfile carrying tool pins is a version an older harv refuses to read", () => {
+  const root = tempDir();
+  writeLockfile(root, [], [], [pinnedTool()]);
+
+  // The whole point of the number. A harv from before the Toolchain reads up to
+  // version 2, so it would parse this file, ignore `[[tools]]`, and let the next
+  // Sync rewrite it without the team's pinned versions in it. Refusing is what
+  // the header promises, and it only works if the number moved.
+  const written = Number(/^version = (\d+)$/m.exec(readFileSync(lockfilePath(root), "utf8"))?.[1]);
+  assert.ok(written > 2, `a Lockfile with [[tools]] is version ${written}, which a pre-Toolchain harv would read`);
+});
+
 test("a Lockfile records an unscopeable requirement as a hint rather than dropping it", () => {
   const root = tempDir();
   writeLockfile(root, [], [], [{ tool: "obscurity", spec: "1", hint: "no scoped installer for obscurity" }]);
@@ -468,7 +480,7 @@ test("a locked tool version that is not a plain version is refused before it bec
   const root = tempDir();
   writeFileSync(
     lockfilePath(root),
-    `version = 1\nskills = []\n\n[[tools]]\nname = "node"\nspec = "22"\nversion = "../../etc"\nbins = ["installs/node/x/bin"]\n`,
+    `version = 3\nskills = []\n\n[[tools]]\nname = "node"\nspec = "22"\nversion = "../../etc"\nbins = ["installs/node/x/bin"]\n`,
   );
 
   assert.throws(readLockfile.bind(null, root), LockfileError);
