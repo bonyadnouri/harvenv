@@ -38,7 +38,7 @@ export const LOCKFILE_FILENAME = "harvenv.lock";
  * asymmetry is deliberate: refusing to read a *newer* file is that protection,
  * while refusing an older one would only make upgrading harv cost a re-fetch.
  */
-const LOCK_VERSION = 2;
+const LOCK_VERSION = 3;
 
 const HASH = /^sha256:[0-9a-f]{64}$/;
 const COMMIT = /^[0-9a-f]{40}$/;

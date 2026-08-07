@@ -624,7 +624,7 @@ function checkUnscopeableHint(fx: Fixtures): Check {
           /harvenv-no-such-tool-a/.test(lock) &&
           /harvenv-no-such-tool-b/.test(lock) &&
           // A pinned tool writes `version = "1.2.3"`; the Lockfile's own format
-          // number is `version = 1`, unquoted, so this catches only real pins.
+          // number is unquoted (`version = 3`), so this catches only real pins.
           !/version = "/.test(lock),
         `${(lock.match(/hint = /g) ?? []).length} hints recorded, no version pinned for either`,
       ),

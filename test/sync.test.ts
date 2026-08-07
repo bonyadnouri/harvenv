@@ -672,7 +672,7 @@ test("a second machine converges on the locked version, not on what the spec res
   // exact version that is not the one a fresh resolve would return.
   writeFileSync(
     join(manifest.root, "harvenv.lock"),
-    `version = 1\nskills = []\n\n[[tools]]\nname = "node"\nspec = "22"\nversion = "22.18.0"\nbins = ["installs/node/22.18.0/bin"]\n`,
+    `version = 3\nskills = []\n\n[[tools]]\nname = "node"\nspec = "22"\nversion = "22.18.0"\nbins = ["installs/node/22.18.0/bin"]\n`,
   );
 
   const engine = fakeEngine(env);
@@ -758,7 +758,7 @@ test("a clone with no engine and an empty Store still launches, keeping its pin"
   const manifest = project(`[tools]\nnode = "22"\n`);
   writeFileSync(
     join(manifest.root, "harvenv.lock"),
-    `version = 1\nskills = []\nplugins = []\n\n[[tools]]\nname = "node"\nspec = "22"\n` +
+    `version = 3\nskills = []\nplugins = []\n\n[[tools]]\nname = "node"\nspec = "22"\n` +
       `version = "22.18.0"\nbins = ["installs/node/22.18.0/bin"]\n`,
   );
 
@@ -774,7 +774,7 @@ test("a clone onto a machine with no engine leaves the committed tool pin intact
   const env = home();
   const manifest = project(`[tools]\nnode = "22"\n`);
   const committed =
-    `version = 1\nskills = []\n\n[[tools]]\nname = "node"\nspec = "22"\nversion = "22.18.0"\n` +
+    `version = 3\nskills = []\n\n[[tools]]\nname = "node"\nspec = "22"\nversion = "22.18.0"\n` +
     `bins = ["installs/node/22.18.0/bin"]\n`;
   writeFileSync(join(manifest.root, "harvenv.lock"), committed);
 

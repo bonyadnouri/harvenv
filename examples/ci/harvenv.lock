@@ -2,7 +2,7 @@
 # teammate's Harvenv identical to yours. Change Sources in harvenv.toml and
 # re-run `harv sync` rather than editing this file.
 
-version = 2
+version = 3
 plugins = []
 
 [[skills]]
