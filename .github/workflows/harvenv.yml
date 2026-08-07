@@ -5,7 +5,9 @@
 # in examples/ci/, but nothing in it is specific to that project or to this
 # repository except two clearly-marked steps: installing harv, and standing in
 # for `claude` because this repository's CI has no credentials. Replace those
-# two and the rest is the recipe for any harvenv project.
+# two and the rest is the recipe for any harvenv project — including the
+# `harv doctor` gate, which on a runner with a key measures ADR 0003's launch
+# recipe against the Claude Code it just installed.
 #
 # The reasoning behind each step — auth, Store caching, what a run without
 # credentials can and cannot prove — is in docs/ci.md.
@@ -99,20 +101,6 @@ jobs:
       - name: the committed Lockfile is what a clean machine produces
         run: git diff --exit-code -- examples/ci/harvenv.lock
 
-      # TODO(#9): the Doctor gate belongs here, once `harv doctor` exists.
-      #
-      #   - name: the Harvenv is runnable
-      #     working-directory: examples/ci
-      #     run: harv doctor --json
-      #
-      # It is what turns the steps below from "a session started" into "a
-      # session could have worked": pending MCP auth, tools that could not be
-      # scoped, and the one CI needs most — the Claude Code version smoke test
-      # ADR 0003 requires, because the flag behaviours the whole recipe rests
-      # on are observed rather than documented and can retire on any release.
-      # Until then, `verify-launch-recipe.ts` in the `session` job below covers
-      # that last part, and only when credentials are available.
-
       - name: install Claude Code
         if: env.ANTHROPIC_API_KEY != ''
         run: npm install --global @anthropic-ai/claude-code
@@ -133,6 +121,35 @@ jobs:
           echo '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
           STANDIN
           chmod +x "$HOME/.local/bin/claude"
+
+      # The gate that turns the step below from "a session started" into "a
+      # session could have worked": Manifest/Lockfile drift, Components and
+      # tools that are not on this runner, MCP servers waiting on first-time
+      # auth, the Tripwire — and the one CI needs most, the Claude Code version
+      # smoke test ADR 0003 asks for, because the flag behaviours the whole
+      # recipe rests on are observed rather than documented and can retire on
+      # any release.
+      #
+      # It runs after `claude` is on PATH rather than straight after the sync,
+      # because the smoke test is a real session: Doctor has to be able to find
+      # a binary before it can measure one. With a key set, that binary is
+      # Claude Code and the recipe is genuinely re-measured here. Without one it
+      # is the stand-in below, which answers no init event — so Doctor reports
+      # the recipe as unverified, says why, and still exits 0. That is the
+      # design: an honest "I could not check this" must not fail a build.
+      - name: the Harvenv is runnable
+        working-directory: examples/ci
+        run: |
+          set -euo pipefail
+          harv doctor --json --no-overlay | tee "$RUNNER_TEMP/doctor.json"
+          # The parts of the report a gate should assert on, rather than the
+          # whole of it: nothing is a problem, every check reported, and the
+          # Claude Code the run measured against named in the log.
+          jq -e '.ok == true' "$RUNNER_TEMP/doctor.json" > /dev/null
+          jq -e '[.checks[].id] == ["claude-code","settings","drift","components","toolchain","mcp","tripwire"]' \
+            "$RUNNER_TEMP/doctor.json" > /dev/null
+          jq -r '"Claude Code \(.claudeCode.version // "not reported") — launch recipe: \(.checks[0].summary)"' \
+            "$RUNNER_TEMP/doctor.json"
 
       # The headless run. `harv claude` passes everything after it through
       # untouched, so this is an ordinary `claude -p`, and harv adopts its exit

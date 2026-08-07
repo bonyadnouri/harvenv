@@ -35,7 +35,7 @@ The system tools (CLIs, SDKs, runtimes) a Harvenv's skills depend on — install
 _Avoid_: system dependencies, prerequisites
 
 **Doctor**:
-The diagnosis command that verifies a synced Harvenv is actually runnable: pending MCP auth, missing unscopeable tools, and Claude Code version compatibility.
+The diagnosis command that verifies a synced Harvenv is actually runnable: pending MCP auth, missing unscopeable tools, Manifest/Lockfile drift, Tripwire presence, and Claude Code version compatibility — the last measured by re-running ADR 0003's launch recipe against the installed version rather than by comparing a number. Reports every check rather than stopping at the first, and distinguishes a problem from a question it could not answer here (ADR 0014).
 _Avoid_: healthcheck, validate
 
 **Source**:

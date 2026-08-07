@@ -19,6 +19,8 @@
 import { readFileSync, writeFileSync } from "node:fs";
 
 import { AddError, entryLine, parseCoordinate, tableFor, validateName, withEntry } from "./add.ts";
+import { diagnose } from "./doctor.ts";
+import type { Finding, Report } from "./doctor.ts";
 import { driftAgainst, driftOver, LOCKFILE_FILENAME, LockfileError, toolDrift } from "./lockfile.ts";
 import type { DriftEntry } from "./lockfile.ts";
 import { findManifest, loadManifest, ManifestError, MANIFEST_FILENAME } from "./manifest.ts";
@@ -54,6 +56,8 @@ import {
 } from "./shim.ts";
 import { TripwireError } from "./tripwire.ts";
 import { MarketplaceError } from "./marketplace.ts";
+import { probeSession } from "./recipe.ts";
+import type { ProbeFn } from "./recipe.ts";
 import { plan, readLocks, sync, SyncError, toolPaths } from "./sync.ts";
 import { requirements, ToolchainError } from "./tools.ts";
 import type { Env } from "./store.ts";
@@ -83,6 +87,12 @@ export interface CliDeps {
    * rather than by a person.
    */
   ask: (question: string) => Promise<string>;
+  /**
+   * Doctor's window onto a real Claude Code session. Injected for the same
+   * reason `launch` is: no test should have to start one, and no test should
+   * be able to.
+   */
+  probe: ProbeFn;
 }
 
 const USAGE = `Usage: harv <command> [args...]
@@ -113,6 +123,14 @@ Commands:
                      project's Harvenv, with its pinned tools in front of PATH.
                      Arguments after \`claude\` are passed through unchanged
                      (harv claude -p "hi", --resume, ...).
+  doctor             Diagnose whether this synced Harvenv is actually runnable:
+                     the launch recipe against the installed Claude Code,
+                     Manifest/Lockfile drift, Components and tools that are not
+                     on this machine, MCP servers waiting on first-time auth,
+                     and the Tripwire. Exits non-zero on any problem.
+       [--json]          A stable report for CI, on stdout.
+       [--no-session]    Do not start Claude Code to measure with.
+       [--no-overlay]    Diagnose the Manifest alone — what CI would see.
   shim install       Route a bare \`claude\` through harv: hermetic inside a
                      harvenv project, the real claude everywhere else.
        [--shell <name>]  zsh, bash, fish, sh — or \`none\` to edit no startup file.
@@ -128,6 +146,9 @@ Options:
   --help, -h         Print this.
 
 harv reads ${MANIFEST_FILENAME} from the current directory or the nearest ancestor.`;
+
+/** Two columns, so a report reads as a table rather than as prose. */
+const field = (label: string, value: string): string => `  ${label.padEnd(16)}${value}`;
 
 /** Errors whose message is written for the user, not for a debugger. */
 const EXPECTED_ERRORS = [
@@ -160,6 +181,7 @@ export function defaultDeps(): CliDeps {
     updateHint: () => updateHint(defaultUpdateCheckDeps()).catch(() => null),
     shim: defaultShimContext(),
     ask: askOnStdin,
+    probe: probeSession,
   };
 }
 
@@ -204,6 +226,7 @@ async function dispatch(argv: string[], deps: CliDeps): Promise<number> {
   const commands: Record<string, (args: string[], deps: CliDeps) => Promise<number> | number> = {
     init,
     claude,
+    doctor,
     sync: syncCommand,
     add,
     shim,
@@ -358,6 +381,106 @@ const driftReport = (drift: DriftEntry[], what: string, lockfile: string): strin
     : `harv: ${what} and ${lockfile} have drifted, so this session would not be the Harvenv ${what} ` +
       `describes.\n${drift.map((entry) => `  ${entry.name}: ${entry.reason}`).join("\n")}\n` +
       `  Run \`harv sync\` to reconcile them.`;
+
+// ---------------------------------------------------------------------------
+// doctor
+// ---------------------------------------------------------------------------
+
+const DOCTOR_USAGE = `Usage: harv doctor [--json] [--no-session] [--no-overlay]
+
+  --json         Print the report as JSON on stdout, for CI.
+  --no-session   Do not start Claude Code sessions to measure with. Faster, and
+                 the right flag on a machine with no credentials — but the
+                 launch-recipe smoke test and MCP connection status are then
+                 reported as unverified rather than checked.
+  --no-overlay   Diagnose the Manifest alone, leaving your Overlay out.`;
+
+/**
+ * Exit 1 on a problem, 0 otherwise — and *only* on a problem. A check that
+ * could not be performed here reports itself as unverified and passes, because
+ * an honest "I could not measure this" that failed a build would teach a team
+ * to stop running Doctor, which costs more than the check was worth.
+ */
+async function doctor(args: string[], deps: CliDeps): Promise<number> {
+  const { overlay, rest } = takeOverlayFlag(args);
+  const flags = new Set(rest);
+  const unknown = rest.filter((arg) => arg !== "--json" && arg !== "--no-session");
+  if (unknown.length > 0) {
+    deps.stderr(`harv: \`doctor\` does not take \`${unknown.join(" ")}\`.\n`);
+    deps.stderr(DOCTOR_USAGE);
+    return 2;
+  }
+
+  const manifest = requireManifest(deps);
+  if (manifest === null) return 1;
+
+  const report = await diagnose({
+    manifest,
+    env: deps.env,
+    overlay,
+    session: !flags.has("--no-session"),
+    probe: deps.probe,
+  });
+
+  if (flags.has("--json")) deps.stdout(JSON.stringify(report, null, 2));
+  else reportDoctor(report, deps);
+
+  return report.ok ? 0 : 1;
+}
+
+/** `[ok]`, `[problem]`, `[unknown]` — one column, so the report scans. */
+const STATUS_WIDTH = 10;
+
+/** A finding's mark. Distinct glyphs, so a paste into a bug report survives. */
+const MARK: Record<Finding["level"], string> = { problem: "x", unknown: "?", note: "-" };
+
+function reportDoctor(report: Report, deps: CliDeps): void {
+  deps.stdout(`harv doctor`);
+  deps.stdout(field("project", report.project.root));
+  deps.stdout(field("harv", `${report.harv.version} (${report.harv.platform})`));
+  deps.stdout(
+    field(
+      "Claude Code",
+      report.claudeCode.path === null
+        ? "not found on PATH"
+        : `${report.claudeCode.version ?? "unreadable version"} at ${report.claudeCode.path}` +
+          (report.claudeCode.verified ? "  (a version harv has verified the launch recipe against)" : ""),
+    ),
+  );
+  deps.stdout("");
+
+  const column = Math.max(...report.checks.map((check) => check.id.length));
+  for (const check of report.checks) {
+    deps.stdout(`${`[${check.status}]`.padEnd(STATUS_WIDTH)}${check.id.padEnd(column)}   ${check.summary}`);
+    for (const finding of check.findings) {
+      deps.stdout(`${" ".repeat(STATUS_WIDTH)}  ${MARK[finding.level]} ${finding.message}`);
+      if (finding.hint !== undefined) deps.stdout(`${" ".repeat(STATUS_WIDTH)}    ${finding.hint}`);
+    }
+  }
+
+  deps.stdout("");
+  deps.stdout(closing(report));
+}
+
+function closing(report: Report): string {
+  const unverified =
+    report.counts.unknown === 0
+      ? ""
+      : ` ${count(report.counts.unknown, "check")} could not be verified on this machine.`;
+
+  if (report.ok) {
+    return (
+      `Nothing to fix: \`harv claude\` here starts the Harvenv ${MANIFEST_FILENAME} describes.` + unverified
+    );
+  }
+  return (
+    `${count(report.counts.problem, "check")} found a problem — see the lines marked \`x\` above.` +
+    unverified +
+    `\nFix them and re-run \`harv doctor\`.`
+  );
+}
+
+const count = (n: number, noun: string): string => `${n} ${noun}${n === 1 ? "" : "s"}`;
 
 // ---------------------------------------------------------------------------
 // sync
@@ -569,9 +692,6 @@ const SHIM_USAGE = `Usage: harv shim <install|uninstall|status>
   install [--shell zsh|bash|fish|sh|none]   Put a \`claude\` lookalike on PATH.
   uninstall                                 Take it back off, and the PATH entry with it.
   status [--json]                           Report what a bare \`claude\` currently runs.`;
-
-/** Two columns, so a report reads as a table rather than as prose. */
-const field = (label: string, value: string): string => `  ${label.padEnd(16)}${value}`;
 
 function shim(args: string[], deps: CliDeps): number {
   const [action, ...flags] = args;

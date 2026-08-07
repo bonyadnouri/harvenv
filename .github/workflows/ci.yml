@@ -39,6 +39,15 @@ jobs:
       - name: the Store's own guarantees
         run: node scripts/verify-sync-store.ts
 
+      # The other one that needs no `claude`: Doctor's own acceptance criteria.
+      # Two of its failure classes are facts about a session — a launch recipe
+      # that regressed, a server waiting on auth — so it scripts them with a
+      # stand-in `claude` that emits the init event it is told to. A regression
+      # nobody can produce on demand becomes a fixture, and "Doctor would catch
+      # it" stops being a claim.
+      - name: harv doctor catches what it says it catches
+        run: node scripts/verify-doctor.ts
+
       # install.sh is piped into a shell on machines that have nothing else.
       - name: shellcheck install.sh
         run: shellcheck install.sh
