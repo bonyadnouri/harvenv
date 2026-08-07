@@ -10,3 +10,8 @@ vendor/mise/
 # personal overlay + generated environment (once harv exists)
 harvenv.local.toml
 .harv/
+
+# written by `harv sync` into any project below here — generated, not authored.
+# `harvenv.lock` is the opposite: it is committed.
+.claude/skills/
+.claude/.harv-materialized.json
