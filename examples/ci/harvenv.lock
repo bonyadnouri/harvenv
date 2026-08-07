@@ -1,0 +1,24 @@
+# harvenv.lock — written by `harv sync`. Commit it: it is what makes a
+# teammate's Harvenv identical to yours. Change Sources in harvenv.toml and
+# re-run `harv sync` rather than editing this file.
+
+version = 1
+
+[[skills]]
+name = "harvenv-ci-demo"
+source = "git"
+git = "https://github.com/bonyadnouri/harvenv.git"
+ref = "example-manifest-v1"
+subdir = "examples/skills/harvenv-ci-demo"
+commit = "9b8b2d54a88edcc97c83495ef9192bd6bdeb9c3b"
+hash = "sha256:441f059f882878bcbcfdbea8d9605af329cded3a2c316e9e9cdadabf424b9a5b"
+
+[[skills]]
+name = "harvenv-ci-marker"
+source = "git"
+git = "https://github.com/bonyadnouri/harvenv.git"
+ref = "example-manifest-v1"
+subdir = "examples/skills/harvenv-ci-marker"
+commit = "9b8b2d54a88edcc97c83495ef9192bd6bdeb9c3b"
+hash = "sha256:dddbe91882935d53cac199803c6802d33e432910ef9782ea75783380fbd21391"
+

@@ -24,7 +24,7 @@ harv --version           # which harv, which mise, and whether you are behind
 
 ## Status
 
-Skills work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding. No Overlay, Toolchain or Doctor yet, and the remaining Components — agents, commands, plugin pins — are still ahead. mise ships inside harv but nothing drives it yet; `harv mise` reaches it for diagnosis.
+Skills work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, and a GitHub Actions workflow runs that whole path on a clean runner on every push. No Overlay, Toolchain or Doctor yet, and the remaining Components — agents, commands, plugin pins — are still ahead. mise ships inside harv but nothing drives it yet; `harv mise` reaches it for diagnosis.
 
 The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their trade-offs live in [docs/adr/](./docs/adr/). The implementation plan is the issue tracker — issues are thin vertical slices in dependency order.
 
@@ -126,6 +126,12 @@ With it installed, `claude` inside a harvenv project is the session the Manifest
 
 Install writes the shim to `$HARV_HOME/bin` (`~/.harv/bin` by default) and adds one marked block to your shell's startup file — zsh, bash, fish or sh. `--shell none` writes the shim and leaves your dotfiles alone, if you would rather put the directory on PATH yourself. Uninstall removes exactly that block and refuses to delete a `claude` harv has no record of creating.
 
+## In CI
+
+A CI runner is the ideal harvenv user: no personal skills, no accumulated settings, no memory of the last project it built. So a session it starts is the Manifest and nothing else ([ADR 0002](./docs/adr/0002-user-scope-suppressed-overlay.md)) — which makes CI both a place to run Claude Code as part of a build and the strictest available test of whether the Manifest really describes the environment your team works in.
+
+The recipe is `harv sync`, a `git diff --exit-code` on the Lockfile, and a headless `harv claude -p`, with `~/.harv/store` cached between runs and `ANTHROPIC_API_KEY` coming from a repository secret. [docs/ci.md](./docs/ci.md) explains each part, including what a runner without credentials can and cannot prove; [`.github/workflows/harvenv.yml`](./.github/workflows/harvenv.yml) runs it on every push to this repository, against the sample Manifest in [`examples/ci/`](./examples/ci/).
+
 ## Hacking on it
 
 Running from source needs Node ≥ 22.18 or Bun, `git` on PATH, and the repo's dependencies:
@@ -188,7 +194,13 @@ The fifth covers `harv init` and the Tripwire: that the scaffolded Manifest real
 node scripts/verify-tripwire.ts          # exits non-zero if a criterion no longer holds
 ```
 
-The sixth builds a binary and checks what shipping it promises: that it runs with no Node or Bun anywhere on PATH, that the mise it claims to carry is really inside it and really runs, that each archive matches its published checksum, and — once a release exists — that `install.sh` installs it and that an older build says so:
+The sixth is the CI recipe of [docs/ci.md](./docs/ci.md), executed: it syncs the sample Manifest into an empty Store and launches it against a fixture `$HOME` that has a personal skill, a conflicting `settings.json` and an MCP server planted in it, then checks that the Harvenv is the Manifest and nothing else — the one check that runs on every push to this repository, because it is the only one that needs no credentials. `--project <dir>` points it at your own project instead:
+
+```
+node scripts/verify-ci-recipe.ts         # needs git and network; needs no claude binary and no credentials
+```
+
+The seventh builds a binary and checks what shipping it promises: that it runs with no Node or Bun anywhere on PATH, that the mise it claims to carry is really inside it and really runs, that each archive matches its published checksum, and — once a release exists — that `install.sh` installs it and that an older build says so:
 
 ```
 bun scripts/verify-packaging.ts          # add --all to build every platform
@@ -201,7 +213,7 @@ node scripts/verify-shim.ts              # exits non-zero if interception, unins
                                          # pass-through has stopped holding
 ```
 
-All seven take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your `~/.claude`, or your shell's startup files. The unit tests are separate and need no `claude` binary:
+All eight take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your `~/.claude`, or your shell's startup files. The unit tests are separate and need no `claude` binary:
 
 ```
 npm test

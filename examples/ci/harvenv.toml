@@ -1,0 +1,21 @@
+# The sample Manifest the `harvenv` workflow syncs and launches on every push.
+# It is an ordinary `harv init` project — nothing here is CI-specific, and the
+# Tripwire it was scaffolded with is committed beside it in .claude/. What makes
+# the run a CI run is the recipe in .github/workflows/harvenv.yml, not this file.
+#
+# The Sources point back at this repository at a tag, so the workflow whose
+# green-ness is an acceptance criterion of issue #12 has no third-party tag to
+# depend on. In your project these are the repositories your team's skills
+# actually live in — public or private, since a Source is just something your
+# `git` can already clone (ADR 0004).
+
+[skills]
+harvenv-ci-demo = { git = "https://github.com/bonyadnouri/harvenv.git", ref = "example-manifest-v1", subdir = "examples/skills/harvenv-ci-demo" }
+harvenv-ci-marker = { git = "https://github.com/bonyadnouri/harvenv.git", ref = "example-manifest-v1", subdir = "examples/skills/harvenv-ci-marker" }
+
+# Binding for everyone who launches through harv, CI included (ADR 0005). This
+# is the half of "same config → same quality" that has nothing to do with
+# skills: a runner that quietly picked a cheaper model would produce different
+# output from the same Manifest, and nothing in the repository would say so.
+[settings]
+model = "opus"
