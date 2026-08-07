@@ -12,7 +12,9 @@
     "typecheck": "tsc --noEmit",
     "verify:launch-recipe": "node scripts/verify-launch-recipe.ts",
     "verify:skeleton": "node scripts/verify-walking-skeleton.ts",
-    "build": "bun build --compile bin/harv.ts --outfile dist/harv"
+    "verify:packaging": "bun scripts/verify-packaging.ts",
+    "vendor:mise": "bun scripts/vendor-mise.ts",
+    "build": "bun scripts/build.ts"
   },
   "dependencies": {
     "smol-toml": "^1.4.2"

@@ -5,6 +5,9 @@ import { join } from "node:path";
 
 import type { Manifest } from "../src/manifest.ts";
 import { run } from "../src/cli.ts";
+import { MISE_VERSION, MiseError } from "../src/mise.ts";
+import { currentPlatform } from "../src/platform.ts";
+import { VERSION } from "../src/version.ts";
 import { tempDir } from "./helpers.ts";
 
 interface Recorded {
@@ -12,11 +15,21 @@ interface Recorded {
   out: string;
   err: string;
   launched: Array<{ manifest: Manifest; passthrough: string[] }>;
+  mised: string[][];
+}
+
+interface Options {
+  /** What the injected launch/mise call returns. */
+  exitCode?: number;
+  /** What the update check has to say, if anything. */
+  hint?: string | null;
 }
 
 /** Run the CLI against a scratch project, capturing everything it emits. */
-async function cli(argv: string[], cwd: string, exitCode = 0): Promise<Recorded> {
+async function cli(argv: string[], cwd: string, options: Options | number = {}): Promise<Recorded> {
+  const { exitCode = 0, hint = null } = typeof options === "number" ? { exitCode: options } : options;
   const launched: Recorded["launched"] = [];
+  const mised: string[][] = [];
   let out = "";
   let err = "";
 
@@ -32,9 +45,14 @@ async function cli(argv: string[], cwd: string, exitCode = 0): Promise<Recorded>
       launched.push({ manifest, passthrough });
       return exitCode;
     },
+    runMise: async (args) => {
+      mised.push(args);
+      return exitCode;
+    },
+    updateHint: async () => hint,
   });
 
-  return { exit, out, err, launched };
+  return { exit, out, err, launched, mised };
 }
 
 /** A project with a Manifest declaring one local skill that really exists. */
@@ -137,6 +155,65 @@ test("harv --help prints usage and succeeds", async () => {
 
   assert.equal(exit, 0);
   assert.match(out, /usage/i);
+});
+
+test("harv --version reports harv and the mise it carries", async () => {
+  const { exit, out } = await cli(["--version"], tempDir());
+
+  assert.equal(exit, 0);
+  assert.match(out, new RegExp(`harv ${VERSION.replaceAll(".", "\\.")}`));
+  assert.match(out, new RegExp(currentPlatform()), "which build you have, not just which version");
+  assert.match(out, new RegExp(`vendored mise ${MISE_VERSION.replaceAll(".", "\\.")}`));
+});
+
+test("harv -v and harv version say the same thing, from anywhere", async () => {
+  for (const argv of [["--version"], ["-v"], ["version"]]) {
+    const { exit, out } = await cli(argv, tempDir());
+    assert.equal(exit, 0, argv.join(" "));
+    assert.match(out, /^harv /, argv.join(" "));
+  }
+});
+
+test("the out-of-date hint goes to stderr, so --version stays machine-readable", async () => {
+  const { exit, out, err } = await cli(["--version"], tempDir(), { hint: "A newer harv is available: 9.9.9" });
+
+  assert.equal(exit, 0);
+  assert.doesNotMatch(out, /newer harv/, "stdout is the answer");
+  assert.match(err, /newer harv/, "the notice is a remark");
+});
+
+test("harv --version works outside a harvenv project — it is what a clean machine runs first", async () => {
+  const { exit, err } = await cli(["--version"], tempDir());
+
+  assert.equal(exit, 0);
+  assert.doesNotMatch(err, /no Manifest/);
+});
+
+test("harv mise passes its arguments to the vendored engine and adopts the exit code", async () => {
+  const { exit, mised } = await cli(["mise", "ls", "--json"], tempDir(), { exitCode: 3 });
+
+  assert.equal(exit, 3);
+  assert.deepEqual(mised, [["ls", "--json"]]);
+});
+
+test("harv mise reports a missing engine without a stack trace", async () => {
+  let err = "";
+  const exit = await run(["mise", "--version"], {
+    cwd: tempDir(),
+    stdout: () => {},
+    stderr: (line) => {
+      err += `${line}\n`;
+    },
+    launch: async () => 0,
+    runMise: async () => {
+      throw new MiseError("No vendored mise for this platform.");
+    },
+    updateHint: async () => null,
+  });
+
+  assert.equal(exit, 1);
+  assert.match(err, /No vendored mise/);
+  assert.doesNotMatch(err, /at .*\.ts:\d+/, "no stack trace leaks to the user");
 });
 
 test("harv claude rejects unusable settings before writing anything into the project", async () => {
