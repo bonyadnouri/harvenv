@@ -21,7 +21,9 @@ import type { DriftEntry } from "./lockfile.ts";
 import { findManifest, loadManifest, ManifestError, MANIFEST_FILENAME } from "./manifest.ts";
 import type { Manifest, Source } from "./manifest.ts";
 import { materialize, MaterializeError } from "./materialize.ts";
-import { launch as launchSession, SettingsError, validateSettings } from "./launch.ts";
+import { launch as launchSession } from "./launch.ts";
+import { McpError, validateMcpServers } from "./mcp.ts";
+import { SettingsError, validateSettings } from "./settings.ts";
 import { GitError } from "./git.ts";
 import { MISE_VERSION, MiseError, runMise as runMiseBinary } from "./mise.ts";
 import { currentPlatform } from "./platform.ts";
@@ -31,12 +33,16 @@ import { defaultUpdateCheckDeps, isDevBuild, updateHint, VERSION } from "./versi
 
 export interface CliDeps {
   cwd: string;
-  /** Where the Store lives. Injected so a test never touches the real one. */
+  /**
+   * The process environment: where the Store lives, where a server definition's
+   * `${VAR}` resolves from, and what a launched session inherits. Injected so a
+   * test never touches the real Store or the real environment.
+   */
   env: Env;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
   /** Injected so tests can exercise the whole command without a real session. */
-  launch: (manifest: Manifest, passthrough: string[]) => Promise<number>;
+  launch: (manifest: Manifest, passthrough: string[], env: Env) => Promise<number>;
   /** Injected for the same reason: no test should need a 90MB binary on disk. */
   runMise: (args: string[]) => Promise<number>;
   /** Resolves to the one line worth printing, or null. Never throws. */
@@ -71,6 +77,7 @@ const EXPECTED_ERRORS = [
   ManifestError,
   MaterializeError,
   SettingsError,
+  McpError,
   LockfileError,
   SyncError,
   GitError,
@@ -156,9 +163,7 @@ async function claude(passthrough: string[], deps: CliDeps): Promise<number> {
   const manifest = requireManifest(deps);
   if (manifest === null) return 1;
 
-  // Everything that can be judged from the Manifest alone is judged before the
-  // first write, so a Manifest that cannot launch leaves no trace in the tree.
-  validateSettings(manifest.settings);
+  validateSessionConfig(manifest, deps.env);
 
   const lock = readLockfile(manifest.root);
   const drift = driftAgainst(manifest, lock);
@@ -168,7 +173,7 @@ async function claude(passthrough: string[], deps: CliDeps): Promise<number> {
   }
 
   materialize(plan(manifest, lock, deps.env));
-  return deps.launch(manifest, passthrough);
+  return deps.launch(manifest, passthrough, deps.env);
 }
 
 const driftReport = (drift: DriftEntry[]): string =>
@@ -188,7 +193,7 @@ function syncCommand(args: string[], deps: CliDeps): number {
   const manifest = requireManifest(deps);
   if (manifest === null) return 1;
 
-  validateSettings(manifest.settings);
+  validateSessionConfig(manifest, deps.env);
   report(sync(manifest, { env: deps.env }), deps);
   return 0;
 }
@@ -315,4 +320,17 @@ function requireManifest(deps: CliDeps): Manifest | null {
     return null;
   }
   return loadManifest(manifestPath);
+}
+
+/**
+ * The rules ADR 0005 makes harv responsible for: a settings key the Manifest may
+ * not bind, or one Claude Code would silently discard, and a server definition
+ * that could not run or whose `${VAR}` this environment cannot satisfy.
+ *
+ * Called by every command that acts on a Manifest, and always before the first
+ * write, so a Manifest that cannot launch leaves no trace in the tree.
+ */
+function validateSessionConfig(manifest: Manifest, env: Env): void {
+  validateSettings(manifest.settings);
+  validateMcpServers(manifest.mcpServers, env);
 }

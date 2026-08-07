@@ -24,13 +24,13 @@ harv --version           # which harv, which mise, and whether you are behind
 
 ## Status
 
-Skills work end to end: declare them by git coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it. No Overlay, Toolchain or Doctor yet, and Components other than skills — agents, commands, MCP servers, plugin pins — are still ahead. mise ships inside harv but nothing drives it yet; `harv mise` reaches it for diagnosis.
+Skills work end to end: declare them by git coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it. Settings and MCP servers are declared and binding. No Overlay, Toolchain or Doctor yet, and the remaining Components — agents, commands, plugin pins — are still ahead. mise ships inside harv but nothing drives it yet; `harv mise` reaches it for diagnosis.
 
 The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their trade-offs live in [docs/adr/](./docs/adr/). The implementation plan is the issue tracker — issues are thin vertical slices in dependency order.
 
 ## Using it
 
-A Manifest declares what the project's Harvenv contains: skills from git repositories, plus an optional settings block.
+A Manifest declares what the project's Harvenv contains: skills from git repositories, plus the settings and MCP servers the session runs with.
 
 ```toml
 # harvenv.toml
@@ -40,6 +40,16 @@ house-style   = { path = "vendor/skills/house-style" }
 
 [settings]
 model = "opus"
+effortLevel = "high"
+
+[settings.permissions]
+defaultMode = "plan"
+deny = ["Bash(git push:*)"]
+
+[mcp.tickets]
+command = "npx"
+args = ["-y", "tickets-mcp"]
+env = { TICKETS_TOKEN = "${TICKETS_TOKEN}" }
 ```
 
 `ref` and `subdir` are optional: without a `ref` harv follows the repository's default branch, and without a `subdir` the repository *is* the skill. There is no registry — a Source is a repository you can already clone (ADR 0004), so private repos work through whatever credentials your `git` already has.
@@ -62,6 +72,22 @@ harv claude -p "hi"      # anything after `claude` passes through untouched
 `harv claude` finds `harvenv.toml` in the working directory or the nearest ancestor — switching environments is just `cd` (ADR 0001) — links the locked skills into `.claude/skills/` as symlinks into the Store, and starts Claude Code with the [ADR 0003](./docs/adr/0003-isolation-via-launch-flags.md) flag recipe. It never fetches: if the Manifest and the Lockfile disagree it names the entries and stops, rather than launching a session that is not the one the Manifest describes ([ADR 0009](./docs/adr/0009-launcher-never-syncs.md)). Outside a harvenv project it says so and stops too.
 
 So the workflow after cloning a harvenv project is `harv sync`, then `harv claude`.
+
+Both commands judge everything they can from the Manifest and your environment before the first write, so a Manifest that cannot launch leaves no Lockfile and no trace in the project tree.
+
+### Settings are binding
+
+`[settings]` is Claude Code's own settings schema, verbatim — harv does not invent a second vocabulary to translate. What harv adds is that the keys actually take effect for everyone (ADR 0005): the block is injected at the top of the precedence stack, so a teammate's `settings.local.json` cannot quietly move the project onto a cheaper model.
+
+Because "binding" is worth nothing if a key can be dropped in transit, harv checks what it is asked to bind. Claude Code accepts a settings payload without complaint and then discards what it does not recognise: `permissions.defaultMode = "manual"` is a valid `--permission-mode` flag but not a valid setting, and `effortLevel = "max"` is a valid `/effort` argument but not a valid setting. Both fall back in silence. harv rejects them instead, and names what to write.
+
+Personal-ergonomics keys are the other half of ADR 0005's split, and a Manifest may not set them at all — `statusLine`, `theme`, `editorMode` and their siblings are refused with an error naming the key and the rule. A key harv cannot confidently classify stays binding; if a setting should be personal, the Manifest simply doesn't set it.
+
+### MCP servers
+
+`[mcp]` entries become the session's MCP configuration, launched with `--strict-mcp-config` so the servers in the session are exactly the declared ones — the machine's own global and per-project servers do not load. The table key is the name the server's tools carry (`mcp__tickets__…`), so it is vocabulary teammates read and type, and it follows the same one-segment rule a skill key does.
+
+A Manifest is committed, so it carries `${VAR}` references rather than credentials. harv resolves them from the environment of whoever is launching, at launch, and never writes the result anywhere: not into the Manifest, not into the project tree, not into a generated file. A reference whose variable is unset fails the launch naming the variable and the server — left to Claude Code, an unset `${VAR}` is substituted as the literal string and the server connects with it ([spike 0002](./docs/spikes/0002-settings-and-mcp-payloads.md), finding 4). One caveat worth knowing: the resolved payload travels in `claude`'s argv, which other processes on the machine can read via `ps`. That is the accepted trade for never writing it down.
 
 ### The Store
 
@@ -120,13 +146,19 @@ The third runs `harv` against real git repositories and a real Store, and confir
 node scripts/verify-sync-store.ts        # needs git; needs no claude binary and no network
 ```
 
-The fourth builds a binary and checks what shipping it promises: that it runs with no Node or Bun anywhere on PATH, that the mise it claims to carry is really inside it and really runs, that each archive matches its published checksum, and — once a release exists — that `install.sh` installs it and that an older build says so:
+The fourth does what the second does, for binding settings and MCP definitions — that a pinned model reaches the session, that a denied tool is gone from it, that a declared server connects while the machine's own stay absent, and that a `${VAR}` resolves at launch without landing on disk. [Spike 0002](./docs/spikes/0002-settings-and-mcp-payloads.md) records what it found on the way, including the one half of one criterion current Claude Code makes unobservable:
+
+```
+node scripts/verify-manifest-settings.ts # exits non-zero if a criterion no longer holds
+```
+
+The fifth builds a binary and checks what shipping it promises: that it runs with no Node or Bun anywhere on PATH, that the mise it claims to carry is really inside it and really runs, that each archive matches its published checksum, and — once a release exists — that `install.sh` installs it and that an older build says so:
 
 ```
 bun scripts/verify-packaging.ts          # add --all to build every platform
 ```
 
-All four take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store or `~/.claude`. The unit tests are separate and need no `claude` binary:
+All five take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store or `~/.claude`. The unit tests are separate and need no `claude` binary:
 
 ```
 npm test
