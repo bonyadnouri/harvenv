@@ -16,6 +16,7 @@
     "verify:settings": "node scripts/verify-manifest-settings.ts",
     "verify:plugins": "node scripts/verify-plugin-pins.ts",
     "verify:tripwire": "node scripts/verify-tripwire.ts",
+    "verify:doctor": "node scripts/verify-doctor.ts",
     "verify:ci": "node scripts/verify-ci-recipe.ts",
     "verify:shim": "node scripts/verify-shim.ts",
     "verify:overlay": "node scripts/verify-overlay.ts",

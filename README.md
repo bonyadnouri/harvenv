@@ -24,7 +24,7 @@ harv --version           # which harv, which mise, and whether you are behind
 
 ## Status
 
-Skills, plugin pins and the Toolchain work end to end: `harv init` scaffolds a project and plants the Tripwire — or `harv init --import` walks the machine's existing `~/.claude` and declares it for you — skills are declared by git coordinate, plugins by marketplace coordinate and system tools by version, `harv sync` fetches and installs them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it with the pinned tools in front of its PATH — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, your personal staples survive through an Overlay that adds to the Manifest without overriding it, and a GitHub Actions workflow runs that whole path on a clean runner on every push. No Doctor yet, and standalone agents and commands are still ahead.
+Skills, plugin pins and the Toolchain work end to end: `harv init` scaffolds a project and plants the Tripwire — or `harv init --import` walks the machine's existing `~/.claude` and declares it for you — skills are declared by git coordinate, plugins by marketplace coordinate and system tools by version, `harv sync` fetches and installs them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it with the pinned tools in front of its PATH — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, your personal staples survive through an Overlay that adds to the Manifest without overriding it, `harv doctor` diagnoses whether a synced Harvenv is actually runnable, and a GitHub Actions workflow runs that whole path on a clean runner on every push. Standalone agents and commands are still ahead.
 
 The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their trade-offs live in [docs/adr/](./docs/adr/). The implementation plan is the issue tracker — issues are thin vertical slices in dependency order.
 
@@ -75,7 +75,7 @@ env = { TICKETS_TOKEN = "${TICKETS_TOKEN}" }
 
 The `[skills]` key is the name the session answers to — the Manifest entry, the invocation, and the skill's own published name are one string (ADR 0008), so harv rejects a skill whose `SKILL.md` disagrees with its key. A key is one path segment (`[A-Za-z0-9][A-Za-z0-9._-]*`): it becomes a directory harv creates and later removes, and a Manifest arrives from a clone, so it is checked rather than trusted.
 
-Four commands:
+Five commands:
 
 ```
 harv init                # scaffold the Manifest, the gitignore entries and the Tripwire
@@ -86,6 +86,7 @@ harv sync                # resolve every entry into the Store and write harvenv.
 harv claude              # a session composed strictly from this Manifest, plus your Overlay
 harv claude -p "hi"      # anything after `claude` passes through untouched
 harv claude --no-overlay # the Manifest alone — what CI and a headless run should see
+harv doctor              # is this synced Harvenv actually runnable? --json for CI
 ```
 
 `harv add` writes the entry into `[skills]` — or into `[plugins]`, for `--marketplace` — and syncs it; a coordinate may carry its ref and subdirectory as `@ref` and `#subdir`, or you can pass `--ref` and `--subdir` separately. It edits the Manifest as text, so your comments and ordering survive, and it puts the file back if the Source turns out not to be fetchable.
@@ -108,7 +109,7 @@ requires: node@22, ripgrep
 
 The Lockfile pins the exact version each spec resolved to, so a teammate installs what you installed rather than what the spec means today ([ADR 0011](./docs/adr/0011-tools-pinned-by-version-not-content-hash.md)). Both routes into the Toolchain end up there, and the Manifest wins when they disagree: a `[tools]` pin overrides what a skill asked for, because Manifest settings are binding ([ADR 0005](./docs/adr/0005-manifest-settings-are-binding.md)). Two skills asking for different versions of the same tool is the one case harv will not guess at — it says so and asks you to pin it.
 
-Installs run through [mise](https://mise.jdx.dev), which harv looks for in three places: `HARV_MISE`, a copy vendored alongside harv itself, then a `mise` already on your PATH. A tool mise has no installer for — or any tool at all when there is no mise to be found — is **not** a failure. It is recorded in the Lockfile as a hint naming who needed it, warned about at sync, and left to the machine's own copy; `harv doctor` will surface it. That is the honest degradation path, not a second install mechanism.
+Installs run through [mise](https://mise.jdx.dev), which harv looks for in three places: `HARV_MISE`, a copy vendored alongside harv itself, then a `mise` already on your PATH. A tool mise has no installer for — or any tool at all when there is no mise to be found — is **not** a failure. It is recorded in the Lockfile as a hint naming who needed it, warned about at sync, and left to the machine's own copy; `harv doctor` then says whether the machine actually has one. That is the honest degradation path, not a second install mechanism.
 
 `harv claude` finds `harvenv.toml` in the working directory or the nearest ancestor — switching environments is just `cd` (ADR 0001) — links the locked skills into `.claude/skills/` as symlinks into the Store, and starts Claude Code with the [ADR 0003](./docs/adr/0003-isolation-via-launch-flags.md) flag recipe. It never fetches: if the Manifest and the Lockfile disagree it names the entries and stops, rather than launching a session that is not the one the Manifest describes ([ADR 0009](./docs/adr/0009-launcher-never-syncs.md)). Outside a harvenv project it says so and stops too.
 
@@ -218,6 +219,39 @@ What it does decide, because these are not judgements:
 **Re-running is a no-op.** Anything already declared is listed and not offered again, so there is no path from a second run to a second entry. Install something new next month and run it again; it will offer you that and nothing else. (Something you *skipped* is offered again — a skip is not a decision harv records anywhere.)
 
 Then `harv sync`, and the pile is a Harvenv.
+### Is it actually runnable?
+
+A Sync that succeeded says the Manifest resolved. It does not say a session would work. `harv doctor` asks that question, and reports every answer rather than stopping at the first:
+
+```
+harv doctor                  # seven checks, human-readable, exit 1 on any problem
+harv doctor --json           # the same report, stable, for CI
+harv doctor --no-session     # don't start Claude Code to measure with
+harv doctor --no-overlay     # the Manifest alone — what CI would see
+```
+
+```
+[ok]      claude-code   Claude Code 2.1.223; 6/6 of the recipe's behaviours still hold
+[ok]      settings      2 settings keys would reach the session
+[problem] drift         1 entry has drifted
+             x brainstorming: Source changed: locked superpowers.git@v6.2.0, the Manifest says @v6.3.0
+               Run `harv sync` to reconcile them.
+[ok]      components    3/3 declared Components resolve on this machine
+[problem] toolchain     0 pinned, 0 on the machine's own copy, 1 unavailable
+             x `ripgrep` could not be scoped to this project and is not on your PATH either, so the
+               skill that needs it will fail at the moment it runs.
+               Install ripgrep the way this machine normally would, or pin a version harv can install.
+[problem] mcp           0/1 declared servers connected
+             x [mcp.tickets] is waiting on first-time authentication — its tools are not in a session yet.
+               Run `harv claude` and complete `/mcp` for it once. The grant is personal to this machine.
+[ok]      tripwire      a bare `claude` here announces that it is not isolated
+```
+
+The first check is the one [ADR 0003](./docs/adr/0003-isolation-via-launch-flags.md) asks for by name. The Launcher is a recipe of native flags whose isolating behaviour is *observed* rather than documented, so any Claude Code release can retire it in silence — and Doctor re-measures it, on the version you have, by starting two throwaway sessions and reading what they loaded. A version harv has verified is a remark; the measurement is the verdict. Two probes cost about four seconds, and `--no-session` skips them on a machine that cannot start one.
+
+Three statuses, two exit codes ([ADR 0014](./docs/adr/0014-doctor-reports-three-statuses.md)). A `problem` will bite and fails the command. A check Doctor could not perform *here* — no credentials to probe with, an MCP server still registering when the session reported in — is reported as unverified and does not. An honest "I could not check this" must not be able to fail a build, or the first runner without an API key teaches everyone to stop running Doctor.
+
+`--json` is the CI contract: a `version`, an `ok`, and all seven checks in a fixed order with a fixed `status` vocabulary, whether or not this project has any MCP servers to talk about. Every problem carries a hint. [docs/ci.md](./docs/ci.md) has the gate.
 
 ## Intercepting a bare `claude`
 
@@ -340,14 +374,20 @@ The eleventh is the Overlay's: that one staples file reaches two different proje
 node scripts/verify-overlay.ts           # needs git and claude
 ```
 
-The last is the import wizard's: that a fixture user scope's skills, plugins and MCP servers are inventoried and grouped, that each group lands where it was sent with the Sources that were derivable, that a Component which exists only on that machine is flagged with the push it needs, and that a second run asks nothing and writes nothing. It then syncs and launches what the wizard declared, because a Manifest that parses and does not resolve would pass every other check. The whole run is repeated through a real pseudo-terminal, since a pipe is not a terminal and the wizard's users are at one:
+The twelfth is the import wizard's: that a fixture user scope's skills, plugins and MCP servers are inventoried and grouped, that each group lands where it was sent with the Sources that were derivable, that a Component which exists only on that machine is flagged with the push it needs, and that a second run asks nothing and writes nothing. It then syncs and launches what the wizard declared, because a Manifest that parses and does not resolve would pass every other check. The whole run is repeated through a real pseudo-terminal, since a pipe is not a terminal and the wizard's users are at one:
 
 ```
 node scripts/verify-import.ts            # needs git and python3; needs no claude binary,
                                          # no credentials and no network
 ```
 
-All twelve take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your Overlay, your `~/.claude`, your shell's startup files, or your own mise setup. The unit tests are separate and need no `claude` binary and no install engine:
+The last is Doctor's own: that a healthy synced project reports every check green, that each failure class is caught with a message you can act on, and that `--json` is stable. Two of those classes are facts about a session — a launch recipe that stopped isolating, a server waiting on auth — so it scripts them, with a `claude` on PATH that emits the `init` event it is told to. A regression nobody can produce on demand becomes a fixture rather than a wait. Its last check drops the stand-in and measures the recipe against the Claude Code you actually have:
+
+```
+node scripts/verify-doctor.ts            # needs git; brings its own claude, so needs no credentials
+```
+
+All thirteen take `--json` and `--keep` (to leave the fixture tree on disk). `harv doctor` does not shell out to them — a released harv is one file, with no repository around it — so it carries a two-probe short form of the launch-recipe check inside the binary, and these stay the full-width version: 13 probes for the recipe alone, including the questions that decided ADR 0008. None of them touch your Store, your Overlay, your `~/.claude`, your shell's startup files, or your own mise setup. The unit tests are separate and need no `claude` binary and no install engine:
 
 ```
 npm test

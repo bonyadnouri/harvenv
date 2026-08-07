@@ -4,13 +4,15 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync
 import { join } from "node:path";
 
 import type { Session } from "../src/overlay.ts";
+import type { Probe, ProbeRequest } from "../src/recipe.ts";
 import type { ShimContext } from "../src/shim.ts";
 import type { Env } from "../src/store.ts";
 import { run } from "../src/cli.ts";
 import { buildLaunchArgs } from "../src/launch.ts";
 import { MISE_VERSION, MiseError } from "../src/mise.ts";
 import { currentPlatform } from "../src/platform.ts";
-import { hasTripwire } from "../src/tripwire.ts";
+import { VERIFIED_CLAUDE_CODE } from "../src/recipe.ts";
+import { hasTripwire, tripwireHook } from "../src/tripwire.ts";
 import { VERSION } from "../src/version.ts";
 import {
   commitFiles,
@@ -30,6 +32,8 @@ interface Recorded {
   mised: string[][];
   /** Every question the import wizard put to the user, in order. */
   asked: string[];
+  /** Every session Doctor asked for, so a test can prove it asked for none. */
+  probed: ProbeRequest[];
 }
 
 interface Options {
@@ -44,6 +48,8 @@ interface Options {
   home?: string;
   /** What the import wizard is answered with, in order. Empty means skip. */
   answers?: string[];
+  /** What a probe session sees. Unobservable by default: no test starts one. */
+  probe?: (request: ProbeRequest) => Probe;
 }
 
 /** One project, one Store, one shim sandbox, one CLI — reused within one test. */
@@ -54,6 +60,7 @@ function harv(cwd: string, options: Options = {}) {
   const mised: string[][] = [];
   const asked: string[] = [];
   const answers = [...(options.answers ?? [])];
+  const probed: ProbeRequest[] = [];
 
   return async (argv: string[], from = cwd): Promise<Recorded> => {
     let out = "";
@@ -81,8 +88,12 @@ function harv(cwd: string, options: Options = {}) {
         asked.push(question);
         return answers.shift() ?? "";
       },
+      probe: async (request) => {
+        probed.push(request);
+        return options.probe?.(request) ?? { unobservable: "no claude in this test" };
+      },
     });
-    return { exit, out, err, launched, mised, asked };
+    return { exit, out, err, launched, mised, asked, probed };
   };
 }
 
@@ -356,6 +367,133 @@ test("harv claude launches when every ${VAR} the Manifest references is set", as
     "s3cret",
     "the session inherits the environment the references resolved from",
   );
+});
+
+// ---------------------------------------------------------------------------
+// harv doctor
+//
+// The diagnosis itself is pinned in doctor.test.ts. These are the command: its
+// flags, its exit code, and the two shapes it prints.
+// ---------------------------------------------------------------------------
+
+/** A project Doctor should find nothing wrong with: a Manifest and a Tripwire. */
+function healthyProject(): string {
+  const root = tempDir();
+  writeFileSync(join(root, "harvenv.toml"), "");
+  mkdirSync(join(root, ".claude"), { recursive: true });
+  writeFileSync(
+    join(root, ".claude", "settings.json"),
+    `${JSON.stringify({ hooks: { SessionStart: [tripwireHook()] } }, null, 2)}\n`,
+  );
+  return root;
+}
+
+/**
+ * A `claude` on PATH that answers `--version` and nothing else.
+ *
+ * Doctor resolves the binary before it decides whether a session could be
+ * started at all, so without one every report opens with "claude is not on this
+ * machine's PATH" and never reaches the checks these tests are about.
+ */
+let claudeBin: string | undefined;
+function claudeOnPath(): string {
+  if (claudeBin === undefined) {
+    claudeBin = tempDir();
+    writeFileSync(join(claudeBin, "claude"), `#!/bin/sh\necho "${VERIFIED_CLAUDE_CODE[0]} (Claude Code)"\n`, {
+      mode: 0o755,
+    });
+  }
+  return claudeBin;
+}
+
+const doctor = (root: string, options: Options = {}) =>
+  harv(root, { ...options, env: { PATH: claudeOnPath(), ...options.env } });
+
+test("harv doctor prints one line per check and exits 0 when nothing is wrong", async () => {
+  const root = healthyProject();
+
+  const { exit, out } = await doctor(root)(["doctor", "--no-session"]);
+
+  assert.equal(exit, 0);
+  for (const id of ["claude-code", "settings", "drift", "components", "toolchain", "mcp", "tripwire"]) {
+    assert.match(out, new RegExp(`^\\[\\w+\\]\\s+${id}\\s`, "m"), `no line for \`${id}\``);
+  }
+  assert.match(out, /Nothing to fix/);
+});
+
+test("harv doctor exits 1 on a problem, and says what to do about it", async () => {
+  const root = healthyProject();
+  rmSync(join(root, ".claude", "settings.json"), { force: true });
+
+  const { exit, out } = await doctor(root)(["doctor", "--no-session"]);
+
+  assert.equal(exit, 1);
+  assert.match(out, /^\[problem\]\s+tripwire/m);
+  assert.match(out, /harv init/);
+  assert.match(out, /Fix them and re-run `harv doctor`/);
+});
+
+test("harv doctor --json prints the report and nothing else", async () => {
+  const root = healthyProject();
+
+  const { exit, out, err } = await doctor(root)(["doctor", "--json", "--no-session"]);
+
+  assert.equal(exit, 0);
+  assert.equal(err, "");
+  const report = JSON.parse(out) as { version: number; ok: boolean; checks: Array<{ id: string }> };
+  assert.equal(report.version, 1);
+  assert.equal(report.ok, true);
+  assert.deepEqual(report.checks.map((check) => check.id), [
+    "claude-code",
+    "settings",
+    "drift",
+    "components",
+    "toolchain",
+    "mcp",
+    "tripwire",
+  ]);
+});
+
+test("harv doctor --json still exits 1 on a problem, so it works as a CI gate", async () => {
+  const root = healthyProject();
+  rmSync(join(root, ".claude", "settings.json"), { force: true });
+
+  const { exit, out } = await doctor(root)(["doctor", "--json", "--no-session"]);
+
+  assert.equal(exit, 1);
+  assert.equal((JSON.parse(out) as { ok: boolean }).ok, false);
+});
+
+test("harv doctor --no-session starts no Claude Code session at all", async () => {
+  const root = healthyProject();
+
+  const { probed } = await doctor(root)(["doctor", "--no-session"]);
+
+  assert.deepEqual(probed, []);
+});
+
+test("harv doctor without --no-session measures the launch recipe", async () => {
+  const root = healthyProject();
+
+  const { probed } = await doctor(root, { probe: () => ({ unobservable: "no claude here" }) })(["doctor"]);
+
+  assert.equal(probed.length, 2, "one bare session and one under the recipe");
+  assert.ok(probed[1]?.args.includes("--setting-sources"));
+  assert.ok(probed[1]?.args.includes("--strict-mcp-config"));
+});
+
+test("harv doctor outside a harvenv project says so rather than diagnosing nothing", async () => {
+  const { exit, err } = await harv(tempDir())(["doctor"]);
+
+  assert.equal(exit, 1);
+  assert.match(err, /no Manifest found/);
+});
+
+test("harv doctor rejects a flag it does not have", async () => {
+  const { exit, err } = await harv(project())(["doctor", "--fix"]);
+
+  assert.equal(exit, 2);
+  assert.match(err, /does not take `--fix`/);
 });
 
 // ---------------------------------------------------------------------------
@@ -842,6 +980,7 @@ test("harv mise reports a missing engine without a stack trace", async () => {
       throw new MiseError("No vendored mise for this platform.");
     },
     updateHint: async () => null,
+    probe: async () => ({ unobservable: "no claude in this test" }),
   });
 
   assert.equal(exit, 1);
@@ -1328,6 +1467,7 @@ function harvWithEngine(cwd: string, receipt: string) {
   stores.set(cwd, store);
   const launched: Recorded["launched"] = [];
   const mised: string[][] = [];
+  const probed: ProbeRequest[] = [];
 
   return async (argv: string[]): Promise<Recorded> => {
     let out = "";
@@ -1351,11 +1491,15 @@ function harvWithEngine(cwd: string, receipt: string) {
       },
       updateHint: async () => null,
       shim: shimSandbox(),
-      // These exercise the Toolchain, which asks nothing; an answer that is
-      // never given is the honest stand-in.
+      // These exercise the Toolchain, which asks nothing and diagnoses nothing;
+      // an answer that is never given is the honest stand-in.
       ask: async () => "",
+      probe: async (request) => {
+        probed.push(request);
+        return { unobservable: "no claude in this test" };
+      },
     });
-    return { exit, out, err, launched, mised, asked: [] };
+    return { exit, out, err, launched, mised, asked: [], probed };
   };
 }
 

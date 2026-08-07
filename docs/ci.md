@@ -45,6 +45,12 @@ on every push to this repository against the sample Manifest in
 # committed one is not what a clean machine produces.
 - run: git diff --exit-code -- harvenv.lock
 
+# Is this Harvenv actually runnable on this runner? Drift, Components and tools
+# that are not here, MCP servers waiting on auth, the Tripwire — and ADR 0003's
+# launch-recipe smoke test against the Claude Code installed above. Exits
+# non-zero on any problem. See "The Doctor gate".
+- run: harv doctor --json --no-overlay
+
 - run: harv claude --no-overlay -p 'summarize the diff on this branch' --output-format json
   env:
     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
@@ -136,8 +142,17 @@ The Launcher is a recipe of native flags (ADR 0003), and three of the behaviours
 it depends on — user-scope suppression above all — are observed rather than
 documented. Any release can retire one silently. Pinning makes that a change you
 make deliberately, on a pull request where the checks can catch it, rather than
-one that arrives between two otherwise identical runs. Until Doctor exists, the
-version smoke test is `scripts/verify-launch-recipe.ts`.
+one that arrives between two otherwise identical runs.
+
+`harv doctor` re-measures those behaviours against whatever version you pinned,
+which is what makes the pin a decision rather than a hope: harv also carries a
+list of the versions it has verified the recipe against, but that list is a
+remark and the measurement is the verdict. A newer Claude Code on which the
+recipe still holds is a note in the report; one on which it does not is a
+problem naming the behaviour that stopped holding.
+`scripts/verify-launch-recipe.ts` is the same measurement at full width — 13
+probes rather than two — and the `session` job runs it when credentials are
+available.
 
 ## Caching the Store
 
@@ -174,20 +189,58 @@ one per project.
 
 ## The Doctor gate
 
-The recipe is missing a step. Between `harv sync` and the launch there should
-be:
+Between the Lockfile check and the launch:
 
 ```yaml
-- run: harv doctor --json
+- run: harv doctor --json --no-overlay
 ```
 
-`harv doctor` does not exist yet — it is issue #9 — and
-`.github/workflows/harvenv.yml` carries a `TODO(#9)` comment where it will slot
-in. It is the step that turns "a session started" into "a session could have
-worked": pending MCP auth, tools that could not be scoped to the project, and
-the one CI needs most, the Claude Code version smoke test ADR 0003 asks for.
-Until then that last part lives in `scripts/verify-launch-recipe.ts`, which the
-`session` job runs when credentials are available.
+It is the step that turns "a session started" into "a session could have
+worked": Manifest/Lockfile drift, Components and tools that are not on this
+runner, MCP servers waiting on first-time auth, the Tripwire — and the one CI
+needs most, the Claude Code version smoke test ADR 0003 asks for. It exits
+non-zero on any problem, so it is a gate without further wiring.
+
+Put it **after** the step that installs Claude Code, not immediately after the
+sync. The smoke test is a real session: Doctor has to be able to find a binary
+before it can measure one, and a runner that has not installed Claude Code yet
+gets a report whose first line is that it is missing.
+
+`--json` prints one report on stdout and nothing else, so a job can assert on
+the parts it cares about rather than on the whole of it:
+
+```yaml
+- run: |
+    set -euo pipefail
+    harv doctor --json --no-overlay | tee "$RUNNER_TEMP/doctor.json"
+    jq -e '.ok == true' "$RUNNER_TEMP/doctor.json" > /dev/null
+```
+
+The shape is fixed. `version` is the report format, `ok` is "no check found a
+problem", and `checks` is always the same seven ids in the same order —
+`claude-code`, `settings`, `drift`, `components`, `toolchain`, `mcp`,
+`tripwire` — whether or not the project has any MCP servers or tools to talk
+about, so a gate never has to ask what a project contains before reading it.
+Each carries a `status` of `ok`, `problem` or `unknown`, a one-line `summary`,
+and `findings` with a `message` and, on every problem, a `hint`.
+
+`unknown` is the third answer, and it is why the exit code stays readable: it
+means Doctor could not ask the question on this machine — no credentials to
+start a probe session with, an MCP server still registering when the session
+reported in — and it does **not** fail the command
+([ADR 0014](./adr/0014-doctor-reports-three-statuses.md)). A CI runner without
+`ANTHROPIC_API_KEY` is the common case, and a gate that failed there would
+teach a team to delete the gate. A job that wants the stricter rule can have
+it:
+
+```yaml
+- run: jq -e '[.checks[].status] | index("unknown") == null' "$RUNNER_TEMP/doctor.json"
+```
+
+`--no-session` skips everything that needs to start Claude Code, and says so in
+the report rather than passing quietly. It is the right flag for a job that
+only wants the offline half — drift, Components, tools, the Tripwire — and does
+not want to spend a session on the rest.
 
 ## What a run without credentials proves
 
@@ -218,6 +271,13 @@ clean room — and checks what a runner ends up with:
 - a warm Store makes both sync and launch network-free;
 - an API key travels through the environment and never through the arguments.
 
+The Doctor gate runs on those same credential-free runs, and most of it means
+something there: drift, the Components in the Store, the tools, the Tripwire.
+Its first check does not — the stand-in `claude` this workflow uses answers no
+`init` event, so the launch recipe is reported as unverified with the reason,
+which is exactly the case ADR 0014 exists for. In a repository with a key it is
+the check that measures the recipe on every run.
+
 **What Claude Code then does with those flags** is not measured, because it
 cannot be without a session. That is `verify-launch-recipe.ts`,
 `verify-walking-skeleton.ts` and `verify-manifest-settings.ts`, which the
@@ -236,6 +296,8 @@ node scripts/verify-ci-recipe.ts         # this document, executed
 project's Manifest rather than the sample one; like its siblings it takes
 `--json` and `--keep`, and it touches neither your Store nor your `~/.claude`.
 
-harv's own unit tests, and `verify-sync-store.ts` — the Store guarantees the
-caching above rests on, which need git but neither credentials nor a network —
-run in [`ci.yml`](../.github/workflows/ci.yml) rather than here.
+harv's own unit tests, `verify-sync-store.ts` — the Store guarantees the caching
+above rests on — and `verify-doctor.ts` — the gate above, including the failure
+classes it only detects during a session, scripted with a `claude` that emits
+the `init` event it is told to — need git but neither credentials nor a network,
+and run in [`ci.yml`](../.github/workflows/ci.yml) rather than here.
