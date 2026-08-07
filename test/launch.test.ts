@@ -1,12 +1,12 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
-import { basename, join } from "node:path";
+import { basename, delimiter, join } from "node:path";
 
 import type { Manifest } from "../src/manifest.ts";
 import { composeSession, NO_OVERLAY } from "../src/overlay.ts";
 import type { Overlay, Session } from "../src/overlay.ts";
-import { buildLaunchArgs, claudeBinary, LaunchError, launchEnv } from "../src/launch.ts";
+import { buildLaunchArgs, claudeBinary, LaunchError, launchEnv, withToolPaths } from "../src/launch.ts";
 import { SHIM_RECORD_FILE } from "../src/shim.ts";
 import { LAUNCHER_ENV } from "../src/tripwire.ts";
 import { fakeExecutable, tempDir } from "./helpers.ts";
@@ -20,6 +20,7 @@ function sessionWith(overrides: Partial<Manifest> = {}, overlay: Overlay = NO_OV
     root,
     skills: [],
     plugins: [],
+    tools: [],
     settings: {},
     mcpServers: [],
     ...overrides,
@@ -176,4 +177,40 @@ test("claudeBinary says claude is missing rather than failing inside spawn", () 
     () => claudeBinary(tempDir()),
     (err: Error) => err instanceof LaunchError && /not found on PATH/.test(err.message),
   );
+});
+
+// ---------------------------------------------------------------------------
+// The Toolchain's half of the launch: PATH injection (ADR 0006)
+// ---------------------------------------------------------------------------
+
+test("the Harvenv's tool paths go in front of everything the machine already has", () => {
+  const env = withToolPaths({ PATH: "/usr/bin:/bin" }, ["/store/node/bin", "/store/rg/bin"]);
+
+  assert.equal(env.PATH, ["/store/node/bin", "/store/rg/bin", "/usr/bin", "/bin"].join(delimiter));
+});
+
+test("the rest of PATH survives, so a tool harv could not scope still resolves", () => {
+  assert.match(withToolPaths({ PATH: "/usr/bin" }, ["/store/node/bin"]).PATH ?? "", /\/usr\/bin$/);
+});
+
+test("a Harvenv with no Toolchain leaves PATH exactly as it was", () => {
+  assert.equal(withToolPaths({ PATH: "/usr/bin:/bin" }, []).PATH, "/usr/bin:/bin");
+});
+
+test("the rest of the parent environment is passed through untouched", () => {
+  const env = withToolPaths({ PATH: "/usr/bin", HOME: "/home/dev", TERM: "xterm" }, ["/store/node/bin"]);
+
+  assert.equal(env.HOME, "/home/dev");
+  assert.equal(env.TERM, "xterm");
+});
+
+test("Windows spells it Path, and harv must not leave a second key winning", () => {
+  const env = withToolPaths({ Path: "C:\\Windows" }, ["/store/node/bin"]);
+
+  assert.equal(env.PATH, undefined);
+  assert.equal(env.Path, `/store/node/bin${delimiter}C:\\Windows`);
+});
+
+test("a machine with no PATH at all still gets the Harvenv's tools", () => {
+  assert.equal(withToolPaths({}, ["/store/node/bin"]).PATH, "/store/node/bin");
 });

@@ -70,6 +70,32 @@ const COMPONENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
 
 export const isComponentName = (name: string): boolean => COMPONENT_NAME.test(name);
 
+/**
+ * A Toolchain tool name, in the engine's vocabulary: `node`, but also a
+ * backend-qualified one like `npm:prettier` or `cargo:ripgrep` (ADR 0006).
+ *
+ * Wider than a Component name, and checked for different reasons. It becomes an
+ * argument to the install engine — hence the leading character, which keeps a
+ * requirement from arriving as a flag — and a path segment under the Store,
+ * hence the refusal of `..`. `@` is in because a package-backed tool carries a
+ * scope (`npm:@scope/pkg`); it cannot lead, so it never reads as a version.
+ */
+const TOOL_NAME = /^[A-Za-z0-9][A-Za-z0-9._+:/@-]*$/;
+
+/** A version spec: an exact version, a prefix, or an alias like `lts`. */
+const TOOL_SPEC = /^[A-Za-z0-9][A-Za-z0-9._+-]*$/;
+
+export const isToolName = (name: string): boolean => TOOL_NAME.test(name) && !name.includes("..");
+
+export const isToolSpec = (spec: string): boolean => TOOL_SPEC.test(spec);
+
+export const TOOL_NAME_RULE =
+  "a tool name must start with a letter or digit and may contain letters, digits, `.`, `-`, `_`, `+`, `:`, `/` and `@`";
+
+export const TOOL_SPEC_RULE =
+  "a version must start with a letter or digit and may contain letters, digits, `.`, `-`, `_` and `+` — " +
+  'e.g. "22", "22.18.0" or "lts"';
+
 /** Shared so the rule reads the same wherever it is enforced. */
 export const COMPONENT_NAME_RULE =
   "a name must be a single path segment starting with a letter or digit and made of letters, digits, " +
@@ -139,10 +165,18 @@ export function describeSource(source: Source | MarketplaceSource): string {
 /** The native `name@marketplace` identity of a pin, for messages. */
 export const describePlugin = (entry: PluginEntry): string => `${entry.name}@${describeSource(entry.source)}`;
 
+/** A system tool the Harvenv needs, at the version spec that was asked for. */
+export interface ToolEntry {
+  tool: string;
+  spec: string;
+}
+
 /** What one declaration file — a Manifest or an Overlay file — says. */
 export interface Declarations {
   skills: SkillEntry[];
   plugins: PluginEntry[];
+  /** The `[tools]` table: the Toolchain this file pins directly (ADR 0006). */
+  tools: ToolEntry[];
   /** The settings table, injected via `--settings` at launch. */
   settings: Record<string, unknown>;
   /** The MCP servers, injected via `--mcp-config` at launch. */
@@ -167,6 +201,13 @@ export interface DeclarationOptions {
    * loaded nothing would be exactly the silence harv exists to remove.
    */
   plugins: string | null;
+  /**
+   * Why `[tools]` may not appear in this file, or null if it may. An Overlay
+   * cannot carry one: a tool is pinned into the committed Lockfile, and a
+   * personal staple has no business putting a version there for the whole team
+   * (ADR 0006, ADR 0013).
+   */
+  tools: string | null;
 }
 
 /** A Manifest may not disable anything, so it carries no such list. */
@@ -201,6 +242,7 @@ export function loadManifest(manifestPath: string): Manifest {
     disable:
       "a Manifest declares what a project's Harvenv contains, and only an Overlay can take something back out",
     plugins: null,
+    tools: null,
   });
   return { path: manifestPath, root, ...declarations };
 }
@@ -218,10 +260,14 @@ export function parseDeclarations(path: string, options: DeclarationOptions): De
   if (options.plugins !== null && raw.plugins !== undefined) {
     throw new ManifestError(`[plugins] in ${path} ${options.plugins}.`);
   }
+  if (options.tools !== null && raw.tools !== undefined) {
+    throw new ManifestError(`[tools] in ${path} ${options.tools}.`);
+  }
 
   return {
     skills: skills.declared,
     plugins: parsePlugins(raw.plugins, path),
+    tools: parseTools(raw.tools, path),
     settings: asTable(raw.settings, "settings", path) ?? {},
     mcpServers: mcpServers.declared,
     disabled: { skills: skills.disabled, mcpServers: mcpServers.disabled },
@@ -255,6 +301,30 @@ function isDisabled(entry: Record<string, unknown>, where: string, options: Decl
     );
   }
   return true;
+}
+
+/**
+ * `[tools]` is a flat table of tool to version spec, because that is the whole
+ * declaration: `node = "22.18"`. A Component may ask for the same tool through
+ * its own `requires`, and when the two disagree this one wins — Manifest
+ * declarations are binding (ADR 0005).
+ */
+function parseTools(value: unknown, manifestPath: string): ToolEntry[] {
+  const tools = asTable(value, "tools", manifestPath);
+  if (!tools) return [];
+
+  return Object.entries(tools).map(([tool, spec]) => {
+    const where = `[tools] entry \`${tool}\` in ${manifestPath}`;
+    if (!isToolName(tool)) throw new ManifestError(`${where} is not a usable tool name: ${TOOL_NAME_RULE}.`);
+    if (typeof spec !== "string" || spec === "") {
+      throw new ManifestError(
+        `${where} must be a version string, e.g. ${tool} = "22.18". ` +
+          `Use "latest" to follow the newest release.`,
+      );
+    }
+    if (!isToolSpec(spec)) throw new ManifestError(`${where} has a version harv will not pass on: ${TOOL_SPEC_RULE}.`);
+    return { tool, spec };
+  });
 }
 
 function readTable(manifestPath: string): Record<string, unknown> {

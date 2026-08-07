@@ -36,6 +36,18 @@ export function harvHome(env: Env = process.env): string {
 export const storeRoot = (env: Env = process.env): string => join(harvHome(env), "store");
 
 /**
+ * The Store's Toolchain half: system tools, one directory per exact version,
+ * shared by every project on the machine (ADR 0006, ADR 0011).
+ *
+ * It sits beside the content-addressed half rather than inside it because the
+ * two are addressed differently — a Component is named by the hash of the tree
+ * a Sync fetched, a tool by the version an installer resolved. What they share
+ * is the property that matters: one copy per machine, reused by every project
+ * that asks for it.
+ */
+export const toolsRoot = (env: Env = process.env): string => join(storeRoot(env), "tools");
+
+/**
  * Where content with this hash lives. Sharded on the first byte of the digest,
  * because a Store that outlives a few projects holds thousands of entries and
  * some filesystems degrade badly on one flat directory.

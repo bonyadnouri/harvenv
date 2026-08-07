@@ -34,7 +34,7 @@
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
-import { driftAgainst, readLockfile, removeLockfile, writeLockfile } from "./lockfile.ts";
+import { driftAgainst, readLockfile, removeLockfile, toolDrift, writeLockfile } from "./lockfile.ts";
 import type { DriftEntry, Lockfile, LockedPlugin, LockedSkill } from "./lockfile.ts";
 import { describePlugin, describeSource } from "./manifest.ts";
 import type { GitSource, Manifest, MarketplaceSource, PluginEntry, SkillEntry, Source } from "./manifest.ts";
@@ -43,8 +43,11 @@ import type { Fetched } from "./git.ts";
 import { declaredMcpServers, MarketplaceError, resolvePlugin } from "./marketplace.ts";
 import { materialize } from "./materialize.ts";
 import type { MaterializePlan, MaterializeResult, Resolved } from "./materialize.ts";
+import { hasBins, resolveBinPath } from "./mise.ts";
 import { OVERLAY_LOCKFILE } from "./overlay.ts";
 import type { Session } from "./overlay.ts";
+import { requirements, resolveToolchain } from "./tools.ts";
+import type { ResolvedTool, ToolchainDeps, ToolchainResult } from "./tools.ts";
 import { hashTree, insert, isStored, storePath } from "./store.ts";
 import type { Env } from "./store.ts";
 
@@ -57,6 +60,8 @@ export interface SyncDeps {
   env: Env;
   resolveCommit: (source: GitSource) => string;
   fetchSource: (source: GitSource, commit: string, env: Env) => Fetched;
+  /** The Toolchain engine, injectable for the same reason. */
+  toolchain: Partial<ToolchainDeps>;
 }
 
 export interface SyncResult {
@@ -71,6 +76,8 @@ export interface SyncResult {
   /** Ready to print; one line each, naming the entry it is about. */
   warnings: string[];
   materialized: MaterializeResult;
+  /** What the Toolchain installed, reused, or could not scope. */
+  toolchain: ToolchainResult;
 }
 
 export function sync(session: Session, deps: Partial<SyncDeps> = {}): SyncResult {
@@ -89,6 +96,7 @@ export function sync(session: Session, deps: Partial<SyncDeps> = {}): SyncResult
     // locked, so those warnings are already waiting by the time Sync runs.
     warnings: [...session.warnings],
     materialized: { linked: [], plugins: [], removed: [] },
+    toolchain: { tools: [], installed: [], reused: [], unscopeable: [], warnings: [] },
   };
 
   const resolveSkills = (skills: SkillEntry[], from: Lockfile | null, portable: boolean) => {
@@ -182,13 +190,32 @@ export function sync(session: Session, deps: Partial<SyncDeps> = {}): SyncResult
     const servers = declaredMcpServers(path);
     if (servers.length > 0) result.warnings.push(unservedMcp(plugin.name, servers));
   }
+  // Read before anything is written into the project tree. A `requires`
+  // declaration travels inside a skill, so this cannot happen until the skills
+  // are fetched (ADR 0006) — but it needs the fetched directories, not the
+  // materialized links, so two Components that contradict each other are caught
+  // while the tree is still untouched.
+  //
+  // Read from the project's own skills, not the Overlay's. What a personal
+  // staple needs is personal, and this Lockfile is committed — a teammate's
+  // Toolchain should not acquire a tool because of somebody's staples (ADR 0013).
+  const required = requirements(manifest, own.resolved);
 
   // Materialization runs before the Lockfile is written: it is the step that
   // validates each fetched tree really is the Component its key names
   // (ADR 0008), and a Lockfile is a promise that should not outlive a failed one.
   result.materialized = materialize({ root: manifest.root, skills: resolved, plugins });
-  writeLockfile(manifest.root, entries, pinned);
-  if (overlay.entries.length > 0) writeLockfile(manifest.root, overlay.entries, [], OVERLAY_LOCKFILE);
+
+  result.drift.push(...toolDrift(required, lock));
+  result.toolchain = resolveToolchain(
+    required,
+    new Map((lock?.tools ?? []).map((entry) => [entry.tool, entry])),
+    { env, ...deps.toolchain },
+  );
+  result.warnings.push(...result.toolchain.warnings);
+
+  writeLockfile(manifest.root, entries, pinned, result.toolchain.tools);
+  if (overlay.entries.length > 0) writeLockfile(manifest.root, overlay.entries, [], [], OVERLAY_LOCKFILE);
   else removeLockfile(manifest.root, OVERLAY_LOCKFILE);
   return result;
 }
@@ -290,6 +317,42 @@ function fromStore(what: string, hash: string | undefined, env: Env): string {
   return storePath(hash, env);
 }
 
+/**
+ * The directories a session's PATH gets, in front of everything the machine
+ * already has — the Launcher's half of the Toolchain (ADR 0006).
+ *
+ * Like `plan`, this reads and never installs. Unlike `plan`, a locked entry the
+ * Store cannot serve is a warning rather than a refusal, and that asymmetry is
+ * deliberate. A missing Component means the session is not the Harvenv the
+ * Manifest describes, and `harv sync` can always fix it. A missing *tool* may
+ * not be fixable at all: on a machine with no install engine, Sync keeps the
+ * pin — it is a committed decision — but cannot install it, so refusing to
+ * launch would name `harv sync` as the remedy for something `harv sync` cannot
+ * remedy, and would turn ADR 0006's degradation path back into the hard failure
+ * it exists to avoid. So the session starts, on the machine's own copy, and is
+ * told which tool it is running without.
+ */
+export function toolPaths(lock: Lockfile | null, env: Env = process.env): { paths: string[]; missing: string[] } {
+  const paths: string[] = [];
+  const missing: string[] = [];
+
+  for (const tool of lock?.tools ?? []) {
+    // An unscopeable entry contributes nothing and says nothing here: it is a
+    // recorded outcome, and Sync has already warned about it.
+    if (tool.version === undefined || tool.bins === undefined) continue;
+
+    if (hasBins(tool.bins, env)) {
+      for (const bin of tool.bins) paths.push(resolveBinPath(bin, env));
+    } else {
+      missing.push(
+        `\`${tool.tool}\` is locked at ${tool.version} but the Store does not hold it, so this session will use ` +
+          `whatever ${tool.tool} is on your PATH. Run \`harv sync\` to install the pinned version.`,
+      );
+    }
+  }
+  return { paths, missing };
+}
+
 export const nonPortable = (name: string, declared: string): string =>
   `skill \`${name}\` comes from the local path \`${declared}\`, which no clone of this project can resolve. ` +
   `Push it to a git repository and declare that instead to make this Harvenv portable.`;
@@ -329,4 +392,5 @@ const withDefaults = (deps: Partial<SyncDeps>): SyncDeps => ({
   env: deps.env ?? process.env,
   resolveCommit: deps.resolveCommit ?? realResolve,
   fetchSource: deps.fetchSource ?? realFetch,
+  toolchain: deps.toolchain ?? {},
 });

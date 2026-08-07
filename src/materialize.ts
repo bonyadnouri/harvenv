@@ -191,16 +191,27 @@ function validatePlugin(name: string, path: string): void {
 }
 
 /**
+ * The YAML frontmatter block of a Markdown file, if it opens with one. Shared
+ * with the Toolchain, which reads a skill's `requires:` from the same block.
+ */
+export function frontmatter(source: string): string | undefined {
+  return /^---\r?\n([\s\S]*?)\r?\n---/.exec(source)?.[1];
+}
+
+/**
  * `name:` from a SKILL.md YAML frontmatter block, if it has one. YAML scalars
  * may be quoted, and a skill that writes `name: "foo"` means `foo` — carrying
  * the quotes through would reject a skill whose name is in fact correct.
  */
 function frontmatterName(source: string): string | undefined {
-  const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(source);
-  if (!match?.[1]) return undefined;
-  const value = /^name:[ \t]*(.+?)[ \t]*$/m.exec(match[1])?.[1];
-  return value === undefined ? undefined : value.replace(/^(['"])(.*)\1$/, "$2");
+  const block = frontmatter(source);
+  if (block === undefined) return undefined;
+  const value = /^name:[ \t]*(.+?)[ \t]*$/m.exec(block)?.[1];
+  return value === undefined ? undefined : unquote(value);
 }
+
+/** A YAML scalar's value: `"foo"` and `'foo'` both mean `foo`. */
+export const unquote = (value: string): string => value.replace(/^(['"])(.*)\1$/, "$2");
 
 function link(linkPath: string, target: string, owned: boolean): void {
   // `existsSync` is false for a dangling link, and a link whose target moved is

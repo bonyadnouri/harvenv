@@ -33,6 +33,7 @@
  */
 
 import { spawn } from "node:child_process";
+import { delimiter } from "node:path";
 
 import { generateMcpConfig } from "./mcp.ts";
 import { generateSettings } from "./settings.ts";
@@ -92,7 +93,7 @@ export function launchEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.Process
 }
 
 /**
- * Claude Code itself, never a harv shim.
+* Claude Code itself, never a harv shim.
  *
  * With the Shim installed, `claude` on PATH *is* harv — and the shim's job
  * inside a harvenv project is to run `harv claude`. Spawning by bare name here
@@ -112,6 +113,29 @@ export function claudeBinary(pathString: string): string {
 }
 
 /**
+ * The same environment with the Harvenv's Toolchain in front of it on PATH
+ * (ADR 0006).
+ *
+ * Prepending is the whole mechanism, and it is why the host machine needs no
+ * mutating. The pinned versions are found first, so a session sees them; the
+ * rest of PATH is still there, so a tool harv could not scope still resolves to
+ * whatever the machine has; and the parent shell is not modified at all, so the
+ * developer's own `node` is exactly what it was the moment the session exits.
+ *
+ * PATH is looked up case-insensitively because Windows spells it `Path`, and
+ * adding a second key would leave the original one winning.
+ */
+export function withToolPaths(base: NodeJS.ProcessEnv, toolPaths: string[]): NodeJS.ProcessEnv {
+  if (toolPaths.length === 0) return { ...base };
+
+  const next = { ...base };
+  const key = Object.keys(next).find((name) => name.toUpperCase() === "PATH") ?? "PATH";
+  const existing = next[key];
+  next[key] = [...toolPaths, ...(existing ? [existing] : [])].join(delimiter);
+  return next;
+}
+
+/**
  * Hand the terminal to Claude Code and adopt its exit code. The session runs
  * from the project root so that project scope — and with it every materialized
  * Component — is the one the Manifest describes, even when harv was invoked
@@ -121,11 +145,13 @@ export function launch(
   session: Session,
   passthrough: string[],
   env: NodeJS.ProcessEnv,
+  toolPaths: string[] = [],
 ): Promise<number> {
-  // Marked once, then used for both jobs, so `${VAR}` resolution and the
-  // session still see the same environment — the marker is the only thing
-  // either of them has that the launching shell did not.
-  const sessionEnv = launchEnv(env);
+  // Composed once, then used for every job below, so `${VAR}` resolution, the
+  // binary lookup and the session all see the same environment — the Tripwire
+  // marker and the Toolchain are the only things any of them has that the
+  // launching shell did not.
+  const sessionEnv = withToolPaths(launchEnv(env), toolPaths);
   // Resolved from the same environment the session will run in, so the binary
   // harv starts is the one that PATH names — not the one harv's own happens to.
   const binary = claudeBinary(sessionEnv.PATH ?? "");

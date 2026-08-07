@@ -5,8 +5,9 @@ import { chmodSync, mkdirSync, readFileSync, statSync, writeFileSync } from "nod
 import { dirname, join } from "node:path";
 import { gzipSync } from "node:zlib";
 
-import { MiseError, resolveMise } from "../src/mise.ts";
+import { miseEnv, MiseError, resolveBinPath, resolveMise } from "../src/mise.ts";
 import type { MiseSources } from "../src/mise.ts";
+import { toolsRoot } from "../src/store.ts";
 import { tempDir } from "./helpers.ts";
 
 /** A stand-in mise: the resolution rules do not care what the bytes are. */
@@ -101,4 +102,51 @@ test("mise is never taken from PATH — an unpinned engine is the drift harv exi
   writeFileSync(join(onPath, "mise"), PAYLOAD);
 
   assert.throws(() => resolveMise(sources({ env: { PATH: onPath } })), MiseError);
+});
+
+// ---------------------------------------------------------------------------
+// The isolation every invocation runs under (ADR 0006)
+// ---------------------------------------------------------------------------
+
+test("installs land in the Store, so every project on the machine shares them", () => {
+  const home = tempDir();
+
+  assert.equal(miseEnv({ HARV_HOME: home }).MISE_DATA_DIR, toolsRoot({ HARV_HOME: home }));
+});
+
+test("every directory mise reads or writes is redirected inside harv's home", () => {
+  const home = tempDir();
+  const env = miseEnv({ HARV_HOME: home });
+
+  for (const key of [
+    "MISE_DATA_DIR",
+    "MISE_CACHE_DIR",
+    "MISE_STATE_DIR",
+    "MISE_CONFIG_DIR",
+    "MISE_GLOBAL_CONFIG_FILE",
+    "MISE_SYSTEM_CONFIG_FILE",
+  ]) {
+    assert.ok(env[key]?.startsWith(home), `${key} is ${env[key]}, which is outside ${home}`);
+  }
+});
+
+test("a machine that already uses mise keeps its own setup — harv names none of it", () => {
+  const env = miseEnv({ HARV_HOME: tempDir(), HOME: "/home/dev" });
+
+  for (const value of Object.values(env)) {
+    assert.doesNotMatch(value, /\.local\/share\/mise|\.config\/mise|\.cache\/mise|\.local\/state\/mise/);
+  }
+});
+
+test("a Sync nobody is watching is never blocked on a prompt", () => {
+  assert.equal(miseEnv({ HARV_HOME: tempDir() }).MISE_YES, "1");
+});
+
+test("a locked bin path is re-checked before it can become part of a session's PATH", () => {
+  const env = { HARV_HOME: tempDir() };
+
+  assert.equal(resolveBinPath("installs/node/22.18.0/bin", env), join(toolsRoot(env), "installs/node/22.18.0/bin"));
+  for (const escape of ["../../etc", "/usr/bin", "installs/../../..", ""]) {
+    assert.throws(() => resolveBinPath(escape, env), MiseError, `\`${escape}\` should not resolve`);
+  }
 });

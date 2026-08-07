@@ -24,7 +24,7 @@ harv --version           # which harv, which mise, and whether you are behind
 
 ## Status
 
-Skills and plugin pins work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate and plugins by marketplace coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, your personal staples survive through an Overlay that adds to the Manifest without overriding it, and a GitHub Actions workflow runs that whole path on a clean runner on every push. No Toolchain or Doctor yet, and standalone agents and commands are still ahead. mise ships inside harv but nothing drives it yet; `harv mise` reaches it for diagnosis.
+Skills, plugin pins and the Toolchain work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate, plugins by marketplace coordinate and system tools by version, `harv sync` fetches and installs them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it with the pinned tools in front of its PATH — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, your personal staples survive through an Overlay that adds to the Manifest without overriding it, and a GitHub Actions workflow runs that whole path on a clean runner on every push. No Doctor yet, and standalone agents and commands are still ahead.
 
 The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their trade-offs live in [docs/adr/](./docs/adr/). The implementation plan is the issue tracker — issues are thin vertical slices in dependency order.
 
@@ -42,7 +42,7 @@ The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their
 
 Init is safe on a project that already has its own `.gitignore` and `.claude/settings.json`: it appends the entries that are missing, merges the Tripwire alongside whatever hooks are already there, and leaves everything else byte-identical. Re-running it changes nothing.
 
-A Manifest declares what the project's Harvenv contains: skills from git repositories, plugins from marketplaces, plus the settings and MCP servers the session runs with.
+A Manifest declares what the project's Harvenv contains: skills from git repositories, plugins from marketplaces, the system tools they run on, plus the settings and MCP servers the session runs with.
 
 ```toml
 # harvenv.toml
@@ -52,6 +52,8 @@ house-style   = { path = "vendor/skills/house-style" }
 
 [plugins]
 gsap-skills = { marketplace = "https://github.com/greensock/gsap-skills.git", ref = "v1.0.0" }
+[tools]
+node = "22.18"
 
 [settings]
 model = "opus"
@@ -86,6 +88,24 @@ harv claude --no-overlay # the Manifest alone — what CI and a headless run sho
 `harv add` writes the entry into `[skills]` — or into `[plugins]`, for `--marketplace` — and syncs it; a coordinate may carry its ref and subdirectory as `@ref` and `#subdir`, or you can pass `--ref` and `--subdir` separately. It edits the Manifest as text, so your comments and ordering survive, and it puts the file back if the Source turns out not to be fetchable.
 
 `harv sync` resolves each entry, fetches what the Store does not already hold, and writes `harvenv.lock` pinning both the commit SHA and a hash of the content that commit produced. **Commit the Lockfile** — it is what makes a teammate's Harvenv identical to yours.
+
+### The Toolchain
+
+`[tools]` declares the system tools — runtimes, CLIs, SDKs — the project's skills run on, as a version spec each. A skill can also carry its own requirement, so a project that adds it does not have to learn what it needs:
+
+```yaml
+---
+name: house-style
+description: ...
+requires: node@22, ripgrep
+---
+```
+
+`harv sync` installs them **project-scoped** ([ADR 0006](./docs/adr/0006-project-scoped-toolchain.md)): into the Store, one directory per exact version, shared by every project on the machine. `harv claude` puts those directories in front of the session's PATH, so a session sees exactly the pinned versions while your shell keeps its own. Nothing on the machine is mutated — no sudo, no system package manager, no writes outside `HARV_HOME`; an existing nvm, brew or asdf setup is untouched.
+
+The Lockfile pins the exact version each spec resolved to, so a teammate installs what you installed rather than what the spec means today ([ADR 0011](./docs/adr/0011-tools-pinned-by-version-not-content-hash.md)). Both routes into the Toolchain end up there, and the Manifest wins when they disagree: a `[tools]` pin overrides what a skill asked for, because Manifest settings are binding ([ADR 0005](./docs/adr/0005-manifest-settings-are-binding.md)). Two skills asking for different versions of the same tool is the one case harv will not guess at — it says so and asks you to pin it.
+
+Installs run through [mise](https://mise.jdx.dev), which harv looks for in three places: `HARV_MISE`, a copy vendored alongside harv itself, then a `mise` already on your PATH. A tool mise has no installer for — or any tool at all when there is no mise to be found — is **not** a failure. It is recorded in the Lockfile as a hint naming who needed it, warned about at sync, and left to the machine's own copy; `harv doctor` will surface it. That is the honest degradation path, not a second install mechanism.
 
 `harv claude` finds `harvenv.toml` in the working directory or the nearest ancestor — switching environments is just `cd` (ADR 0001) — links the locked skills into `.claude/skills/` as symlinks into the Store, and starts Claude Code with the [ADR 0003](./docs/adr/0003-isolation-via-launch-flags.md) flag recipe. It never fetches: if the Manifest and the Lockfile disagree it names the entries and stops, rather than launching a session that is not the one the Manifest describes ([ADR 0009](./docs/adr/0009-launcher-never-syncs.md)). Outside a harvenv project it says so and stops too.
 
@@ -158,7 +178,7 @@ Pinned plugins are linked under `.claude/harv-plugins/<name>` and served with `-
 
 ### The Store
 
-Fetched content lands in `~/.harv/store`, addressed by a hash of the tree itself rather than by the commit it came from ([ADR 0010](./docs/adr/0010-store-addressed-by-content-hash.md)). Two projects declaring the same skill share one copy, and the second one syncs with no network access at all — the Lockfile already says which bytes it needs, and the Store either has them or does not. `HARV_HOME` moves the whole thing, which is what CI and the verification scripts use.
+Fetched content lands in `~/.harv/store`, addressed by a hash of the tree itself rather than by the commit it came from ([ADR 0010](./docs/adr/0010-store-addressed-by-content-hash.md)). Tools live beside it in `~/.harv/store/tools`, addressed by version instead — a runtime is not reproducible byte for byte the way a fetched skill is, so hashing one would report a false alarm on every second machine ([ADR 0011](./docs/adr/0011-tools-pinned-by-version-not-content-hash.md)). Two projects declaring the same skill share one copy, and the second one syncs with no network access at all — the Lockfile already says which bytes it needs, and the Store either has them or does not. `HARV_HOME` moves the whole thing, which is what CI and the verification scripts use.
 
 A Source declared by `path` is allowed and stays live — it is materialized straight from where it sits, never copied into the Store, so you can develop a skill in-tree. It is also the one thing a clone cannot reproduce, so every Sync warns about it by name. An Overlay's path Sources are not warned about: nobody clones an Overlay, so a local directory in one is just where you keep a skill you are still writing.
 
@@ -188,7 +208,7 @@ The recipe is `harv sync`, a `git diff --exit-code` on the Lockfile, and a headl
 
 ## Hacking on it
 
-Running from source needs Node ≥ 22.18 or Bun, `git` on PATH, and the repo's dependencies:
+Running from source needs Node ≥ 22.18 or Bun, `git` on PATH, and the repo's dependencies. A `[tools]` section also needs the vendored mise, which a source checkout fetches with `bun scripts/vendor-mise.ts` — without it, tools degrade to hints rather than failing:
 
 ```
 npm install
@@ -266,7 +286,13 @@ The eighth builds a binary and checks what shipping it promises: that it runs wi
 bun scripts/verify-packaging.ts          # add --all to build every platform
 ```
 
-The ninth does the second's job for the Shim: it installs one into a scratch `HARV_HOME`, types `claude` into a real shell inside and outside a harvenv project, and compares the resulting sessions against an unshimmed control. Its own last check re-reads the machine's dotfiles and `claude` and asserts the run left them exactly as it found them:
+The ninth runs `harv` against a real, pinned mise and installs a real Node into a fixture Store, then reads back what a session's PATH actually resolves to. Two of its claims are again about absences — no second install, and nothing global touched — so it proves them by removing the possibility: the second project syncs with a `mise` that records being run and then fails, and `sudo` plus every system package manager sit on PATH ahead of the real ones for the whole run, recording any call. It also snapshots the machine's own tool directories before and after and diffs them:
+
+```
+node scripts/verify-toolchain.ts         # needs network; uses the vendored or pinned mise
+```
+
+The tenth does the second's job for the Shim: it installs one into a scratch `HARV_HOME`, types `claude` into a real shell inside and outside a harvenv project, and compares the resulting sessions against an unshimmed control. Its own last check re-reads the machine's dotfiles and `claude` and asserts the run left them exactly as it found them:
 
 ```
 node scripts/verify-shim.ts              # exits non-zero if interception, uninstall or
@@ -279,7 +305,7 @@ The last is the Overlay's: that one staples file reaches two different projects,
 node scripts/verify-overlay.ts           # needs git and claude
 ```
 
-All ten take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your Overlay, your `~/.claude`, or your shell's startup files. The unit tests are separate and need no `claude` binary:
+All eleven take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your Overlay, your `~/.claude`, your shell's startup files, or your own mise setup. The unit tests are separate and need no `claude` binary and no install engine:
 
 ```
 npm test

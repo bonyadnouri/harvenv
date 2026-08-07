@@ -9,10 +9,12 @@ import {
   LockfileError,
   lockfilePath,
   readLockfile,
+  toolDrift,
   writeLockfile,
 } from "../src/lockfile.ts";
 import type { LockedPlugin, LockedSkill } from "../src/lockfile.ts";
 import { loadManifest } from "../src/manifest.ts";
+import type { ResolvedTool } from "../src/tools.ts";
 import { tempDir } from "./helpers.ts";
 
 const HASH = `sha256:${"a".repeat(64)}`;
@@ -380,4 +382,126 @@ test("driftAgainst notices a Source that changed kind", () => {
   writeLockfile(root, [gitLock("example")]);
 
   assert.equal(driftAgainst(manifest, readLockfile(root)).length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// The Toolchain half
+// ---------------------------------------------------------------------------
+
+const pinnedTool = (overrides: Partial<ResolvedTool> = {}): ResolvedTool => ({
+  tool: "node",
+  spec: "22.18",
+  version: "22.18.0",
+  bins: ["installs/node/22.18.0/bin"],
+  ...overrides,
+});
+
+test("writeLockfile then readLockfile round-trips a pinned tool with its bin paths", () => {
+  const root = tempDir();
+  writeLockfile(root, [], [], [pinnedTool()]);
+
+  assert.deepEqual(readLockfile(root)?.tools, [pinnedTool()]);
+});
+
+test("a Lockfile records an unscopeable requirement as a hint rather than dropping it", () => {
+  const root = tempDir();
+  writeLockfile(root, [], [], [{ tool: "obscurity", spec: "1", hint: "no scoped installer for obscurity" }]);
+
+  assert.deepEqual(readLockfile(root)?.tools, [
+    { tool: "obscurity", spec: "1", hint: "no scoped installer for obscurity" },
+  ]);
+});
+
+test("a project with no Toolchain writes no tools key at all", () => {
+  const root = tempDir();
+  writeLockfile(root, [gitLock("example")]);
+
+  assert.ok(!readFileSync(lockfilePath(root), "utf8").includes("tools"));
+  assert.deepEqual(readLockfile(root)?.tools, []);
+});
+
+test("tools are written in name order, so the file is a stable diff", () => {
+  const root = tempDir();
+  writeLockfile(root, [], [], [pinnedTool({ tool: "ripgrep" }), pinnedTool({ tool: "node" })]);
+
+  assert.deepEqual(
+    readLockfile(root)?.tools.map((tool) => tool.tool),
+    ["node", "ripgrep"],
+  );
+});
+
+test("a locked bin path that climbs out of the Store is refused — it would become PATH", () => {
+  const root = tempDir();
+  writeLockfile(root, [], [], [pinnedTool({ bins: ["installs/../../../../usr/bin"] })]);
+
+  assert.throws(
+    () => readLockfile(root),
+    (err: Error) => err instanceof LockfileError && err.message.includes("outside harv's Store"),
+  );
+});
+
+test("an absolute locked bin path is refused for the same reason", () => {
+  const root = tempDir();
+  writeLockfile(root, [], [], [pinnedTool({ bins: ["/usr/local/bin"] })]);
+
+  assert.throws(readLockfile.bind(null, root), LockfileError);
+});
+
+test("a Windows-style locked bin path cannot smuggle a climb past a POSIX reader", () => {
+  const root = tempDir();
+  writeLockfile(root, [], [], [pinnedTool({ bins: ["installs\\..\\..\\..\\Windows"] })]);
+
+  assert.throws(readLockfile.bind(null, root), LockfileError);
+});
+
+test("a pinned tool with no bin paths is refused, because there would be nothing to inject", () => {
+  const root = tempDir();
+  writeLockfile(root, [], [], [pinnedTool({ bins: [] })]);
+
+  assert.throws(
+    () => readLockfile(root),
+    (err: Error) => err instanceof LockfileError && err.message.includes("`bins`"),
+  );
+});
+
+test("a locked tool version that is not a plain version is refused before it becomes a path", () => {
+  const root = tempDir();
+  writeFileSync(
+    lockfilePath(root),
+    `version = 1\nskills = []\n\n[[tools]]\nname = "node"\nspec = "22"\nversion = "../../etc"\nbins = ["installs/node/x/bin"]\n`,
+  );
+
+  assert.throws(readLockfile.bind(null, root), LockfileError);
+});
+
+test("toolDrift reports nothing when the Toolchain and the Lockfile agree", () => {
+  const lock = { version: 1, skills: [], plugins: [], tools: [pinnedTool()] };
+
+  assert.deepEqual(toolDrift([{ tool: "node", spec: "22.18", from: "the Manifest" }], lock), []);
+});
+
+test("toolDrift names a tool that is needed but not locked, and who needs it", () => {
+  const drift = toolDrift([{ tool: "node", spec: "22.18", from: "skill `alpha`" }], { version: 1, skills: [], plugins: [], tools: [] });
+
+  assert.deepEqual(drift, [{ name: "node", reason: "needed by skill `alpha` but not locked" }]);
+});
+
+test("toolDrift names a version spec that moved, quoting both", () => {
+  const lock = { version: 1, skills: [], plugins: [], tools: [pinnedTool()] };
+  const drift = toolDrift([{ tool: "node", spec: "24", from: "the Manifest" }], lock);
+
+  assert.deepEqual(drift.length, 1);
+  assert.match(drift[0]?.reason ?? "", /locked `22\.18`.*needs `24`/);
+});
+
+test("toolDrift names a tool nothing needs any more", () => {
+  const drift = toolDrift([], { version: 1, skills: [], plugins: [], tools: [pinnedTool()] });
+
+  assert.deepEqual(drift, [{ name: "node", reason: "locked but nothing needs it any more" }]);
+});
+
+test("an unscopeable locked tool is a recorded outcome, not drift", () => {
+  const lock = { version: 1, skills: [], plugins: [], tools: [{ tool: "obscurity", spec: "1", hint: "no installer" }] };
+
+  assert.deepEqual(toolDrift([{ tool: "obscurity", spec: "1", from: "skill `alpha`" }], lock), []);
 });
