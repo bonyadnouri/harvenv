@@ -7,11 +7,12 @@ import { fetchSource, resolveCommit } from "../src/git.ts";
 import { readLockfile } from "../src/lockfile.ts";
 import { loadManifest } from "../src/manifest.ts";
 import type { Manifest } from "../src/manifest.ts";
-import { hashTree, storePath } from "../src/store.ts";
+import { hashTree, storePath, toolsRoot } from "../src/store.ts";
 import type { Env } from "../src/store.ts";
 import { composeSession, NO_OVERLAY } from "../src/overlay.ts";
-import { plan, readLocks, sync, SyncError } from "../src/sync.ts";
+import { plan, readLocks, sync, SyncError, toolPaths } from "../src/sync.ts";
 import type { SyncDeps } from "../src/sync.ts";
+import type { ToolchainDeps } from "../src/tools.ts";
 import {
   commitFiles,
   git,
@@ -49,6 +50,9 @@ function counting(env: Env): SyncDeps & { fetches: string[] } {
       fetches.push(commit);
       return fetchSource(source, commit, forEnv);
     },
+    // No engine, so a test that declares no tools resolves none — and one that
+    // does gets the recorded-hint path without an installer on the machine.
+    toolchain: { findMise: () => ({ unavailable: "no engine in this test" }) },
     fetches,
   };
 }
@@ -62,6 +66,7 @@ const offline = (env: Env): SyncDeps => ({
   fetchSource: () => {
     throw new Error("fetchSource was called, so this Sync re-fetched");
   },
+  toolchain: { findMise: () => ({ unavailable: "no engine in this test" }) },
 });
 
 const skillsDir = (root: string) => join(root, ".claude", "skills");
@@ -571,5 +576,171 @@ test("plan tells the user to sync when the Store does not hold a pinned plugin",
   assert.throws(
     () => plan(solo(manifest), readLocks(manifest.root), env),
     (err: Error) => err instanceof SyncError && /alpha-pack/.test(err.message) && /harv sync/.test(err.message),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The Toolchain (ADR 0006)
+// ---------------------------------------------------------------------------
+
+/** Any path will do: every engine call is faked, and only the calls are asserted. */
+const MISE = "/fake/mise";
+
+/**
+ * An engine that installs into the real Store, so the Store's own answers —
+ * "do I already hold this version?" — are the ones under test. Only the
+ * downloading is faked; where things land, and who asks for them, is not.
+ */
+function fakeEngine(env: Env, overrides: Partial<ToolchainDeps> = {}): Partial<ToolchainDeps> & { calls: string[] } {
+  const calls: string[] = [];
+  return {
+    calls,
+    findMise: () => ({ bin: MISE }),
+    resolveVersion: (_mise, tool, spec) => {
+      calls.push(`resolve ${tool}@${spec}`);
+      return `${spec}.99`;
+    },
+    isKnown: () => true,
+    install: (_mise, tool, version) => {
+      calls.push(`install ${tool}@${version}`);
+      mkdirSync(join(toolsRoot(env), "installs", tool, version, "bin"), { recursive: true });
+    },
+    binPaths: (_mise, tool, version) => [`installs/${tool}/${version}/bin`],
+    ...overrides,
+  };
+}
+
+test("sync installs a Manifest-declared tool and locks the exact version it resolved", () => {
+  const env = home();
+  const manifest = project(`[tools]\nnode = "22"\n`);
+  const engine = fakeEngine(env);
+
+  const result = sync(solo(manifest), { env, toolchain: engine });
+
+  assert.deepEqual(result.toolchain.installed, ["node@22.99"]);
+  assert.deepEqual(readLockfile(manifest.root)?.tools, [
+    { tool: "node", spec: "22", version: "22.99", bins: ["installs/node/22.99/bin"] },
+  ]);
+});
+
+test("a tool lands in the Store, not in the project", () => {
+  const env = home();
+  const manifest = project(`[tools]\nnode = "22"\n`);
+  sync(solo(manifest), { env, toolchain: fakeEngine(env) });
+
+  assert.ok(existsSync(join(toolsRoot(env), "installs", "node", "22.99")));
+  assert.ok(!existsSync(join(manifest.root, "node")));
+});
+
+test("a skill's own requires declaration reaches the Toolchain", () => {
+  const env = home();
+  const repo = gitRepo({
+    "SKILL.md": `---\nname: example\ndescription: Fixture.\nrequires: node@22\n---\n\nBody.\n`,
+  });
+  const manifest = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
+
+  const result = sync(solo(manifest), { ...counting(env), toolchain: fakeEngine(env) });
+
+  assert.deepEqual(result.toolchain.installed, ["node@22.99"]);
+});
+
+test("a second project needing the same version installs nothing and runs no engine at all", () => {
+  const env = home();
+  const first = project(`[tools]\nnode = "22"\n`);
+  sync(solo(first), { env, toolchain: fakeEngine(env) });
+
+  const second = project(`[tools]\nnode = "22"\n`);
+  writeFileSync(join(second.root, "harvenv.lock"), readFileSync(join(first.root, "harvenv.lock"), "utf8"));
+  const engine = fakeEngine(env, {
+    findMise: () => {
+      throw new Error("the Toolchain reached for an engine it did not need");
+    },
+  });
+
+  const result = sync(solo(second), { env, toolchain: engine });
+
+  assert.deepEqual(result.toolchain.reused, ["node@22.99"]);
+  assert.deepEqual(result.toolchain.installed, []);
+  assert.deepEqual(engine.calls, []);
+});
+
+test("a second machine converges on the locked version, not on what the spec resolves to today", () => {
+  const env = home();
+  const manifest = project(`[tools]\nnode = "22"\n`);
+  // What a teammate cloned: the Manifest's spec, and a Lockfile pinning an
+  // exact version that is not the one a fresh resolve would return.
+  writeFileSync(
+    join(manifest.root, "harvenv.lock"),
+    `version = 1\nskills = []\n\n[[tools]]\nname = "node"\nspec = "22"\nversion = "22.18.0"\nbins = ["installs/node/22.18.0/bin"]\n`,
+  );
+
+  const engine = fakeEngine(env);
+  const result = sync(solo(manifest), { env, toolchain: engine });
+
+  assert.deepEqual(result.toolchain.installed, ["node@22.18.0"]);
+  assert.ok(!engine.calls.some((call) => call.startsWith("resolve")), engine.calls.join(", "));
+});
+
+test("an unscopeable requirement is recorded in the Lockfile and the Sync still succeeds", () => {
+  const env = home();
+  const manifest = project(`[tools]\nobscurity = "1"\n`);
+  const engine = fakeEngine(env, { resolveVersion: () => null, isKnown: () => false });
+
+  const result = sync(solo(manifest), { env, toolchain: engine });
+
+  assert.deepEqual(result.toolchain.unscopeable, ["obscurity"]);
+  assert.deepEqual(readLockfile(manifest.root)?.tools[0]?.version, undefined);
+  assert.match(readLockfile(manifest.root)?.tools[0]?.hint ?? "", /obscurity/);
+  assert.deepEqual(result.warnings.length, 1);
+});
+
+test("sync reports the Toolchain drift it is about to resolve", () => {
+  const env = home();
+  const manifest = project(`[tools]\nnode = "22"\n`);
+
+  const result = sync(solo(manifest), { env, toolchain: fakeEngine(env) });
+
+  assert.deepEqual(result.drift, [{ name: "node", reason: "needed by the Manifest but not locked" }]);
+});
+
+test("a tool the Manifest stopped declaring leaves the Lockfile", () => {
+  const env = home();
+  const manifest = project(`[tools]\nnode = "22"\n`);
+  sync(solo(manifest), { env, toolchain: fakeEngine(env) });
+
+  const dropped = loadManifest(manifest.path);
+  writeFileSync(manifest.path, "");
+  sync(solo(loadManifest(dropped.path)), { env, toolchain: fakeEngine(env) });
+
+  assert.deepEqual(readLockfile(manifest.root)?.tools, []);
+});
+
+test("toolPaths resolves every locked tool to a bin directory inside the Store", () => {
+  const env = home();
+  const manifest = project(`[tools]\nnode = "22"\n`);
+  sync(solo(manifest), { env, toolchain: fakeEngine(env) });
+
+  assert.deepEqual(toolPaths(readLockfile(manifest.root), env), [
+    join(toolsRoot(env), "installs", "node", "22.99", "bin"),
+  ]);
+});
+
+test("toolPaths contributes nothing for an unscopeable tool — the session falls back to the machine", () => {
+  const env = home();
+  const manifest = project(`[tools]\nobscurity = "1"\n`);
+  sync(solo(manifest), { env, toolchain: fakeEngine(env, { resolveVersion: () => null, isKnown: () => false }) });
+
+  assert.deepEqual(toolPaths(readLockfile(manifest.root), env), []);
+});
+
+test("toolPaths tells the user to sync when the Store does not hold what the Lockfile pins", () => {
+  const env = home();
+  const manifest = project(`[tools]\nnode = "22"\n`);
+  sync(solo(manifest), { env, toolchain: fakeEngine(env) });
+  rmSync(join(toolsRoot(env), "installs", "node", "22.99"), { recursive: true });
+
+  assert.throws(
+    () => toolPaths(readLockfile(manifest.root), env),
+    (err: Error) => err instanceof SyncError && err.message.includes("harv sync"),
   );
 });

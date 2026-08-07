@@ -26,7 +26,7 @@ interface Recorded {
   exit: number;
   out: string;
   err: string;
-  launched: Array<{ session: Session; passthrough: string[]; env: Env }>;
+  launched: Array<{ session: Session; passthrough: string[]; env: Env; toolPaths: string[] }>;
   mised: string[][];
 }
 
@@ -61,8 +61,8 @@ function harv(cwd: string, options: Options = {}) {
       stderr: (line) => {
         err += `${line}\n`;
       },
-      launch: async (session, passthrough, env) => {
-        launched.push({ session, passthrough, env });
+      launch: async (session, passthrough, env, toolPaths) => {
+        launched.push({ session, passthrough, env, toolPaths });
         return options.exitCode ?? 0;
       },
       runMise: async (args) => {
@@ -1170,4 +1170,154 @@ test("the Overlay's Lockfile says not to commit it, where the Manifest's says th
   assert.doesNotMatch(overlayLock, /Commit it/, "it is gitignored, so telling anyone to commit it is wrong");
   assert.match(overlayLock, /not commit/i);
   assert.match(readFileSync(join(root, "harvenv.lock"), "utf8"), /Commit it/);
+});
+
+// ---------------------------------------------------------------------------
+// The Toolchain (ADR 0006)
+// ---------------------------------------------------------------------------
+
+/**
+ * A stand-in for the install engine: it answers the three questions harv asks,
+ * installs by creating the directory a real one would, and records the
+ * environment it was handed — so a test can assert that harv redirected mise
+ * away from the user's own setup before running it.
+ */
+function stubMise(receipt: string): string {
+  const path = join(tempDir(), "mise");
+  writeFileSync(
+    path,
+    `#!/usr/bin/env node\n` +
+      `const fs = require("node:fs");\n` +
+      `const p = require("node:path");\n` +
+      `const [command, coordinate = ""] = process.argv.slice(2);\n` +
+      `const at = coordinate.lastIndexOf("@");\n` +
+      `const tool = at > 0 ? coordinate.slice(0, at) : coordinate;\n` +
+      `const spec = at > 0 ? coordinate.slice(at + 1) : "";\n` +
+      `fs.appendFileSync(${JSON.stringify(receipt)}, JSON.stringify({\n` +
+      `  argv: process.argv.slice(2), env: process.env, cwd: process.cwd()\n` +
+      `}) + "\\n");\n` +
+      `const data = process.env.MISE_DATA_DIR;\n` +
+      `const version = spec.includes(".") ? spec : spec + ".1.0";\n` +
+      `const bin = p.join(data, "installs", tool, version, "bin");\n` +
+      `if (command === "latest") { if (tool === "obscurity") process.exit(1); console.log(version); }\n` +
+      `else if (command === "registry") { process.exit(tool === "obscurity" ? 1 : 0); }\n` +
+      `else if (command === "install") { fs.mkdirSync(bin, { recursive: true }); }\n` +
+      `else if (command === "bin-paths") { console.log(bin); }\n` +
+      `else { process.exit(1); }\n`,
+    { mode: 0o755 },
+  );
+  return path;
+}
+
+/** Every invocation the stub engine recorded. */
+const invocations = (receipt: string): Array<{ argv: string[]; env: Record<string, string>; cwd: string }> =>
+  existsSync(receipt)
+    ? readFileSync(receipt, "utf8")
+        .trim()
+        .split("\n")
+        .map((line) => JSON.parse(line))
+    : [];
+
+/**
+ * A CLI whose Toolchain engine is the stub above, pointed at through the same
+ * `HARV_MISE_BIN` a user would use — so these exercise the real resolution and
+ * the real process layer, and only the downloading is faked.
+ */
+function harvWithEngine(cwd: string, receipt: string) {
+  const store = tempDir();
+  const launched: Recorded["launched"] = [];
+  const mised: string[][] = [];
+
+  return async (argv: string[]): Promise<Recorded> => {
+    let out = "";
+    let err = "";
+    const exit = await run(argv, {
+      cwd,
+      env: { HARV_HOME: store, HARV_MISE_BIN: stubMise(receipt), PATH: process.env.PATH ?? "" },
+      stdout: (line) => {
+        out += `${line}\n`;
+      },
+      stderr: (line) => {
+        err += `${line}\n`;
+      },
+      launch: async (session, passthrough, env, toolPaths) => {
+        launched.push({ session, passthrough, env, toolPaths });
+        return 0;
+      },
+      runMise: async (args) => {
+        mised.push(args);
+        return 0;
+      },
+      updateHint: async () => null,
+      shim: shimSandbox(),
+    });
+    return { exit, out, err, launched, mised };
+  };
+}
+
+test("harv sync installs a declared tool and reports it", async () => {
+  const receipt = join(tempDir(), "mise.jsonl");
+  const cli = harvWithEngine(project('[tools]\nnode = "22"\n'), receipt);
+
+  const { exit, out } = await cli(["sync"]);
+
+  assert.equal(exit, 0);
+  assert.match(out, /installed node@22\.1\.0/);
+  assert.ok(
+    invocations(receipt).some((call) => call.argv[0] === "install"),
+    "the engine was asked to install",
+  );
+});
+
+test("harv never lets the engine touch the user's own mise setup", async () => {
+  const receipt = join(tempDir(), "mise.jsonl");
+  await harvWithEngine(project('[tools]\nnode = "22"\n'), receipt)(["sync"]);
+
+  for (const call of invocations(receipt)) {
+    for (const key of ["MISE_DATA_DIR", "MISE_CONFIG_DIR", "MISE_CACHE_DIR", "MISE_STATE_DIR"]) {
+      assert.ok(call.env[key]?.length, `${key} was redirected`);
+      assert.ok(!/\.local\/share\/mise$|\.config\/mise$/.test(call.env[key]!), `${key} is not the user's own`);
+    }
+  }
+});
+
+test("harv claude hands the session the Harvenv's tool paths", async () => {
+  const receipt = join(tempDir(), "mise.jsonl");
+  const cli = harvWithEngine(project('[tools]\nnode = "22"\n'), receipt);
+  await cli(["sync"]);
+
+  const { exit, launched } = await cli(["claude"]);
+
+  assert.equal(exit, 0);
+  assert.equal(launched[0]?.toolPaths.length, 1);
+  assert.match(launched[0]?.toolPaths[0] ?? "", /installs\/node\/22\.1\.0\/bin$/);
+});
+
+test("harv claude refuses to start when the Toolchain has drifted from the Lockfile", async () => {
+  const receipt = join(tempDir(), "mise.jsonl");
+  const root = project('[tools]\nnode = "22"\n');
+  const cli = harvWithEngine(root, receipt);
+  await cli(["sync"]);
+  writeFileSync(join(root, "harvenv.toml"), '[tools]\nnode = "24"\n');
+
+  const { exit, err, launched } = await cli(["claude"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /node/);
+  assert.match(err, /harv sync/);
+  assert.deepEqual(launched, [], "no session started from a Harvenv the Manifest does not describe");
+});
+
+test("an unscopeable tool is a warning and a launch, not a failure", async () => {
+  const receipt = join(tempDir(), "mise.jsonl");
+  const cli = harvWithEngine(project('[tools]\nobscurity = "1"\n'), receipt);
+
+  const synced = await cli(["sync"]);
+  const { exit, launched } = await cli(["claude"]);
+
+  assert.equal(synced.exit, 0);
+  assert.match(synced.err, /obscurity/);
+  assert.match(synced.err, /no scoped installer/);
+  assert.equal(exit, 0);
+  assert.deepEqual(launched[0]?.toolPaths, [], "the session falls back to the machine's own PATH");
 });

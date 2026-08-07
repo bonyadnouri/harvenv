@@ -22,8 +22,9 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { dirname, isAbsolute, join } from "node:path";
 import { parse as parseToml, stringify as stringifyToml, TomlError } from "smol-toml";
 
-import { COMPONENT_NAME_RULE, describeSource, isComponentName } from "./manifest.ts";
+import { COMPONENT_NAME_RULE, describeSource, isComponentName, isToolName, isToolSpec } from "./manifest.ts";
 import type { Manifest, MarketplaceSource, Source } from "./manifest.ts";
+import type { Requirement, ResolvedTool } from "./tools.ts";
 
 export const LOCKFILE_FILENAME = "harvenv.lock";
 
@@ -97,6 +98,12 @@ export interface Lockfile {
   version: number;
   skills: LockedSkill[];
   plugins: LockedPlugin[];
+  /**
+   * The Toolchain, pinned at the exact versions a Sync resolved — plus the
+   * requirements that could not be scoped at all, which are recorded here
+   * rather than dropped so a teammate's Doctor reports the same gap (ADR 0006).
+   */
+  tools: ResolvedTool[];
 }
 
 export interface DriftEntry {
@@ -153,11 +160,14 @@ export function readLockfile(root: string, kind: LockfileKind = COMMITTED_LOCKFI
   if (!Array.isArray(skills)) throw new LockfileError(`${path} has a \`skills\` that is not a list of entries.`);
   const plugins = raw.plugins ?? [];
   if (!Array.isArray(plugins)) throw new LockfileError(`${path} has a \`plugins\` that is not a list of entries.`);
+  const tools = raw.tools ?? [];
+  if (!Array.isArray(tools)) throw new LockfileError(`${path} has a \`tools\` that is not a list of entries.`);
 
   return {
     version: LOCK_VERSION,
     skills: skills.map((entry) => readEntry(entry, root, path)),
     plugins: plugins.map((entry) => readPlugin(entry, path)),
+    tools: tools.map((entry) => readTool(entry, path)),
   };
 }
 
@@ -166,12 +176,16 @@ export function writeLockfile(
   root: string,
   skills: LockedSkill[],
   plugins: LockedPlugin[] = [],
+  tools: ResolvedTool[] = [],
   kind: LockfileKind = COMMITTED_LOCKFILE,
 ): void {
   const body = stringifyToml({
     version: LOCK_VERSION,
-    skills: byName(skills).map(toTable),
-    plugins: byName(plugins).map(toPluginTable),
+    skills: byName(skills, (entry) => entry.name).map(toTable),
+    plugins: byName(plugins, (entry) => entry.name).map(toPluginTable),
+    // Omitted rather than written empty: a project with no Toolchain should not
+    // carry a key that only ever says so.
+    ...(tools.length === 0 ? {} : { tools: byName(tools, (entry) => entry.tool).map(toolTable) }),
   });
   const path = lockfilePath(root, kind);
   mkdirSync(dirname(path), { recursive: true });
@@ -188,8 +202,8 @@ export function removeLockfile(root: string, kind: LockfileKind): void {
   rmSync(lockfilePath(root, kind), { force: true });
 }
 
-const byName = <T extends { name: string }>(entries: T[]): T[] =>
-  [...entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+const byName = <T,>(entries: T[], name: (entry: T) => string): T[] =>
+  [...entries].sort((a, b) => (name(a) < name(b) ? -1 : name(a) > name(b) ? 1 : 0));
 
 /**
  * What the Manifest now says that the Lockfile does not yet reflect.
@@ -261,8 +275,119 @@ export function driftOver(
   return drift;
 }
 
+/**
+ * What the Harvenv now needs from its Toolchain that the Lockfile does not yet
+ * reflect. Read alongside `driftAgainst`, and reported the same way.
+ *
+ * A locked entry that carries only a hint is deliberately not drift: an
+ * unscopeable requirement is a recorded outcome, not an unfinished one, and a
+ * Launcher that refused to start over it would turn ADR 0006's degradation path
+ * back into the hard failure it exists to avoid.
+ */
+export function toolDrift(required: Requirement[], lock: Lockfile | null): DriftEntry[] {
+  const locked = new Map((lock?.tools ?? []).map((entry) => [entry.tool, entry]));
+  const drift: DriftEntry[] = [];
+
+  for (const requirement of required) {
+    const entry = locked.get(requirement.tool);
+    if (entry === undefined) {
+      drift.push({ name: requirement.tool, reason: `needed by ${requirement.from} but not locked` });
+    } else if (entry.spec !== requirement.spec) {
+      drift.push({
+        name: requirement.tool,
+        reason: `version changed: locked \`${entry.spec}\`, ${requirement.from} needs \`${requirement.spec}\``,
+      });
+    }
+  }
+
+  const needed = new Set(required.map((requirement) => requirement.tool));
+  for (const tool of locked.keys()) {
+    if (!needed.has(tool)) drift.push({ name: tool, reason: `locked but nothing needs it any more` });
+  }
+
+  return drift;
+}
+
 /** The identity of a Source for drift purposes: kind and every coordinate part. */
 const coordinate = (source: Source | MarketplaceSource): string => `${source.kind}:${describeSource(source)}`;
+
+function toolTable(entry: ResolvedTool): Record<string, unknown> {
+  const table: Record<string, unknown> = { name: entry.tool, spec: entry.spec };
+  if (entry.version !== undefined) table.version = entry.version;
+  // Recorded rather than derived: where a tool puts its binaries is the
+  // installer's business, and it differs by tool. They are relative to the
+  // Store's tools root, so the pin means the same thing on a machine whose
+  // `HARV_HOME` is somewhere else.
+  if (entry.bins !== undefined) table.bins = entry.bins;
+  if (entry.hint !== undefined) table.hint = entry.hint;
+  return table;
+}
+
+/**
+ * One `[[tools]]` entry, checked before it is believed.
+ *
+ * `bins` gets the hardest look of anything in this file: those paths are joined
+ * onto the Store and prepended to a session's PATH, and this file arrives from
+ * a clone. A relative path that climbs out of the Store would put a directory
+ * of someone else's choosing ahead of everything the user has installed.
+ */
+function readTool(value: unknown, path: string): ResolvedTool {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new LockfileError(`${path} has a [[tools]] entry that is not a table.`);
+  }
+  const entry = value as Record<string, unknown>;
+  const tool = entry.name;
+  if (typeof tool !== "string" || !isToolName(tool)) {
+    throw new LockfileError(
+      `${path} locks a tool named ${JSON.stringify(tool)}, which harv will not use. ` +
+        `Delete the Lockfile and run \`harv sync\`.`,
+    );
+  }
+  const where = `${path} tool \`${tool}\``;
+
+  const spec = text(entry.spec, "spec", where);
+  if (!isToolSpec(spec)) throw new LockfileError(`${where} has a \`spec\` harv will not pass on: ${spec}`);
+
+  if (entry.version === undefined) {
+    // No version means the Sync that wrote this could not scope the tool. The
+    // hint is the whole content of such an entry, so it has to be there.
+    return { tool, spec, hint: text(entry.hint, "hint", where) };
+  }
+
+  const version = text(entry.version, "version", where);
+  if (!isToolSpec(version)) {
+    throw new LockfileError(
+      `${where} has a \`version\` that is not a plain version string: ${version}. ` +
+        `Delete the Lockfile and run \`harv sync\`.`,
+    );
+  }
+
+  const bins = entry.bins;
+  if (!Array.isArray(bins) || bins.length === 0) {
+    throw new LockfileError(`${where} is missing \`bins\`. Delete the Lockfile and run \`harv sync\`.`);
+  }
+  return { tool, spec, version, bins: bins.map((bin) => readBin(bin, where)) };
+}
+
+function readBin(value: unknown, where: string): string {
+  if (typeof value !== "string" || value === "") {
+    throw new LockfileError(`${where} has a \`bins\` entry that is not a path: ${JSON.stringify(value)}`);
+  }
+  const escapes =
+    isAbsolute(value) ||
+    // Checked on both separators, because a Lockfile written on Windows is read
+    // on machines where `\` is an ordinary character in a name.
+    value.split(/[\\/]/).some((segment) => segment === "..") ||
+    /^[A-Za-z]:/.test(value);
+  if (escapes) {
+    throw new LockfileError(
+      `${where} has a \`bins\` entry pointing outside harv's Store: ${value}. ` +
+        `Those paths go on a session's PATH, so harv will not follow this one. ` +
+        `Delete the Lockfile and run \`harv sync\`.`,
+    );
+  }
+  return value;
+}
 
 function toTable(entry: LockedSkill): Record<string, unknown> {
   // Built key by key, in a fixed order, because the serialized order is the

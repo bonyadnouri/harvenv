@@ -217,6 +217,12 @@ function read(path: string, scope: OverlayLayer["scope"]): Layer | null {
       plugins:
         "cannot be declared in an Overlay yet — pin it in the project's Manifest, where a plugin's " +
         "marketplace coordinate is resolved and locked",
+      // A tool is pinned into the *committed* Lockfile, so a personal staple
+      // declaring one would put a version there for the whole team. Refused by
+      // name for the same reason: silence would be worse than a message.
+      tools:
+        "pins a version into the project's committed Lockfile, so it belongs in the Manifest rather than in a " +
+        "personal Overlay",
     }),
   );
   return { path, scope, declarations };

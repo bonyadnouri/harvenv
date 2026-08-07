@@ -21,17 +21,31 @@
  *                            drift the Toolchain exists to prevent
  *   the embedded copy        released binaries; unpacked under `~/.harv` once
  *   vendor/mise/<platform>/  running from source, after `bun scripts/vendor-mise.ts`
+ *
+ * The second half of this module is what the Toolchain actually asks that
+ * binary — the same job `git.ts` does for Sources — and it exists to keep two
+ * promises the rest of the Toolchain simply assumes:
+ *
+ *   - **Nothing global is mutated.** Every invocation redirects mise's data,
+ *     config, cache and state directories into harv's own home. No sudo, no
+ *     system package manager, no writes outside `HARV_HOME`.
+ *   - **Nothing ambient is read.** mise's normal job is to notice the config
+ *     file in your working directory; harv's whole point is that a session's
+ *     tools come from the Manifest. So every invocation runs from a neutral
+ *     directory and names tools by explicit `tool@version` argument — a
+ *     `mise.toml` in the project can neither add a tool nor move one's version.
  */
 
 import { createHash } from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 import { gunzipSync } from "node:zlib";
 
 import { currentPlatform } from "./platform.ts";
-import { harvHome } from "./store.ts";
+import { harvHome, toolsRoot } from "./store.ts";
+import type { Env } from "./store.ts";
 
 /** Replaced at build time, alongside the embedded binary they describe. */
 declare const __HARV_MISE_VERSION__: string;
@@ -183,8 +197,209 @@ function unpack(sources: MiseSources): string {
 export function runMise(args: string[]): Promise<number> {
   const bin = miseBinary();
   return new Promise((resolveExit, reject) => {
-    const child = spawn(bin, args, { stdio: "inherit" });
+    // Isolated like every other invocation: this is an escape hatch onto the
+    // engine, not a way around the promise that harv leaves the machine alone.
+    const child = spawn(bin, args, { stdio: "inherit", env: { ...process.env, ...miseEnv() } });
     child.on("error", reject);
     child.on("exit", (code, signal) => resolveExit(signal ? 128 : (code ?? 0)));
   });
 }
+
+// ---------------------------------------------------------------------------
+// The Toolchain's use of it (ADR 0006)
+// ---------------------------------------------------------------------------
+
+/**
+ * mise's view of the world, rewritten to live entirely inside harv's home.
+ *
+ * `MISE_DATA_DIR` is the load-bearing one — it is what puts installs in the
+ * Store, per version, shared by every project on the machine. The rest exist so
+ * that a run cannot read or write the user's own mise setup: config, cache and
+ * state are redirected, the global and system config files are pointed at paths
+ * under harv's home, and `MISE_YES` keeps a prompt from blocking a Sync nobody
+ * is watching. A machine whose owner already uses mise keeps its
+ * `~/.local/share/mise` untouched; one whose owner does not never acquires one.
+ */
+export function miseEnv(env: Env = process.env): Record<string, string> {
+  // The data directory is the Store, because installs are shared artifacts.
+  // Cache, state and config are harv's own working files, so they sit beside
+  // the Store rather than inside it.
+  const work = join(harvHome(env), "mise-work");
+  return {
+    MISE_DATA_DIR: toolsRoot(env),
+    MISE_CACHE_DIR: join(work, "cache"),
+    MISE_STATE_DIR: join(work, "state"),
+    MISE_CONFIG_DIR: join(work, "config"),
+    MISE_GLOBAL_CONFIG_FILE: join(work, "config", "config.toml"),
+    MISE_SYSTEM_CONFIG_FILE: join(work, "config", "system.toml"),
+    // A tool harv installs is one the Manifest asked for, so there is no
+    // interactive question left to ask.
+    MISE_YES: "1",
+    // Progress bars and colour are for a terminal; this output gets parsed.
+    MISE_QUIET: "1",
+    NO_COLOR: "1",
+  };
+}
+
+/**
+ * The engine, or the reason there isn't one.
+ *
+ * A source checkout that has not run `scripts/vendor-mise.ts` has no mise, and
+ * that is not a reason to fail a Sync: it lands in the same place as a tool
+ * mise cannot install, which ADR 0006 degrades to a recorded hint. An explicit
+ * `HARV_MISE_BIN` is the exception — a path that points nowhere is a typo, and
+ * degrading past it would hide the one case the user was being deliberate
+ * about.
+ */
+export function findMise(env: Env = process.env): Engine {
+  const sources = { ...defaultSources(), env: env as NodeJS.ProcessEnv };
+  if (sources.env.HARV_MISE_BIN) return { bin: resolveMise(sources) };
+  try {
+    return { bin: resolveMise(sources) };
+  } catch (err) {
+    if (err instanceof MiseError) return { unavailable: err.message };
+    throw err;
+  }
+}
+
+/** An engine, or the reason there is none — phrased for whoever has to act. */
+export type Engine = { bin: string; unavailable?: undefined } | { bin?: undefined; unavailable: string };
+
+interface Completed {
+  status: number;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Run mise and read its answer back, with harv's isolation applied.
+ *
+ * The working directory is a neutral one inside harv's home rather than the
+ * project: mise would otherwise pick up a `mise.toml` sitting in the project
+ * tree, and a session's Toolchain has to come from the Manifest alone.
+ */
+export function captureMise(bin: string, args: string[], env: Env = process.env): Completed {
+  const cwd = join(harvHome(env), "mise-work", "cwd");
+  mkdirSync(cwd, { recursive: true });
+
+  const result = spawnSync(bin, args, {
+    cwd,
+    encoding: "utf8",
+    env: { ...process.env, ...miseEnv(env) } as NodeJS.ProcessEnv,
+    // A tool that builds from source can take minutes; a tool that hangs must
+    // not take a Sync with it forever.
+    timeout: 30 * 60 * 1000,
+    maxBuffer: 32 * 1024 * 1024,
+  });
+
+  if (result.error) throw new MiseError(`Cannot run mise at ${bin}: ${result.error.message}`);
+  return { status: result.status ?? 1, stdout: result.stdout ?? "", stderr: result.stderr ?? "" };
+}
+
+/**
+ * The exact version a spec names right now — the Toolchain's `ls-remote`, and
+ * the only step that asks what "latest" means. Everything after it names a
+ * version, so a spec that drifts cannot change what a teammate installs.
+ *
+ * Null means mise cannot serve this requirement: the caller records a hint
+ * instead of failing (ADR 0006).
+ */
+export function resolveVersion(bin: string, tool: string, spec: string, env: Env = process.env): string | null {
+  const result = captureMise(bin, ["latest", `${tool}@${spec}`], env);
+  const version = result.stdout.trim().split("\n").pop()?.trim() ?? "";
+  return result.status !== 0 || version === "" ? null : version;
+}
+
+/** Whether the engine has an installer for this tool at all. */
+export const isKnown = (bin: string, tool: string, env: Env = process.env): boolean =>
+  captureMise(bin, ["registry", tool], env).status === 0;
+
+/** Install one exact version into the Store. Idempotent: mise skips what it holds. */
+export function install(bin: string, tool: string, version: string, env: Env = process.env): void {
+  const result = captureMise(bin, ["install", `${tool}@${version}`], env);
+  if (result.status !== 0) {
+    throw new MiseError(
+      `Could not install ${tool}@${version}: ${lastLine(result.stderr) || `mise exited ${result.status}`}`,
+    );
+  }
+}
+
+/**
+ * The bin directories one installed version contributes, relative to the tools
+ * Store root.
+ *
+ * They are returned relative on purpose. These paths end up in the Lockfile —
+ * committed, and read on a machine whose `HARV_HOME` is somewhere else
+ * entirely — so anything absolute would be a pin that only works where it was
+ * written. `installs/node/22.18.0/bin` means the same thing everywhere.
+ *
+ * A path outside the Store is refused rather than recorded: the Lockfile's
+ * `bins` become a session's PATH, and a Toolchain that could point PATH at an
+ * arbitrary directory would be a worse promise than no Toolchain at all.
+ */
+export function binPaths(bin: string, tool: string, version: string, env: Env = process.env): string[] {
+  const result = captureMise(bin, ["bin-paths", `${tool}@${version}`], env);
+  if (result.status !== 0) {
+    throw new MiseError(
+      `Could not read the bin paths of ${tool}@${version}: ` +
+        `${lastLine(result.stderr) || `mise exited ${result.status}`}`,
+    );
+  }
+
+  const root = toolsRoot(env);
+  const paths: string[] = [];
+  for (const line of result.stdout.split("\n")) {
+    const absolute = line.trim();
+    if (absolute === "") continue;
+    if (!isAbsolute(absolute)) {
+      throw new MiseError(`mise reported a bin path that is not absolute for ${tool}@${version}: ${absolute}`);
+    }
+    const rel = relative(root, absolute);
+    if (rel === "" || rel.startsWith("..") || isAbsolute(rel)) {
+      throw new MiseError(
+        `mise installed ${tool}@${version} outside harv's Store, at ${absolute}. ` +
+          `harv only puts Store paths on a session's PATH, so this tool cannot be scoped to the project.`,
+      );
+    }
+    paths.push(rel.split(sep).join("/"));
+  }
+  return paths;
+}
+
+/**
+ * Whether the Store still holds a locked tool — asked before the engine is, and
+ * answered from the bin directories the Lockfile recorded rather than from a
+ * guess at where an installer puts things. Each backend has its own layout, and
+ * a rule that happened to be right for `node` and wrong for `npm:prettier`
+ * would send a session that has everything it needs back to `harv sync`.
+ */
+export const hasBins = (bins: string[], env: Env = process.env): boolean =>
+  bins.length > 0 && bins.every((path) => existsSync(resolveBinPath(path, env)));
+
+/**
+ * A Lockfile `bins` entry as an absolute directory under this machine's Store.
+ *
+ * The Lockfile arrives from a clone and this path goes on a session's PATH, so
+ * the entry is re-checked here rather than trusted: containment is verified
+ * after resolution, which is what catches `..` however it is spelled.
+ */
+export function resolveBinPath(rel: string, env: Env = process.env): string {
+  const root = toolsRoot(env);
+  const absolute = resolve(root, rel);
+  const inside = relative(root, absolute);
+  if (isAbsolute(rel) || inside === "" || inside.startsWith("..") || isAbsolute(inside)) {
+    throw new MiseError(
+      `A locked tool has a bin path that points outside harv's Store: ${rel}. ` +
+        `Delete ${"harvenv.lock"} and run \`harv sync\` to write it again.`,
+    );
+  }
+  return absolute;
+}
+
+const lastLine = (text: string): string =>
+  text
+    .trim()
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "")
+    .pop() ?? "";

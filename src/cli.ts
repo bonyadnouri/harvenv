@@ -19,7 +19,7 @@
 import { readFileSync, writeFileSync } from "node:fs";
 
 import { AddError, entryLine, parseCoordinate, tableFor, validateName, withEntry } from "./add.ts";
-import { driftAgainst, driftOver, LOCKFILE_FILENAME, LockfileError } from "./lockfile.ts";
+import { driftAgainst, driftOver, LOCKFILE_FILENAME, LockfileError, toolDrift } from "./lockfile.ts";
 import type { DriftEntry } from "./lockfile.ts";
 import { findManifest, loadManifest, ManifestError, MANIFEST_FILENAME } from "./manifest.ts";
 import type { Manifest, MarketplaceSource, Source } from "./manifest.ts";
@@ -51,7 +51,8 @@ import {
 } from "./shim.ts";
 import { TripwireError } from "./tripwire.ts";
 import { MarketplaceError } from "./marketplace.ts";
-import { plan, readLocks, sync, SyncError } from "./sync.ts";
+import { plan, readLocks, sync, SyncError, toolPaths } from "./sync.ts";
+import { requirements, ToolchainError } from "./tools.ts";
 import type { Env } from "./store.ts";
 import { defaultUpdateCheckDeps, isDevBuild, updateHint, VERSION } from "./version.ts";
 
@@ -66,7 +67,7 @@ export interface CliDeps {
   stdout: (line: string) => void;
   stderr: (line: string) => void;
   /** Injected so tests can exercise the whole command without a real session. */
-  launch: (session: Session, passthrough: string[], env: Env) => Promise<number>;
+  launch: (session: Session, passthrough: string[], env: Env, toolPaths: string[]) => Promise<number>;
   /** Injected for the same reason: no test should need a 90MB binary on disk. */
   runMise: (args: string[]) => Promise<number>;
   /** Resolves to the one line worth printing, or null. Never throws. */
@@ -82,9 +83,10 @@ Commands:
                      ${MANIFEST_FILENAME}, gitignore entries for generated and
                      personal files, and the Tripwire that warns an un-isolated
                      session. Safe to re-run; it only tops up what is missing.
-  sync               Resolve every Manifest entry into the Store and write
-                     ${"harvenv.lock"}. Run it after editing the Manifest, and
-                     after cloning a project that has one.
+  sync               Resolve every Manifest entry into the Store, install the
+                     system tools it needs, and write ${"harvenv.lock"}. Run it
+                     after editing the Manifest, and after cloning a project
+                     that has one.
   add <name> --git <coordinate> [--ref <ref>] [--subdir <dir>]
   add <name> --path <dir>
                      Declare a skill in the Manifest and sync it. A coordinate
@@ -94,16 +96,17 @@ Commands:
                      plugin arrives whole — its skills, commands, subagents and
                      hooks all load, under the plugin's own name.
   claude [args...]   Start a Claude Code session composed strictly from this
-                     project's Harvenv. Arguments after \`claude\` are passed
-                     through unchanged (harv claude -p "hi", --resume, ...).
+                     project's Harvenv, with its pinned tools in front of PATH.
+                     Arguments after \`claude\` are passed through unchanged
+                     (harv claude -p "hi", --resume, ...).
   shim install       Route a bare \`claude\` through harv: hermetic inside a
                      harvenv project, the real claude everywhere else.
        [--shell <name>]  zsh, bash, fish, sh — or \`none\` to edit no startup file.
   shim uninstall     Remove the shim and the PATH entry it added.
   shim status        Report where the shim is, whether it is active, and what
                      a bare \`claude\` resolves to. Takes --json.
-  mise [args...]     Run the vendored Toolchain engine. Mostly for diagnosis
-                     until \`harv sync\` drives it.
+  mise [args...]     Run the vendored Toolchain engine directly, isolated the
+                     same way \`harv sync\` runs it. For diagnosis.
 
 Options:
   --version, -v      Print the harv and mise versions, and whether harv is
@@ -129,6 +132,7 @@ const EXPECTED_ERRORS = [
   InitError,
   ShimError,
   TripwireError,
+  ToolchainError,
 ];
 
 export function defaultDeps(): CliDeps {
@@ -263,8 +267,24 @@ async function claude(args: string[], deps: CliDeps): Promise<number> {
   }
 
   for (const warning of session.warnings) deps.stderr(`harv: warning: ${warning}`);
-  materialize(plan(session, locks, deps.env));
-  return deps.launch(session, passthrough, deps.env);
+
+  // Where every Component resolves to, from the Lockfile alone — which is also
+  // what the Toolchain needs, since a `requires` declaration lives inside the
+  // skill that carries it.
+  const resolved = plan(session, locks, deps.env);
+  const toolchainDrift = driftReport(
+    toolDrift(requirements(session.manifest, resolved.skills), locks.manifest),
+    "the Manifest",
+    LOCKFILE_FILENAME,
+  );
+  if (toolchainDrift !== null) {
+    deps.stderr(toolchainDrift);
+    return 1;
+  }
+
+  materialize(resolved);
+
+  return deps.launch(session, passthrough, deps.env, toolPaths(locks.manifest, deps.env));
 }
 
 const driftReport = (drift: DriftEntry[], what: string, lockfile: string): string | null =>
@@ -294,11 +314,14 @@ function syncCommand(args: string[], deps: CliDeps): number {
 function report(result: ReturnType<typeof sync>, deps: CliDeps): void {
   for (const entry of result.drift) deps.stdout(`  ${entry.name}: ${entry.reason}`);
 
+  const tools = result.toolchain;
   const done = [
     result.fetched.length > 0 ? `fetched ${result.fetched.join(", ")}` : "",
     result.reused.length > 0 ? `reused ${result.reused.join(", ")} from the Store` : "",
     result.local.length > 0 ? `linked ${result.local.join(", ")} from a local path` : "",
     result.materialized.removed.length > 0 ? `removed ${result.materialized.removed.join(", ")}` : "",
+    tools.installed.length > 0 ? `installed ${tools.installed.join(", ")}` : "",
+    tools.reused.length > 0 ? `reused ${tools.reused.join(", ")} from the Store` : "",
   ].filter((line) => line !== "");
 
   deps.stdout(done.length > 0 ? `harv: ${done.join("; ")}.` : "harv: up to date.");
