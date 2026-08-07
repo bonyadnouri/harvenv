@@ -4,13 +4,14 @@ import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node
 import { join } from "node:path";
 
 import type { Manifest } from "../src/manifest.ts";
+import type { ShimContext } from "../src/shim.ts";
 import type { Env } from "../src/store.ts";
 import { run } from "../src/cli.ts";
 import { MISE_VERSION, MiseError } from "../src/mise.ts";
 import { currentPlatform } from "../src/platform.ts";
 import { hasTripwire } from "../src/tripwire.ts";
 import { VERSION } from "../src/version.ts";
-import { commitFiles, gitRepo, skillFile, tempDir } from "./helpers.ts";
+import { commitFiles, gitRepo, shimSandbox, skillFile, tempDir } from "./helpers.ts";
 
 interface Recorded {
   exit: number;
@@ -26,11 +27,14 @@ interface Options {
   /** Merged onto the Store pointer, for tests about `${VAR}` resolution. */
   env?: Env;
   hint?: string | null;
+  /** Scratch by default, so no test reaches the real HOME, PATH or dotfiles. */
+  shim?: ShimContext;
 }
 
-/** One project, one Store, one CLI — reused across the calls of a single test. */
+/** One project, one Store, one shim sandbox, one CLI — reused within one test. */
 function harv(cwd: string, options: Options = {}) {
   const store = tempDir();
+  const shim = options.shim ?? shimSandbox();
   const launched: Recorded["launched"] = [];
   const mised: string[][] = [];
 
@@ -55,6 +59,7 @@ function harv(cwd: string, options: Options = {}) {
         return options.exitCode ?? 0;
       },
       updateHint: async () => options.hint ?? null,
+      shim,
     });
     return { exit, out, err, launched, mised };
   };
@@ -178,6 +183,97 @@ test("harv claude launches a Manifest that declares nothing but settings", async
 
   assert.equal(exit, 0);
   assert.equal(launched.length, 1);
+});
+
+test("harv shim install reports the shim, the PATH entry and the real claude behind it", async () => {
+  const ctx = shimSandbox();
+  const cli = harv(tempDir(), { shim: ctx });
+
+  const { exit, out } = await cli(["shim", "install"]);
+
+  assert.equal(exit, 0);
+  assert.match(out, /shim installed/);
+  assert.match(out, new RegExp(ctx.shimPath.replaceAll(".", "\\.")));
+  assert.match(out, new RegExp(`added to ${join(ctx.home, "\\.zshrc")}`));
+  assert.match(out, /HARV_NO_SHIM=1/, "the escape hatch is named where it is installed");
+  assert.equal(existsSync(ctx.shimPath), true);
+});
+
+test("harv shim status reports an uninstalled shim, then an installed one", async () => {
+  const ctx = shimSandbox();
+  const cli = harv(tempDir(), { shim: ctx });
+
+  const before = await cli(["shim", "status"]);
+  await cli(["shim", "install"]);
+  const after = await cli(["shim", "status"]);
+
+  assert.match(before.out, /shim\s+not installed/);
+  assert.match(after.out, new RegExp(`shim\\s+installed at ${ctx.shimPath.replaceAll(".", "\\.")}`));
+  assert.equal(after.exit, 0);
+});
+
+test("harv shim status --json is machine-readable", async () => {
+  const ctx = shimSandbox();
+  const cli = harv(tempDir(), { shim: ctx });
+  await cli(["shim", "install"]);
+
+  const { out } = await cli(["shim", "status", "--json"]);
+
+  assert.equal(JSON.parse(out).installed, true);
+  assert.equal(JSON.parse(out).shimPath, ctx.shimPath);
+});
+
+test("harv shim uninstall removes what install added, and says so", async () => {
+  const ctx = shimSandbox();
+  const cli = harv(tempDir(), { shim: ctx });
+  await cli(["shim", "install"]);
+
+  const { exit, out } = await cli(["shim", "uninstall"]);
+
+  assert.equal(exit, 0);
+  assert.match(out, /shim uninstalled/);
+  assert.equal(existsSync(ctx.shimPath), false);
+  assert.equal(readFileSync(join(ctx.home, ".zshrc"), "utf8").includes("harv shim"), false);
+});
+
+test("harv shim uninstall with nothing installed says so instead of failing", async () => {
+  const { exit, out } = await harv(tempDir())(["shim", "uninstall"]);
+
+  assert.equal(exit, 0);
+  assert.match(out, /nothing to remove/);
+});
+
+test("harv shim reports a refusal without a stack trace", async () => {
+  const ctx = shimSandbox();
+  mkdirSync(ctx.binDir, { recursive: true });
+  writeFileSync(ctx.shimPath, "#!/bin/sh\n", { mode: 0o755 });
+
+  const { exit, err } = await harv(tempDir(), { shim: ctx })(["shim", "install"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /did not create it/);
+  assert.doesNotMatch(err, /at .*\.ts:\d+/);
+});
+
+test("harv shim with no action prints its own usage", async () => {
+  const { exit, err } = await harv(tempDir())(["shim"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /install\|uninstall\|status/);
+});
+
+test("harv shim rejects an unknown action by name", async () => {
+  const { exit, err } = await harv(tempDir())(["shim", "activate"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /activate/);
+});
+
+test("harv shim install rejects an option it does not understand", async () => {
+  const { exit, err } = await harv(tempDir())(["shim", "install", "--global"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /--global/);
 });
 
 test("harv claude rejects unusable settings before writing anything into the project", async () => {
@@ -633,6 +729,7 @@ test("harv mise reports a missing engine without a stack trace", async () => {
       err += `${line}\n`;
     },
     launch: async () => 0,
+    shim: shimSandbox(),
     runMise: async () => {
       throw new MiseError("No vendored mise for this platform.");
     },

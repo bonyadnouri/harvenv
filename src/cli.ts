@@ -11,7 +11,9 @@
  * `mise` and `--version` sit outside that split: they answer questions about
  * the installation rather than about a project, so neither looks for a
  * Manifest. That is what makes `harv --version` the one thing that always
- * works on a machine which has just met harv.
+ * works on a machine which has just met harv. `shim` sits outside it too, and
+ * further out still: it is the only command that writes beyond the project, and
+ * the only one a user runs once rather than daily.
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
@@ -22,7 +24,7 @@ import type { DriftEntry } from "./lockfile.ts";
 import { findManifest, loadManifest, ManifestError, MANIFEST_FILENAME } from "./manifest.ts";
 import type { Manifest, Source } from "./manifest.ts";
 import { materialize, MaterializeError } from "./materialize.ts";
-import { launch as launchSession } from "./launch.ts";
+import { launch as launchSession, LaunchError } from "./launch.ts";
 import { McpError, validateMcpServers } from "./mcp.ts";
 import { SettingsError, validateSettings } from "./settings.ts";
 import { GitError } from "./git.ts";
@@ -30,6 +32,14 @@ import { init as initProject, InitError } from "./init.ts";
 import type { InitResult } from "./init.ts";
 import { MISE_VERSION, MiseError, runMise as runMiseBinary } from "./mise.ts";
 import { currentPlatform } from "./platform.ts";
+import {
+  defaultShimContext,
+  installShim,
+  shimStatus,
+  ShimError,
+  uninstallShim,
+  type ShimContext,
+} from "./shim.ts";
 import { TripwireError } from "./tripwire.ts";
 import { plan, sync, SyncError } from "./sync.ts";
 import type { Env } from "./store.ts";
@@ -51,6 +61,8 @@ export interface CliDeps {
   runMise: (args: string[]) => Promise<number>;
   /** Resolves to the one line worth printing, or null. Never throws. */
   updateHint: () => Promise<string | null>;
+  /** Injected so tests never touch the real HOME, PATH or shell startup files. */
+  shim: ShimContext;
 }
 
 const USAGE = `Usage: harv <command> [args...]
@@ -70,6 +82,12 @@ Commands:
   claude [args...]   Start a Claude Code session composed strictly from this
                      project's Harvenv. Arguments after \`claude\` are passed
                      through unchanged (harv claude -p "hi", --resume, ...).
+  shim install       Route a bare \`claude\` through harv: hermetic inside a
+                     harvenv project, the real claude everywhere else.
+       [--shell <name>]  zsh, bash, fish, sh — or \`none\` to edit no startup file.
+  shim uninstall     Remove the shim and the PATH entry it added.
+  shim status        Report where the shim is, whether it is active, and what
+                     a bare \`claude\` resolves to. Takes --json.
   mise [args...]     Run the vendored Toolchain engine. Mostly for diagnosis
                      until \`harv sync\` drives it.
 
@@ -85,6 +103,7 @@ const EXPECTED_ERRORS = [
   ManifestError,
   MaterializeError,
   SettingsError,
+  LaunchError,
   McpError,
   LockfileError,
   SyncError,
@@ -92,6 +111,7 @@ const EXPECTED_ERRORS = [
   AddError,
   MiseError,
   InitError,
+  ShimError,
   TripwireError,
 ];
 
@@ -104,6 +124,7 @@ export function defaultDeps(): CliDeps {
     launch: launchSession,
     runMise: runMiseBinary,
     updateHint: () => updateHint(defaultUpdateCheckDeps()).catch(() => null),
+    shim: defaultShimContext(),
   };
 }
 
@@ -127,6 +148,7 @@ export async function run(argv: string[], deps: CliDeps): Promise<number> {
     claude,
     sync: syncCommand,
     add,
+    shim,
     mise: (args, d) => d.runMise(args),
   };
   const handler = commands[command];
@@ -375,4 +397,175 @@ function requireManifest(deps: CliDeps): Manifest | null {
 function validateSessionConfig(manifest: Manifest, env: Env): void {
   validateSettings(manifest.settings);
   validateMcpServers(manifest.mcpServers, env);
+}
+
+// ---------------------------------------------------------------------------
+// shim
+// ---------------------------------------------------------------------------
+
+const SHIM_USAGE = `Usage: harv shim <install|uninstall|status>
+
+  install [--shell zsh|bash|fish|sh|none]   Put a \`claude\` lookalike on PATH.
+  uninstall                                 Take it back off, and the PATH entry with it.
+  status [--json]                           Report what a bare \`claude\` currently runs.`;
+
+/** Two columns, so a report reads as a table rather than as prose. */
+const field = (label: string, value: string): string => `  ${label.padEnd(16)}${value}`;
+
+function shim(args: string[], deps: CliDeps): number {
+  const [action, ...flags] = args;
+
+  switch (action) {
+    case "install":
+      return shimInstall(flags, deps);
+    case "uninstall":
+      return shimUninstall(deps);
+    case "status":
+      return shimReport(flags, deps);
+    case undefined:
+      deps.stderr(SHIM_USAGE);
+      return 2;
+    default:
+      deps.stderr(`harv: unknown shim action \`${action}\`.\n`);
+      deps.stderr(SHIM_USAGE);
+      return 2;
+  }
+}
+
+/** `--shell <name>`, the only flag install takes. */
+function shellFlag(flags: string[], deps: CliDeps): string | null | undefined {
+  const at = flags.indexOf("--shell");
+  if (at === -1) {
+    const unknown = flags.filter((f) => f.startsWith("-"));
+    if (unknown.length > 0) {
+      deps.stderr(`harv: unknown option \`${unknown[0]}\`.\n`);
+      deps.stderr(SHIM_USAGE);
+      return null;
+    }
+    return undefined;
+  }
+  const name = flags[at + 1];
+  if (name === undefined || name.startsWith("-")) {
+    deps.stderr(`harv: --shell needs a shell name (zsh, bash, fish, sh, or none).`);
+    return null;
+  }
+  return name;
+}
+
+function shimInstall(flags: string[], deps: CliDeps): number {
+  const shell = shellFlag(flags, deps);
+  if (shell === null) return 2;
+
+  const result = installShim(deps.shim, shell);
+
+  deps.stdout(`harv: shim ${result.created ? "installed" : "already installed"}.`);
+  deps.stdout(field("claude", result.shimPath));
+  for (const file of result.startupFiles) deps.stdout(field("PATH entry", `added to ${file}`));
+  deps.stdout(field("real claude", result.realClaude ?? "not found on PATH"));
+  deps.stdout("");
+
+  if (result.unconfigurableShell !== null) {
+    deps.stdout(
+      `harv does not know where \`${result.unconfigurableShell}\` reads its startup files, so none were edited.`,
+    );
+    deps.stdout(`Put the shim directory first on PATH yourself:\n`);
+    deps.stdout(`    ${result.pathLine}\n`);
+  } else if (!result.activeNow) {
+    deps.stdout(`Restart your shell — or run the line below — for \`claude\` to route through harv:\n`);
+    deps.stdout(`    ${result.pathLine}\n`);
+  }
+
+  deps.stdout(
+    `Inside a harvenv project \`claude\` now starts the session the Manifest describes;\n` +
+      `everywhere else it runs Claude Code exactly as before. \`HARV_NO_SHIM=1 claude\`\n` +
+      `always bypasses it, and \`harv shim uninstall\` removes it.`,
+  );
+  return 0;
+}
+
+function shimUninstall(deps: CliDeps): number {
+  const result = uninstallShim(deps.shim);
+
+  if (!result.removedShim && result.cleanedFiles.length === 0) {
+    deps.stdout(`harv: no shim installed — nothing to remove.`);
+    deps.stdout(field("claude", result.realClaude ?? "not found on PATH"));
+    return 0;
+  }
+
+  deps.stdout(`harv: shim uninstalled.`);
+  if (result.removedShim) deps.stdout(field("removed", deps.shim.shimPath));
+  for (const file of result.cleanedFiles) deps.stdout(field("PATH entry", `removed from ${file}`));
+  for (const dir of result.removedDirs) deps.stdout(field("removed", `${dir}/`));
+  deps.stdout(field("claude", result.realClaude ?? "not found on PATH"));
+  deps.stdout("");
+  deps.stdout(`Restart your shell to drop the shim directory from PATH.`);
+  return 0;
+}
+
+function shimReport(flags: string[], deps: CliDeps): number {
+  const status = shimStatus(deps.shim);
+
+  if (flags.includes("--json")) {
+    deps.stdout(JSON.stringify(status, null, 2));
+    return 0;
+  }
+
+  deps.stdout(`harv shim`);
+  if (status.foreign) {
+    deps.stdout(field("shim", `NOT harv's: ${status.shimPath} exists but harv did not create it`));
+  } else {
+    deps.stdout(field("shim", status.installed ? `installed at ${status.shimPath}` : `not installed`));
+  }
+  deps.stdout(
+    field(
+      "claude",
+      status.resolvedClaude === null
+        ? "not found on PATH"
+        : `${status.resolvedClaude}${status.active ? " (the shim)" : ""}`,
+    ),
+  );
+  deps.stdout(field("real claude", status.realClaude ?? "not found on PATH"));
+
+  if (status.installed) {
+    deps.stdout(
+      field(
+        "routes through",
+        status.harvCommand === null
+          ? "an unreadable shim — reinstall it with `harv shim install`"
+          : `${status.harvCommand.join(" ")}${status.harvReachable ? "" : "  <- GONE: sessions would not be isolated"}`,
+      ),
+    );
+  }
+
+  if (status.installed && !status.active) {
+    deps.stdout(
+      field(
+        "PATH",
+        status.onPath
+          ? `the shim is on PATH but shadowed — ${status.resolvedClaude} comes first`
+          : `${deps.shim.binDir} is not on PATH in this shell`,
+      ),
+    );
+  }
+
+  const withBlockPresent = status.startupFiles.filter((f) => f.blockPresent);
+  deps.stdout(
+    field(
+      "shell",
+      `${status.shell ?? "unknown"} — ${
+        withBlockPresent.length > 0
+          ? `PATH entry in ${withBlockPresent.map((f) => f.path).join(", ")}`
+          : "no startup file carries harv's PATH entry"
+      }`,
+    ),
+  );
+
+  deps.stdout("");
+  deps.stdout(
+    status.active
+      ? `A bare \`claude\` is hermetic inside a harvenv project and unchanged everywhere else.\n` +
+          `\`HARV_NO_SHIM=1 claude\` bypasses the shim.`
+      : `A bare \`claude\` runs Claude Code directly — only \`harv claude\` is hermetic.`,
+  );
+  return 0;
 }
