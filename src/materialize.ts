@@ -15,6 +15,7 @@
 import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import { COMPONENT_NAME_RULE, isComponentName } from "./manifest.ts";
 import type { Manifest } from "./manifest.ts";
 
 /** harv's ownership record, kept beside the Components it materialized. */
@@ -65,6 +66,12 @@ export function materialize(manifest: Manifest): MaterializeResult {
  * would leave the session answering to a name the Manifest never mentions.
  */
 function validateSkill(name: string, path: string): void {
+  // Enforced here as well as at parse time, because this is where a name turns
+  // into a path that gets written to and later removed. Sync will call this
+  // with names resolved from git subdirectories, not only from Manifest keys.
+  if (!isComponentName(name)) {
+    throw new MaterializeError(`\`${name}\` cannot be materialized: ${COMPONENT_NAME_RULE}.`);
+  }
   if (!existsSync(path)) {
     throw new MaterializeError(`Skill \`${name}\` declares a path that does not exist: ${path}`);
   }
@@ -87,11 +94,16 @@ function validateSkill(name: string, path: string): void {
   }
 }
 
-/** `name:` from a SKILL.md YAML frontmatter block, if it has one. */
+/**
+ * `name:` from a SKILL.md YAML frontmatter block, if it has one. YAML scalars
+ * may be quoted, and a skill that writes `name: "foo"` means `foo` — carrying
+ * the quotes through would reject a skill whose name is in fact correct.
+ */
 function frontmatterName(source: string): string | undefined {
   const match = /^---\r?\n([\s\S]*?)\r?\n---/.exec(source);
   if (!match?.[1]) return undefined;
-  return /^name:[ \t]*(.+?)[ \t]*$/m.exec(match[1])?.[1];
+  const value = /^name:[ \t]*(.+?)[ \t]*$/m.exec(match[1])?.[1];
+  return value === undefined ? undefined : value.replace(/^(['"])(.*)\1$/, "$2");
 }
 
 function link(linkPath: string, target: string, owned: boolean): void {
@@ -117,7 +129,12 @@ function removeOwned(path: string): void {
 function readState(claudeDir: string): State {
   try {
     const parsed = JSON.parse(readFileSync(join(claudeDir, MATERIALIZED_STATE_FILE), "utf8"));
-    const skills = Array.isArray(parsed?.skills) ? parsed.skills.filter((s: unknown) => typeof s === "string") : [];
+    // This file lives in the project tree, so it is input, not memory. Removal
+    // walks it rather than the Manifest, and every entry becomes a recursive
+    // delete — so a name harv would never have written is one it will not act on.
+    const skills = Array.isArray(parsed?.skills)
+      ? parsed.skills.filter((s: unknown): s is string => typeof s === "string" && isComponentName(s))
+      : [];
     return { version: STATE_VERSION, skills };
   } catch {
     return { version: STATE_VERSION, skills: [] };

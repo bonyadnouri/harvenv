@@ -9,7 +9,7 @@
 
 import { findManifest, loadManifest, ManifestError, MANIFEST_FILENAME } from "./manifest.ts";
 import { materialize, MaterializeError } from "./materialize.ts";
-import { launch as launchSession, SettingsError } from "./launch.ts";
+import { launch as launchSession, SettingsError, validateSettings } from "./launch.ts";
 import type { Manifest } from "./manifest.ts";
 
 export interface CliDeps {
@@ -81,6 +81,9 @@ async function claude(passthrough: string[], deps: CliDeps): Promise<number> {
   }
 
   const manifest = loadManifest(manifestPath);
+  // Everything that can be judged from the Manifest alone is judged before the
+  // first write, so a Manifest that cannot launch leaves no trace in the tree.
+  validateSettings(manifest.settings);
   materialize(manifest);
   return deps.launch(manifest, passthrough);
 }

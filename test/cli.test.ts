@@ -138,3 +138,16 @@ test("harv --help prints usage and succeeds", async () => {
   assert.equal(exit, 0);
   assert.match(out, /usage/i);
 });
+
+test("harv claude rejects unusable settings before writing anything into the project", async () => {
+  const root = project(
+    '[skills]\nexample-skill = { path = "vendor/example-skill" }\n\n[settings.permissions]\ndefaultMode = "manual"\n',
+  );
+
+  const { exit, err, launched } = await cli(["claude"], root);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /manual/);
+  assert.deepEqual(launched, []);
+  assert.equal(existsSync(join(root, ".claude")), false, "the project tree is untouched when launch cannot succeed");
+});

@@ -17,6 +17,24 @@ export const MANIFEST_FILENAME = "harvenv.toml";
 /** Sources ADR 0004 defines but this slice cannot yet fetch. */
 const DEFERRED_SOURCE_KEYS = ["git", "ref", "subdir", "marketplace", "version"];
 
+/**
+ * A Component name is one path segment, and a conservative one.
+ *
+ * The name is not just a label: materialization joins it onto `.claude/skills`,
+ * so `..` or an embedded separator would place a symlink outside the directory
+ * harv manages — and, once recorded as owned, would hand a later run a path
+ * outside it to remove. A Manifest is committed content that teammates and CI
+ * run without reading, so its keys are validated rather than trusted.
+ */
+const COMPONENT_NAME = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
+export const isComponentName = (name: string): boolean => COMPONENT_NAME.test(name);
+
+/** Shared so the rule reads the same wherever it is enforced. */
+export const COMPONENT_NAME_RULE =
+  "a name must be a single path segment starting with a letter or digit and made of letters, digits, " +
+  "`.`, `-` and `_` — no `/`, `\\` or `..`";
+
 export interface SkillEntry {
   /** The Manifest key — and, per ADR 0008, the name the session answers to. */
   name: string;
@@ -84,6 +102,9 @@ function parseSkills(value: unknown, root: string, manifestPath: string): SkillE
 
   return Object.entries(skills).map(([name, entry]) => {
     const where = `[skills] entry \`${name}\` in ${manifestPath}`;
+    if (!isComponentName(name)) {
+      throw new ManifestError(`${where} is not a usable skill name: ${COMPONENT_NAME_RULE}.`);
+    }
     if (!isTable(entry)) {
       throw new ManifestError(`${where} must be a table, e.g. ${name} = { path = "vendor/${name}" }`);
     }

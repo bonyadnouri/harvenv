@@ -104,3 +104,23 @@ test("loadManifest keeps an absolute skill path as given", () => {
 
   assert.equal(loadManifest(path).skills[0]?.path, "/opt/skills/example-skill");
 });
+
+test("loadManifest rejects a skill name that would escape the skills directory", () => {
+  for (const name of ["..", ".", "../agents", "a/b", "nested\\name", "../../etc/passwd"]) {
+    const path = manifestIn(tempDir(), `[skills]\n"${name}" = { path = "vendor/x" }\n`);
+
+    assert.throws(
+      () => loadManifest(path),
+      (err: Error) => err instanceof ManifestError && /name/i.test(err.message),
+      `expected \`${name}\` to be rejected`,
+    );
+  }
+});
+
+test("loadManifest accepts the skill names Claude Code actually uses", () => {
+  for (const name of ["grill-with-docs", "gsap_core", "web3d", "Skill.v2"]) {
+    const path = manifestIn(tempDir(), `[skills]\n"${name}" = { path = "vendor/x" }\n`);
+
+    assert.equal(loadManifest(path).skills[0]?.name, name);
+  }
+});

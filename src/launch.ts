@@ -45,8 +45,14 @@ export class SettingsError extends Error {
   override name = "SettingsError";
 }
 
-/** The Harvenv's settings as a `--settings` payload. Inline JSON is accepted. */
-export function generateSettings(settings: Record<string, unknown>): string {
+/**
+ * Throws if the Manifest asks for settings Claude Code would not honour.
+ *
+ * Exported so a caller can find that out *before* it starts writing into the
+ * project tree: a Manifest that can never launch has no business leaving
+ * materialized Components behind.
+ */
+export function validateSettings(settings: Record<string, unknown>): void {
   const permissions = settings.permissions;
   if (permissions && typeof permissions === "object" && !Array.isArray(permissions)) {
     const mode = (permissions as Record<string, unknown>).defaultMode;
@@ -57,6 +63,11 @@ export function generateSettings(settings: Record<string, unknown>): string {
       );
     }
   }
+}
+
+/** The Harvenv's settings as a `--settings` payload. Inline JSON is accepted. */
+export function generateSettings(settings: Record<string, unknown>): string {
+  validateSettings(settings);
   return JSON.stringify(settings);
 }
 

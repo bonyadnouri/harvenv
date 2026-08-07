@@ -131,3 +131,49 @@ test("materialize records what it owns so a later run can reverse it", () => {
   const state = JSON.parse(readFileSync(join(root, ".claude", MATERIALIZED_STATE_FILE), "utf8"));
   assert.deepEqual(state.skills, ["example-skill"]);
 });
+
+test("materialize accepts a SKILL.md whose name is quoted, as YAML allows", () => {
+  const root = tempDir();
+  const source = join(tempDir(), "example-skill");
+  mkdirSync(source, { recursive: true });
+  writeFileSync(
+    join(source, "SKILL.md"),
+    '---\nname: "example-skill"\ndescription: Fixture skill for harvenv tests.\n---\n\nMarker.\n',
+  );
+
+  materialize(manifestFor(root, [{ name: "example-skill", path: source }]));
+
+  assert.equal(existsSync(join(skillsDir(root), "example-skill", "SKILL.md")), true);
+});
+
+test("materialize refuses a skill name that would place a link outside the skills directory", () => {
+  const root = tempDir();
+  // The skill's own name agrees with the key, so only the escape guard can
+  // reject this — the name-agreement check has nothing to complain about.
+  const source = skillAt(join(tempDir(), "agents"), "../agents", "../agents");
+  const sibling = join(root, ".claude", "agents");
+  mkdirSync(sibling, { recursive: true });
+  writeFileSync(join(sibling, "hand-written.md"), "mine\n");
+
+  assert.throws(
+    () => materialize(manifestFor(root, [{ name: "../agents", path: source }])),
+    (err: Error) => err instanceof MaterializeError && /single path segment/.test(err.message),
+  );
+  assert.equal(existsSync(join(sibling, "hand-written.md")), true, "the sibling directory is untouched");
+});
+
+test("materialize ignores an ownership record naming a path outside the skills directory", () => {
+  const root = tempDir();
+  const sibling = join(root, ".claude", "agents");
+  mkdirSync(sibling, { recursive: true });
+  writeFileSync(join(sibling, "hand-written.md"), "mine\n");
+  // A state file harv would never write, but the project tree is not harv's to trust.
+  writeFileSync(
+    join(root, ".claude", MATERIALIZED_STATE_FILE),
+    JSON.stringify({ version: 1, skills: ["../agents"] }),
+  );
+
+  materialize(manifestFor(root, []));
+
+  assert.equal(existsSync(join(sibling, "hand-written.md")), true);
+});
