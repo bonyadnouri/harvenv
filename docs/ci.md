@@ -37,18 +37,34 @@ on every push to this repository against the sample Manifest in
 
 # Clone, sync, launch — the same three steps a teammate performs, in the same
 # order. `harv claude` never fetches (ADR 0009), so the sync is not optional.
-- run: harv sync
+# `--no-overlay` states the baseline rather than relying on the runner being
+# bare — see "The Overlay in CI".
+- run: harv sync --no-overlay
 
 # The gate that costs nothing: a Sync that rewrote the Lockfile means the
 # committed one is not what a clean machine produces.
 - run: git diff --exit-code -- harvenv.lock
 
-- run: harv claude -p 'summarize the diff on this branch' --output-format json
+- run: harv claude --no-overlay -p 'summarize the diff on this branch' --output-format json
   env:
     ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
 ```
 
-`harv claude` passes everything after it through untouched and adopts the
+## The Overlay in CI
+
+`--no-overlay` is harv's own flag, taken out of the arguments before the rest is
+passed through, and it leaves the Overlay out of both commands entirely: no
+staples file, no per-project extras, no personal settings key.
+
+On a hosted runner it changes nothing, because there is nothing there to leave
+out. It is in the recipe for the two cases where that stops being true — a
+self-hosted or reused runner with an `overlay.toml` in its `$HARV_HOME`, and a
+cache key that restores more of that directory than the Store — and because
+ADR 0002's consequence is a claim the recipe should make rather than one the
+environment happens to satisfy. If a run starts behaving differently on one
+runner than another, this is the flag that removes a whole class of reason.
+
+`harv claude` passes everything else after it through untouched and adopts the
 session's exit code, so the last step is an ordinary `claude -p` and an ordinary
 build gate: a session that fails fails the job, and its stdout can be piped into
 `jq` like any other command's.

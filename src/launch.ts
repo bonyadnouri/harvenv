@@ -38,7 +38,7 @@ import { generateMcpConfig } from "./mcp.ts";
 import { generateSettings } from "./settings.ts";
 import { resolveRealClaude } from "./shim.ts";
 import { LAUNCHER_ENV } from "./tripwire.ts";
-import type { Manifest } from "./manifest.ts";
+import type { Session } from "./overlay.ts";
 import { pluginDir } from "./materialize.ts";
 
 /** A session that cannot be started at all — as opposed to one that fails. */
@@ -54,7 +54,7 @@ export class LaunchError extends Error {
  * is what the launching shell had.
  */
 export function buildLaunchArgs(
-  manifest: Manifest,
+  session: Session,
   passthrough: string[],
   env: NodeJS.ProcessEnv,
 ): string[] {
@@ -62,14 +62,19 @@ export function buildLaunchArgs(
     "--setting-sources",
     "project,local",
     "--settings",
-    generateSettings(manifest.settings),
+    // Personal-ergonomics keys are legitimate here even though a Manifest may
+    // not set them: by this point the Overlay has contributed its own.
+    generateSettings(session.settings, { allowPersonalKeys: true }),
     "--strict-mcp-config",
     "--mcp-config",
-    generateMcpConfig(manifest.mcpServers, env),
+    generateMcpConfig(session.mcpServers, env),
     // The link, never the Store entry it points at: a plugin with no
     // `plugin.json` is named after the directory it is served from, and that
     // directory has to be called what the Manifest calls it.
-    ...manifest.plugins.flatMap((plugin) => ["--plugin-dir", pluginDir(manifest.root, plugin.name)]),
+    ...session.manifest.plugins.flatMap((plugin) => [
+      "--plugin-dir",
+      pluginDir(session.manifest.root, plugin.name),
+    ]),
     ...passthrough,
   ];
 }
@@ -113,7 +118,7 @@ export function claudeBinary(pathString: string): string {
  * from a subdirectory.
  */
 export function launch(
-  manifest: Manifest,
+  session: Session,
   passthrough: string[],
   env: NodeJS.ProcessEnv,
 ): Promise<number> {
@@ -126,8 +131,8 @@ export function launch(
   const binary = claudeBinary(sessionEnv.PATH ?? "");
 
   return new Promise((resolveExit, reject) => {
-    const child = spawn(binary, buildLaunchArgs(manifest, passthrough, sessionEnv), {
-      cwd: manifest.root,
+    const child = spawn(binary, buildLaunchArgs(session, passthrough, sessionEnv), {
+      cwd: session.manifest.root,
       env: sessionEnv,
       stdio: "inherit",
     });

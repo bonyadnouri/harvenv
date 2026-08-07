@@ -84,9 +84,13 @@ jobs:
       # Clone, sync, launch — the same three steps a teammate performs, in the
       # same order (ADR 0009: the Launcher never syncs, so this one is not
       # optional). Everything it fetches is pinned by the committed Lockfile.
+      # `--no-overlay` is belt and braces: a hosted runner has no Overlay to
+      # begin with, but a self-hosted one might, and ADR 0002's "CI runs with
+      # Manifest only" should be something the recipe states rather than
+      # something the runner happens to be.
       - name: harv sync
         working-directory: examples/ci
-        run: harv sync
+        run: harv sync --no-overlay
 
       # A Sync that rewrote the Lockfile means the committed one is not what a
       # clean machine produces, so a teammate cloning this repository would not
@@ -137,7 +141,7 @@ jobs:
         working-directory: examples/ci
         run: |
           set -euo pipefail
-          harv claude -p 'Reply with the single word: ok' --output-format json \
+          harv claude --no-overlay -p 'Reply with the single word: ok' --output-format json \
             | tee "$RUNNER_TEMP/result.json"
           jq -e '.is_error == false' "$RUNNER_TEMP/result.json" > /dev/null
 

@@ -76,6 +76,7 @@ test("the gitignore entries cover what Sync generates and what stays personal", 
   assert.ok(GITIGNORE_ENTRIES.includes(".claude/harv-plugins/"), "the links pinned plugins are served from");
   assert.ok(GITIGNORE_ENTRIES.includes(".claude/.harv-materialized.json"), "harv's ownership record");
   assert.ok(GITIGNORE_ENTRIES.includes("harvenv.local.toml"), "the per-project Overlay");
+  assert.ok(GITIGNORE_ENTRIES.includes(".harv/"), "where Sync pins that Overlay (ADR 0013)");
 });
 
 test("init on an empty project plants the Tripwire in committed project settings", () => {

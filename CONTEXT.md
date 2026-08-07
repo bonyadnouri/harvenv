@@ -16,7 +16,7 @@ _Avoid_: requirements, config file
 A unit the Manifest can declare: a skill, subagent, slash command, settings block, MCP server definition, or plugin pin. Credentials and `CLAUDE.md` are never Components — auth is personal, and project context already travels with git.
 
 **Lockfile**:
-The committed, machine-resolved pin of every Manifest entry — exact versions and hashes — so that two Syncs on two machines produce the same Harvenv.
+The committed, machine-resolved pin of every Manifest entry — exact versions and hashes — so that two Syncs on two machines produce the same Harvenv. The Overlay is pinned the same way into an uncommitted file of its own, so the Launcher can serve a staple without resolving anything (ADR 0013).
 
 **Overlay**:
 A personal, uncommitted set of Components layered on top of a project's Harvenv — declared in one global staples file plus an optional gitignored per-project extras file (which wins on conflict and may disable a staple). Explicit and per-user: the committed baseline stays identical for everyone, and nothing personal loads by accident.

@@ -18,8 +18,8 @@
  * locked name becomes a directory in the project tree.
  */
 
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
-import { isAbsolute, join } from "node:path";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { dirname, isAbsolute, join } from "node:path";
 import { parse as parseToml, stringify as stringifyToml, TomlError } from "smol-toml";
 
 import { COMPONENT_NAME_RULE, describeSource, isComponentName } from "./manifest.ts";
@@ -42,10 +42,27 @@ const LOCK_VERSION = 2;
 const HASH = /^sha256:[0-9a-f]{64}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
 
-const HEADER =
-  `# ${LOCKFILE_FILENAME} — written by \`harv sync\`. Commit it: it is what makes a\n` +
-  `# teammate's Harvenv identical to yours. Change Sources in ${"harvenv.toml"} and\n` +
-  `# re-run \`harv sync\` rather than editing this file.\n\n`;
+/**
+ * Which Lockfile: where it lives, and what it says about itself at the top.
+ *
+ * The header is not decoration. The two files carry opposite instructions —
+ * one is the thing that makes a teammate's Harvenv identical to yours and must
+ * be committed, the other pins your own Overlay and must not be (ADR 0013) —
+ * and they are the same format, so the file has to say which one it is.
+ */
+export interface LockfileKind {
+  /** Relative to the project root. */
+  filename: string;
+  header: string;
+}
+
+export const COMMITTED_LOCKFILE: LockfileKind = {
+  filename: LOCKFILE_FILENAME,
+  header:
+    `# ${LOCKFILE_FILENAME} — written by \`harv sync\`. Commit it: it is what makes a\n` +
+    `# teammate's Harvenv identical to yours. Change Sources in ${"harvenv.toml"} and\n` +
+    `# re-run \`harv sync\` rather than editing this file.\n\n`,
+};
 
 export class LockfileError extends Error {
   override name = "LockfileError";
@@ -88,11 +105,18 @@ export interface DriftEntry {
   reason: string;
 }
 
-export const lockfilePath = (root: string): string => join(root, LOCKFILE_FILENAME);
+export const lockfilePath = (root: string, kind: LockfileKind = COMMITTED_LOCKFILE): string =>
+  join(root, kind.filename);
 
-/** The Lockfile of a project, or null if it has never been synced. */
-export function readLockfile(root: string): Lockfile | null {
-  const path = lockfilePath(root);
+/**
+ * The Lockfile of a project, or null if it has never been synced.
+ *
+ * `kind` exists for the Overlay, which is pinned exactly like the Manifest and
+ * into a file of exactly this format — but into an uncommitted one, because the
+ * resolution of a personal staple is nobody else's business (ADR 0013).
+ */
+export function readLockfile(root: string, kind: LockfileKind = COMMITTED_LOCKFILE): Lockfile | null {
+  const path = lockfilePath(root, kind);
   if (!existsSync(path)) return null;
 
   let raw: Record<string, unknown>;
@@ -138,13 +162,30 @@ export function readLockfile(root: string): Lockfile | null {
 }
 
 /** Write the Lockfile. Entries are ordered by name so the file is a stable diff. */
-export function writeLockfile(root: string, skills: LockedSkill[], plugins: LockedPlugin[] = []): void {
+export function writeLockfile(
+  root: string,
+  skills: LockedSkill[],
+  plugins: LockedPlugin[] = [],
+  kind: LockfileKind = COMMITTED_LOCKFILE,
+): void {
   const body = stringifyToml({
     version: LOCK_VERSION,
     skills: byName(skills).map(toTable),
     plugins: byName(plugins).map(toPluginTable),
   });
-  writeFileSync(lockfilePath(root), `${HEADER}${body}\n`);
+  const path = lockfilePath(root, kind);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, `${kind.header}${body}\n`);
+}
+
+/**
+ * Forget a Lockfile entirely — for the Overlay's, when there is no longer an
+ * Overlay to pin. An empty file left behind would be read as "this project
+ * locks nothing personal", which is true, but so is having no file, and the
+ * absent one does not have to be gitignored by anyone reading the repo later.
+ */
+export function removeLockfile(root: string, kind: LockfileKind): void {
+  rmSync(lockfilePath(root, kind), { force: true });
 }
 
 const byName = <T extends { name: string }>(entries: T[]): T[] =>
@@ -164,14 +205,32 @@ export function driftAgainst(manifest: Manifest, lock: Lockfile | null): DriftEn
   ];
 }
 
+export interface DriftOptions {
+  /** What declared these entries, so an Overlay's drift does not read as a Manifest's. */
+  source?: string;
+  /**
+   * Whether an entry the Lockfile holds and nothing declares any more counts.
+   *
+   * It does for the committed Lockfile, whose whole job is to agree with the
+   * Manifest a teammate reads beside it. It does not for the Overlay's, which is
+   * uncommitted and rewritten by every Sync: a staple you stopped declaring is
+   * simply unmaterialized at the next launch, and nothing downstream is wrong.
+   */
+  orphans?: boolean;
+}
+
 /**
- * One comparison for both tables: a declared entry is drifted when the Lockfile
+ * One comparison for every table: a declared entry is drifted when the Lockfile
  * does not hold it or holds it at another coordinate, and a locked entry is
- * drifted when the Manifest has stopped declaring it.
+ * drifted when the declaring file has stopped declaring it.
+ *
+ * Exported because the Overlay is compared against a Lockfile of its own, by
+ * its own rules — see `DriftOptions`.
  */
-function driftOver(
+export function driftOver(
   declared: Array<{ name: string; source: Source | MarketplaceSource }>,
   lockedEntries: Array<{ name: string; source: Source | MarketplaceSource }>,
+  { source = "the Manifest", orphans = true }: DriftOptions = {},
 ): DriftEntry[] {
   const locked = new Map(lockedEntries.map((entry) => [entry.name, entry]));
   const drift: DriftEntry[] = [];
@@ -179,7 +238,7 @@ function driftOver(
   for (const entry of declared) {
     const pinned = locked.get(entry.name);
     if (pinned === undefined) {
-      drift.push({ name: entry.name, reason: `declared in the Manifest but not locked` });
+      drift.push({ name: entry.name, reason: `declared in ${source} but not locked` });
       continue;
     }
     if (coordinate(entry.source) !== coordinate(pinned.source)) {
@@ -187,14 +246,16 @@ function driftOver(
         name: entry.name,
         // Described, not compared: the comparison needs the kind to tell a path
         // from a repository, and the reader does not need to read it.
-        reason: `Source changed: locked ${describeSource(pinned.source)}, Manifest says ${describeSource(entry.source)}`,
+        reason: `Source changed: locked ${describeSource(pinned.source)}, ${source} says ${describeSource(entry.source)}`,
       });
     }
   }
 
   const names = new Set(declared.map((entry) => entry.name));
-  for (const name of locked.keys()) {
-    if (!names.has(name)) drift.push({ name, reason: `locked but no longer declared in the Manifest` });
+  if (orphans) {
+    for (const name of locked.keys()) {
+      if (!names.has(name)) drift.push({ name, reason: `locked but no longer declared in ${source}` });
+    }
   }
 
   return drift;

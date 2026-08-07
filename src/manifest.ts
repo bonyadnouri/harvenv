@@ -16,6 +16,13 @@
  * (ADR 0008). Which table an entry sits in is therefore not a filing detail —
  * it is the difference between `brainstorming` and `superpowers:brainstorming`.
  *
+ * The reader is shared: an Overlay file declares the same tables in the same
+ * vocabulary, because a personal staple is the same kind of thing as a project's
+ * own Component and there is no reason to learn it twice (ADR 0002). What
+ * differs between the two is policy, not shape — who may set which settings key,
+ * and whether an entry may *remove* a name rather than declare one — so it
+ * arrives as options rather than as a second parser.
+ *
  * Parsing stops at shape: what a table has to *be* to be read at all. What its
  * contents have to *mean* — that a settings key is one a Manifest may bind, that
  * a server declares a transport Claude Code runs, that a marketplace really
@@ -132,17 +139,42 @@ export function describeSource(source: Source | MarketplaceSource): string {
 /** The native `name@marketplace` identity of a pin, for messages. */
 export const describePlugin = (entry: PluginEntry): string => `${entry.name}@${describeSource(entry.source)}`;
 
-export interface Manifest {
+/** What one declaration file — a Manifest or an Overlay file — says. */
+export interface Declarations {
+  skills: SkillEntry[];
+  plugins: PluginEntry[];
+  /** The settings table, injected via `--settings` at launch. */
+  settings: Record<string, unknown>;
+  /** The MCP servers, injected via `--mcp-config` at launch. */
+  mcpServers: McpServerEntry[];
+  /** Names this file removes rather than declares. Only an Overlay may. */
+  disabled: { skills: string[]; mcpServers: string[] };
+}
+
+export interface DeclarationOptions {
+  /** Where a relative `path` Source resolves against. */
+  root: string;
+  /**
+   * Why `{ disable = true }` may not appear in this file, or null if it may.
+   * The reason is the caller's because only the caller knows where the entry
+   * would have belonged — this reader knows the shape, not the policy.
+   */
+  disable: string | null;
+  /**
+   * Why `[plugins]` may not appear in this file, or null if it may. An Overlay
+   * cannot carry one yet: a plugin pin goes through a marketplace catalogue and
+   * a Lockfile table this slice did not extend, and a table that parsed and then
+   * loaded nothing would be exactly the silence harv exists to remove.
+   */
+  plugins: string | null;
+}
+
+/** A Manifest may not disable anything, so it carries no such list. */
+export interface Manifest extends Omit<Declarations, "disabled"> {
   /** Absolute path to `harvenv.toml`. */
   path: string;
   /** The project root: the directory holding the Manifest. */
   root: string;
-  skills: SkillEntry[];
-  plugins: PluginEntry[];
-  /** The Manifest's settings table, injected via `--settings` at launch. */
-  settings: Record<string, unknown>;
-  /** The Manifest's MCP servers, injected via `--mcp-config` at launch. */
-  mcpServers: McpServerEntry[];
 }
 
 /** A Manifest that cannot be understood. Always actionable, always user-facing. */
@@ -164,16 +196,65 @@ export function findManifest(startDir: string): string | null {
 
 export function loadManifest(manifestPath: string): Manifest {
   const root = dirname(manifestPath);
-  const raw = readTable(manifestPath);
+  const { disabled: _unused, ...declarations } = parseDeclarations(manifestPath, {
+    root,
+    disable:
+      "a Manifest declares what a project's Harvenv contains, and only an Overlay can take something back out",
+    plugins: null,
+  });
+  return { path: manifestPath, root, ...declarations };
+}
+
+/**
+ * Read one declaration file. Shared by the Manifest and by both Overlay files,
+ * so the two speak the same TOML and a staple is written exactly the way the
+ * project's own entry would be.
+ */
+export function parseDeclarations(path: string, options: DeclarationOptions): Declarations {
+  const raw = readTable(path);
+  const skills = parseSkills(raw.skills, path, options);
+  const mcpServers = parseMcpServers(raw.mcp, path, options);
+
+  if (options.plugins !== null && raw.plugins !== undefined) {
+    throw new ManifestError(`[plugins] in ${path} ${options.plugins}.`);
+  }
 
   return {
-    path: manifestPath,
-    root,
-    skills: parseSkills(raw.skills, root, manifestPath),
-    plugins: parsePlugins(raw.plugins, manifestPath),
-    settings: asTable(raw.settings, "settings", manifestPath) ?? {},
-    mcpServers: parseMcpServers(raw.mcp, manifestPath),
+    skills: skills.declared,
+    plugins: parsePlugins(raw.plugins, path),
+    settings: asTable(raw.settings, "settings", path) ?? {},
+    mcpServers: mcpServers.declared,
+    disabled: { skills: skills.disabled, mcpServers: mcpServers.disabled },
   };
+}
+
+/**
+ * Whether this entry removes its name instead of declaring it.
+ *
+ * A disabled entry is a whole entry, not a modifier: `disable` next to a Source
+ * would say "fetch this and also do not" at once, and `disable = false` is a
+ * value that reads like an instruction and means nothing — the way to stop
+ * disabling a name is to delete the entry, not to negate it.
+ */
+function isDisabled(entry: Record<string, unknown>, where: string, options: DeclarationOptions): boolean {
+  if (!("disable" in entry)) return false;
+  if (options.disable !== null) {
+    throw new ManifestError(`${where} declares \`disable\`, but ${options.disable}.`);
+  }
+  if (entry.disable !== true) {
+    throw new ManifestError(
+      `${where} has \`disable = ${JSON.stringify(entry.disable)}\`, and \`true\` is the only value that means ` +
+        `anything. Delete the entry to stop disabling the name.`,
+    );
+  }
+  const alongside = Object.keys(entry).filter((key) => key !== "disable");
+  if (alongside.length > 0) {
+    throw new ManifestError(
+      `${where} declares \`disable\` alongside \`${alongside.join("\`, \`")}\`, so it both removes the name and ` +
+        `declares it. Keep one.`,
+    );
+  }
+  return true;
 }
 
 function readTable(manifestPath: string): Record<string, unknown> {
@@ -191,17 +272,27 @@ function readTable(manifestPath: string): Record<string, unknown> {
   }
 }
 
-function parseSkills(value: unknown, root: string, manifestPath: string): SkillEntry[] {
+function parseSkills(
+  value: unknown,
+  manifestPath: string,
+  options: DeclarationOptions,
+): { declared: SkillEntry[]; disabled: string[] } {
   const skills = asTable(value, "skills", manifestPath);
-  if (!skills) return [];
+  const declared: SkillEntry[] = [];
+  const disabled: string[] = [];
+  if (!skills) return { declared, disabled };
 
-  return Object.entries(skills).map(([name, entry]) => {
+  for (const [name, entry] of Object.entries(skills)) {
     const where = `[skills] entry \`${name}\` in ${manifestPath}`;
     if (!isComponentName(name)) {
       throw new ManifestError(`${where} is not a usable skill name: ${COMPONENT_NAME_RULE}.`);
     }
     if (!isTable(entry)) {
       throw new ManifestError(`${where} must be a table, e.g. ${name} = { git = "https://…" }`);
+    }
+    if (isDisabled(entry, where, options)) {
+      disabled.push(name);
+      continue;
     }
 
     const misplaced = Object.keys(MISPLACED_SKILL_KEYS).find((key) => key in entry);
@@ -211,8 +302,9 @@ function parseSkills(value: unknown, root: string, manifestPath: string): SkillE
       );
     }
 
-    return { name, source: parseSource(entry, name, where, root) };
-  });
+    declared.push({ name, source: parseSource(entry, name, where, options.root) });
+  }
+  return { declared, disabled };
 }
 
 /**
@@ -347,11 +439,17 @@ const pluginExample = (name: string): string =>
  * the session, so it is vocabulary a teammate reads and types. The Component
  * name rule keeps it to one conservative segment.
  */
-function parseMcpServers(value: unknown, manifestPath: string): McpServerEntry[] {
+function parseMcpServers(
+  value: unknown,
+  manifestPath: string,
+  options: DeclarationOptions,
+): { declared: McpServerEntry[]; disabled: string[] } {
   const servers = asTable(value, "mcp", manifestPath);
-  if (!servers) return [];
+  const declared: McpServerEntry[] = [];
+  const disabled: string[] = [];
+  if (!servers) return { declared, disabled };
 
-  return Object.entries(servers).map(([name, definition]) => {
+  for (const [name, definition] of Object.entries(servers)) {
     const where = `[mcp.${name}] in ${manifestPath}`;
     if (!isComponentName(name)) {
       throw new ManifestError(`${where} is not a usable MCP server name: ${COMPONENT_NAME_RULE}.`);
@@ -361,8 +459,10 @@ function parseMcpServers(value: unknown, manifestPath: string): McpServerEntry[]
         `${where} must be a table of server settings, e.g. [mcp.${name}] with command = "npx"`,
       );
     }
-    return { name, definition };
-  });
+    if (isDisabled(definition, where, options)) disabled.push(name);
+    else declared.push({ name, definition });
+  }
+  return { declared, disabled };
 }
 
 const isTable = (value: unknown): value is Record<string, unknown> =>
