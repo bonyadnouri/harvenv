@@ -14,6 +14,7 @@
     "verify:skeleton": "node scripts/verify-walking-skeleton.ts",
     "verify:sync": "node scripts/verify-sync-store.ts",
     "verify:settings": "node scripts/verify-manifest-settings.ts",
+    "verify:plugins": "node scripts/verify-plugin-pins.ts",
     "verify:tripwire": "node scripts/verify-tripwire.ts",
     "verify:ci": "node scripts/verify-ci-recipe.ts",
     "verify:shim": "node scripts/verify-shim.ts",

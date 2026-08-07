@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync, lstatSync, mkdirSync, readFileSync, readlinkSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
-import { materialize, MaterializeError, MATERIALIZED_STATE_FILE } from "../src/materialize.ts";
+import { materialize, MaterializeError, MATERIALIZED_STATE_FILE, pluginDir } from "../src/materialize.ts";
 import type { MaterializePlan } from "../src/materialize.ts";
-import { skillFile, tempDir } from "./helpers.ts";
+import { marketplaceFile, pluginFile, skillFile, tempDir } from "./helpers.ts";
 
 /** A skill directory on disk, outside any project — a stand-in for the Store. */
 function skillAt(dir: string, name: string, frontmatterName = name): string {
@@ -169,6 +169,142 @@ test("materialize ignores an ownership record naming a path outside the skills d
   );
 
   materialize(planFor(root, []));
+
+  assert.equal(existsSync(join(sibling, "hand-written.md")), true);
+});
+
+// ---------------------------------------------------------------------------
+// Plugins — linked under their own name, because that name is what serves them
+// ---------------------------------------------------------------------------
+
+/** A plugin directory whose name is a hash digest, exactly as the Store holds it. */
+function pluginAt(digest: string, declaredName: string | null): string {
+  const dir = join(tempDir(), digest);
+  mkdirSync(join(dir, "skills", "packaged-skill"), { recursive: true });
+  writeFileSync(join(dir, "skills", "packaged-skill", "SKILL.md"), skillFile("packaged-skill"));
+  if (declaredName !== null) {
+    mkdirSync(join(dir, ".claude-plugin"), { recursive: true });
+    writeFileSync(join(dir, ".claude-plugin", "plugin.json"), pluginFile(declaredName));
+  }
+  return dir;
+}
+
+test("materialize links a pinned plugin under its own name, not the Store's", () => {
+  const root = tempDir();
+  const source = pluginAt("f3a9c2b10e4d5678", "alpha-pack");
+
+  const result = materialize({ root, skills: [], plugins: [{ name: "alpha-pack", path: source }] });
+
+  const link = pluginDir(root, "alpha-pack");
+  assert.deepEqual(result.plugins, ["alpha-pack"]);
+  assert.equal(lstatSync(link).isSymbolicLink(), true, "linked, so the Store keeps the only copy");
+  assert.equal(readlinkSync(link), source);
+  assert.equal(basename(link), "alpha-pack", "the directory a session is pointed at is the plugin's name");
+});
+
+test("materialize links a plugin that declares no name of its own", () => {
+  // Real marketplaces publish these. The link's name is then the only name the
+  // session can use, which is precisely why harv creates one.
+  const root = tempDir();
+  const source = pluginAt("0f1e2d3c4b5a6978", null);
+
+  materialize({ root, skills: [], plugins: [{ name: "nameless-pack", path: source }] });
+
+  assert.equal(readlinkSync(pluginDir(root, "nameless-pack")), source);
+});
+
+test("materialize refuses a plugin published under a name other than its pin", () => {
+  const root = tempDir();
+  const source = pluginAt("aaaabbbbccccdddd", "superpowers-dev");
+
+  assert.throws(
+    () => materialize({ root, skills: [], plugins: [{ name: "superpowers", path: source }] }),
+    (err: Error) =>
+      err instanceof MaterializeError && /superpowers-dev/.test(err.message) && /superpowers/.test(err.message),
+  );
+  assert.equal(existsSync(pluginDir(root, "superpowers")), false, "nothing is linked from a rejected plan");
+});
+
+test("materialize refuses a whole marketplace served as one plugin", () => {
+  const root = tempDir();
+  const source = pluginAt("bbbbccccddddeeee", null);
+  mkdirSync(join(source, ".claude-plugin"), { recursive: true });
+  writeFileSync(join(source, ".claude-plugin", "marketplace.json"), marketplaceFile("fixtures", { alpha: "./" }));
+
+  assert.throws(
+    () => materialize({ root, skills: [], plugins: [{ name: "alpha", path: source }] }),
+    (err: Error) => err instanceof MaterializeError && /marketplace/.test(err.message),
+  );
+});
+
+test("materialize removes a plugin it created once the Manifest stops pinning it", () => {
+  const root = tempDir();
+  const kept = pluginAt("1111222233334444", "kept-pack");
+  const dropped = pluginAt("5555666677778888", "dropped-pack");
+
+  materialize({
+    root,
+    skills: [],
+    plugins: [
+      { name: "kept-pack", path: kept },
+      { name: "dropped-pack", path: dropped },
+    ],
+  });
+  const result = materialize({ root, skills: [], plugins: [{ name: "kept-pack", path: kept }] });
+
+  assert.deepEqual(result.removed, ["dropped-pack"]);
+  assert.equal(existsSync(pluginDir(root, "dropped-pack")), false);
+  assert.equal(existsSync(pluginDir(root, "kept-pack")), true);
+});
+
+test("materialize refuses to clobber a plugin directory it did not create", () => {
+  const root = tempDir();
+  const mine = pluginDir(root, "alpha-pack");
+  mkdirSync(mine, { recursive: true });
+  writeFileSync(join(mine, "hand-written.md"), "mine\n");
+
+  assert.throws(
+    () => materialize({ root, skills: [], plugins: [{ name: "alpha-pack", path: pluginAt("99998888", "alpha-pack") }] }),
+    (err: Error) => err instanceof MaterializeError && /did not create it/.test(err.message),
+  );
+  assert.equal(readFileSync(join(mine, "hand-written.md"), "utf8"), "mine\n");
+});
+
+test("a skill and a plugin of the same name are materialized side by side", () => {
+  const root = tempDir();
+  const skill = skillAt(join(tempDir(), "shared"), "shared");
+  const plugin = pluginAt("ccccddddeeeeffff", "shared");
+
+  materialize({ root, skills: [{ name: "shared", path: skill }], plugins: [{ name: "shared", path: plugin }] });
+
+  assert.equal(readlinkSync(join(skillsDir(root), "shared")), skill);
+  assert.equal(readlinkSync(pluginDir(root, "shared")), plugin);
+});
+
+test("a name that moves from [skills] to [plugins] loses its skill link and gains a plugin one", () => {
+  const root = tempDir();
+  const skill = skillAt(join(tempDir(), "shared"), "shared");
+  const plugin = pluginAt("eeeeffff00001111", "shared");
+
+  materialize({ root, skills: [{ name: "shared", path: skill }], plugins: [] });
+  const result = materialize({ root, skills: [], plugins: [{ name: "shared", path: plugin }] });
+
+  assert.deepEqual(result.removed, ["shared"]);
+  assert.equal(existsSync(join(skillsDir(root), "shared")), false);
+  assert.equal(readlinkSync(pluginDir(root, "shared")), plugin);
+});
+
+test("materialize ignores an ownership record naming a plugin path outside its directory", () => {
+  const root = tempDir();
+  const sibling = join(root, ".claude", "agents");
+  mkdirSync(sibling, { recursive: true });
+  writeFileSync(join(sibling, "hand-written.md"), "mine\n");
+  writeFileSync(
+    join(root, ".claude", MATERIALIZED_STATE_FILE),
+    JSON.stringify({ version: 1, skills: [], plugins: ["../agents"] }),
+  );
+
+  materialize({ root, skills: [], plugins: [] });
 
   assert.equal(existsSync(join(sibling, "hand-written.md")), true);
 });

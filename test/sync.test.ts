@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readlinkSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { fetchSource, resolveCommit } from "../src/git.ts";
@@ -11,7 +11,16 @@ import { hashTree, storePath } from "../src/store.ts";
 import type { Env } from "../src/store.ts";
 import { plan, sync, SyncError } from "../src/sync.ts";
 import type { SyncDeps } from "../src/sync.ts";
-import { commitFiles, git, gitRepo, skillFile, tempDir } from "./helpers.ts";
+import {
+  commitFiles,
+  git,
+  gitRepo,
+  marketplaceFile,
+  marketplaceWith,
+  pluginFile,
+  skillFile,
+  tempDir,
+} from "./helpers.ts";
 
 /** A Store of this test's own. Every sync in one test must share it to dedupe. */
 const home = (): Env => ({ HARV_HOME: tempDir() });
@@ -302,4 +311,261 @@ test("plan resolves a locked path Source to the directory itself", () => {
   assert.deepEqual(resolved.skills, [
     { name: "local-thing", path: join(manifest.root, "vendor", "local-thing") },
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// Plugin pins — a marketplace commit in, a plugin the session can load out
+// ---------------------------------------------------------------------------
+
+const pluginLink = (root: string, name = "alpha-pack") => join(root, ".claude", "harv-plugins", name);
+
+/** A marketplace repository publishing one plugin in a subdirectory. */
+const marketplaceRepo = (plugin = "alpha-pack", body = "Marker.\n") => gitRepo(marketplaceWith(plugin, "fixtures", body));
+
+test("sync pins a plugin by the marketplace commit and the plugin's own content hash", () => {
+  const marketplace = marketplaceRepo();
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+
+  sync(manifest, counting(home()));
+
+  const locked = readLockfile(manifest.root)?.plugins[0];
+  assert.equal(locked?.name, "alpha-pack");
+  assert.equal(locked?.commit, marketplace.commit, "the commit pinned is the marketplace's");
+  assert.match(locked?.hash ?? "", /^sha256:[0-9a-f]{64}$/);
+});
+
+test("sync resolves the plugin out of the marketplace and leaves the rest of it behind", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+
+  sync(manifest, counting(env));
+
+  const link = pluginLink(manifest.root);
+  assert.equal(existsSync(join(link, ".claude-plugin", "plugin.json")), true, "the plugin's own manifest");
+  assert.equal(existsSync(join(link, "skills", "alpha-pack-skill", "SKILL.md")), true);
+  assert.equal(existsSync(join(link, "commands", "alpha-pack-command.md")), true);
+  assert.equal(existsSync(join(link, "README.md")), false, "the marketplace's own files stay behind");
+  assert.equal(existsSync(join(link, ".claude-plugin", "marketplace.json")), false);
+});
+
+test("sync serves a plugin from the Store, through a link named after the plugin", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+
+  sync(manifest, counting(env));
+
+  const hash = readLockfile(manifest.root)?.plugins[0]?.hash ?? "";
+  assert.equal(readlinkSync(pluginLink(manifest.root)), storePath(hash, env));
+  assert.equal(existsSync(join(storePath(hash, env), ".claude-plugin", "plugin.json")), true);
+});
+
+test("sync run twice fetches a marketplace once and leaves the Lockfile byte-identical", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+  const deps = counting(env);
+
+  sync(manifest, deps);
+  const first = readFileSync(join(manifest.root, "harvenv.lock"), "utf8");
+  const second = sync(manifest, deps);
+
+  assert.equal(deps.fetches.length, 1, "the second Sync fetched nothing");
+  assert.deepEqual(second.reused, ["alpha-pack"]);
+  assert.equal(readFileSync(join(manifest.root, "harvenv.lock"), "utf8"), first);
+});
+
+test("a second machine converges on identical bytes from the Lockfile, with no network", () => {
+  const first = home();
+  const marketplace = marketplaceRepo();
+  const declaration = `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`;
+  const original = project(declaration);
+  sync(original, counting(first));
+
+  // What a teammate has after `git clone`: the Manifest and the Lockfile, and a
+  // Store that already holds the content — so nothing may be fetched at all.
+  const second = project(declaration);
+  writeFileSync(join(second.root, "harvenv.lock"), readFileSync(join(original.root, "harvenv.lock"), "utf8"));
+  const result = sync(second, offline(first));
+
+  assert.deepEqual(result.reused, ["alpha-pack"]);
+  assert.equal(hashTree(realpathSync(pluginLink(second.root))), readLockfile(original.root)?.plugins[0]?.hash);
+});
+
+test("sync reproduces the locked marketplace commit even after the marketplace moved on", () => {
+  const env = home();
+  const marketplace = marketplaceRepo("alpha-pack", "First.\n");
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+  sync(manifest, counting(env));
+  const locked = readFileSync(join(manifest.root, "harvenv.lock"), "utf8");
+
+  commitFiles(marketplace.dir, marketplaceWith("alpha-pack", "fixtures", "Second.\n"), "second");
+  rmSync(join(env.HARV_HOME as string, "store"), { recursive: true, force: true });
+  rmSync(join(manifest.root, ".claude"), { recursive: true, force: true });
+  sync(manifest, counting(env));
+
+  const skill = join(pluginLink(manifest.root), "skills", "alpha-pack-skill", "SKILL.md");
+  assert.match(readFileSync(skill, "utf8"), /First\./);
+  assert.equal(readFileSync(join(manifest.root, "harvenv.lock"), "utf8"), locked, "the Lockfile did not move");
+});
+
+test("sync follows a plugin that moved inside a marketplace it re-resolves", () => {
+  // Where a plugin lives is the marketplace's to state, so a reorganized
+  // marketplace at a new ref is followed rather than reported as broken.
+  const env = home();
+  const marketplace = gitRepo(marketplaceWith("alpha-pack"));
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+  sync(manifest, counting(env));
+
+  git(["checkout", "--quiet", "-b", "next"], marketplace.dir);
+  git(["rm", "--quiet", "-r", "plugins"], marketplace.dir);
+  const moved = commitFiles(
+    marketplace.dir,
+    {
+      ".claude-plugin/marketplace.json": marketplaceFile("fixtures", { "alpha-pack": "./packs/alpha-pack" }),
+      "packs/alpha-pack/.claude-plugin/plugin.json": pluginFile("alpha-pack"),
+      "packs/alpha-pack/skills/alpha-pack-skill/SKILL.md": skillFile("alpha-pack-skill", "Moved.\n"),
+    },
+    "reorganized",
+  );
+  writeFileSync(
+    join(manifest.root, "harvenv.toml"),
+    `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}", ref = "next" }\n`,
+  );
+  sync(loadManifest(join(manifest.root, "harvenv.toml")), counting(env));
+
+  assert.equal(readLockfile(manifest.root)?.plugins[0]?.commit, moved);
+  assert.match(
+    readFileSync(join(pluginLink(manifest.root), "skills", "alpha-pack-skill", "SKILL.md"), "utf8"),
+    /Moved\./,
+  );
+});
+
+test("sync fails loudly when a marketplace fetch does not produce the pinned content", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+  sync(manifest, counting(env));
+
+  const tampered = readFileSync(join(manifest.root, "harvenv.lock"), "utf8").replace(
+    /hash = "sha256:[0-9a-f]{64}"/,
+    `hash = "sha256:${"c".repeat(64)}"`,
+  );
+  writeFileSync(join(manifest.root, "harvenv.lock"), tampered);
+  rmSync(join(env.HARV_HOME as string, "store"), { recursive: true, force: true });
+
+  assert.throws(
+    () => sync(manifest, counting(env)),
+    (err: Error) => err instanceof SyncError && /alpha-pack/.test(err.message) && /c{64}/.test(err.message),
+  );
+});
+
+test("sync names the plugins a marketplace does offer when the pin is not among them", () => {
+  const marketplace = marketplaceRepo("alpha-pack");
+  const manifest = project(`[plugins]\nbeta-pack = { marketplace = "${marketplace.url}" }\n`);
+
+  assert.throws(
+    () => sync(manifest, counting(home())),
+    (err: Error) => /beta-pack/.test(err.message) && /alpha-pack/.test(err.message),
+  );
+});
+
+test("sync warns by name about MCP servers a pinned plugin ships and the recipe suppresses", () => {
+  const files = marketplaceWith("alpha-pack");
+  files["plugins/alpha-pack/.mcp.json"] = JSON.stringify({ mcpServers: { docs: { command: "node" } } });
+  const marketplace = gitRepo(files);
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+
+  const result = sync(manifest, counting(home()));
+
+  assert.equal(result.warnings.length, 1);
+  assert.match(result.warnings[0] ?? "", /alpha-pack/);
+  assert.match(result.warnings[0] ?? "", /docs/);
+  assert.match(result.warnings[0] ?? "", /strict-mcp-config/);
+});
+
+test("sync says nothing about MCP for a plugin that ships no servers", () => {
+  const marketplace = marketplaceRepo();
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+
+  assert.deepEqual(sync(manifest, counting(home())).warnings, []);
+});
+
+test("sync drops a plugin from project scope once the Manifest stops pinning it", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+  sync(manifest, counting(env));
+
+  writeFileSync(join(manifest.root, "harvenv.toml"), "");
+  sync(loadManifest(join(manifest.root, "harvenv.toml")), counting(env));
+
+  assert.equal(existsSync(pluginLink(manifest.root)), false);
+  assert.deepEqual(readLockfile(manifest.root)?.plugins, []);
+});
+
+test("sync rejects a plugin published under a name other than the one it is pinned as", () => {
+  const files = marketplaceWith("alpha-pack");
+  files["plugins/alpha-pack/.claude-plugin/plugin.json"] = pluginFile("alpha-pack-dev");
+  const marketplace = gitRepo(files);
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+
+  assert.throws(() => sync(manifest, counting(home())), /alpha-pack-dev/);
+});
+
+test("the Store holds one copy when a skill and a plugin resolve to the same bytes", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const first = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+  sync(first, counting(env));
+  const second = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+  sync(second, counting(env));
+
+  const hash = readLockfile(first.root)?.plugins[0]?.hash ?? "";
+  assert.equal(readLockfile(second.root)?.plugins[0]?.hash, hash);
+  assert.equal(hashTree(storePath(hash, env)), hash, "the Store entry still hashes to its own address");
+});
+
+test("skills and plugins are synced from one Manifest without colliding", () => {
+  const env = home();
+  const skillRepo = gitRepo({ "SKILL.md": skillFile("shared") });
+  const marketplace = marketplaceRepo("shared");
+  const manifest = project(
+    `[skills]\nshared = { git = "${skillRepo.url}" }\n\n` +
+      `[plugins]\nshared = { marketplace = "${marketplace.url}" }\n`,
+  );
+
+  const result = sync(manifest, counting(env));
+
+  assert.deepEqual(result.materialized.plugins, ["shared"]);
+  assert.equal(existsSync(join(skillsDir(manifest.root), "shared", "SKILL.md")), true);
+  assert.equal(existsSync(join(pluginLink(manifest.root, "shared"), ".claude-plugin", "plugin.json")), true);
+});
+
+// --- plan: what the Launcher resolves without fetching -----------------------
+
+test("plan resolves a locked plugin to its Store entry", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+  sync(manifest, counting(env));
+
+  const resolved = plan(manifest, readLockfile(manifest.root), env);
+
+  const hash = readLockfile(manifest.root)?.plugins[0]?.hash ?? "";
+  assert.deepEqual(resolved.plugins, [{ name: "alpha-pack", path: storePath(hash, env) }]);
+});
+
+test("plan tells the user to sync when the Store does not hold a pinned plugin", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+  sync(manifest, counting(env));
+  rmSync(join(env.HARV_HOME as string, "store"), { recursive: true, force: true });
+
+  assert.throws(
+    () => plan(manifest, readLockfile(manifest.root), env),
+    (err: Error) => err instanceof SyncError && /alpha-pack/.test(err.message) && /harv sync/.test(err.message),
+  );
 });

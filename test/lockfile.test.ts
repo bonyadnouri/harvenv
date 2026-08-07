@@ -11,7 +11,7 @@ import {
   readLockfile,
   writeLockfile,
 } from "../src/lockfile.ts";
-import type { LockedSkill } from "../src/lockfile.ts";
+import type { LockedPlugin, LockedSkill } from "../src/lockfile.ts";
 import { loadManifest } from "../src/manifest.ts";
 import { tempDir } from "./helpers.ts";
 
@@ -25,6 +25,13 @@ const gitLock = (name: string, extra: Partial<LockedSkill> = {}): LockedSkill =>
   commit: COMMIT,
   hash: HASH,
   ...extra,
+});
+
+const pluginLock = (name: string, source: { ref?: string } = {}): LockedPlugin => ({
+  name,
+  source: { kind: "marketplace", repo: "https://example.com/m.git", ...source },
+  commit: COMMIT,
+  hash: HASH,
 });
 
 /** A project whose Manifest is `body`, ready for a drift comparison. */
@@ -108,7 +115,7 @@ test("readLockfile rejects a content hash that is not one", () => {
   const root = tempDir();
   writeFileSync(
     lockfilePath(root),
-    `version = 1\n\n[[skills]]\nname = "example"\nsource = "git"\ngit = "https://example.com/s.git"\ncommit = "${COMMIT}"\nhash = "sha256:../../etc"\n`,
+    `version = 2\n\n[[skills]]\nname = "example"\nsource = "git"\ngit = "https://example.com/s.git"\ncommit = "${COMMIT}"\nhash = "sha256:../../etc"\n`,
   );
 
   assert.throws(
@@ -121,7 +128,7 @@ test("readLockfile rejects a locked name that would escape the skills directory"
   const root = tempDir();
   writeFileSync(
     lockfilePath(root),
-    `version = 1\n\n[[skills]]\nname = "../agents"\nsource = "git"\ngit = "https://example.com/s.git"\ncommit = "${COMMIT}"\nhash = "${HASH}"\n`,
+    `version = 2\n\n[[skills]]\nname = "../agents"\nsource = "git"\ngit = "https://example.com/s.git"\ncommit = "${COMMIT}"\nhash = "${HASH}"\n`,
   );
 
   assert.throws(
@@ -134,13 +141,173 @@ test("readLockfile rejects a git entry with no commit to reproduce", () => {
   const root = tempDir();
   writeFileSync(
     lockfilePath(root),
-    `version = 1\n\n[[skills]]\nname = "example"\nsource = "git"\ngit = "https://example.com/s.git"\nhash = "${HASH}"\n`,
+    `version = 2\n\n[[skills]]\nname = "example"\nsource = "git"\ngit = "https://example.com/s.git"\nhash = "${HASH}"\n`,
   );
 
   assert.throws(
     () => readLockfile(root),
     (err: Error) => err instanceof LockfileError && /commit/.test(err.message),
   );
+});
+
+// ---------------------------------------------------------------------------
+// Plugin pins
+// ---------------------------------------------------------------------------
+
+test("writeLockfile then readLockfile round-trips a plugin pin", () => {
+  const root = tempDir();
+
+  writeLockfile(root, [], [pluginLock("superpowers", { ref: "v6.2.0" })]);
+
+  assert.deepEqual(readLockfile(root)?.plugins, [pluginLock("superpowers", { ref: "v6.2.0" })]);
+});
+
+test("a plugin is pinned by the marketplace commit and its own content hash", () => {
+  const root = tempDir();
+
+  writeLockfile(root, [], [pluginLock("superpowers")]);
+  const text = readFileSync(lockfilePath(root), "utf8");
+
+  assert.match(text, /\[\[plugins\]\]/);
+  assert.match(text, new RegExp(`marketplace = "https://example.com/m.git"`));
+  assert.match(text, new RegExp(`commit = "${COMMIT}"`));
+  assert.match(text, new RegExp(`hash = "${HASH}"`));
+});
+
+test("the Lockfile keeps skills and plugins apart, so one name can never be both", () => {
+  const root = tempDir();
+
+  writeLockfile(root, [gitLock("shared")], [pluginLock("shared")]);
+
+  assert.deepEqual(readLockfile(root)?.skills.map((s) => s.name), ["shared"]);
+  assert.deepEqual(readLockfile(root)?.plugins.map((p) => p.name), ["shared"]);
+});
+
+test("a Lockfile that pins plugins is not readable by a harv that predates them", () => {
+  // The bump is the point: an older harv would read the skills, ignore the
+  // plugins and launch a Harvenv missing them, which is the one failure a
+  // Lockfile exists to prevent.
+  const root = tempDir();
+  writeLockfile(root, [], [pluginLock("superpowers")]);
+
+  assert.match(readFileSync(lockfilePath(root), "utf8"), /^version = 2$/m);
+});
+
+test("readLockfile still reads a Lockfile written before plugins existed", () => {
+  // The refusal is one-directional. A version-1 file pins no plugins, which is
+  // a subset of what this harv understands, so upgrading harv costs nothing —
+  // the next Sync rewrites it current.
+  const root = tempDir();
+  writeFileSync(
+    lockfilePath(root),
+    `version = 1\n\n[[skills]]\nname = "example"\nsource = "git"\ngit = "https://example.com/s.git"\ncommit = "${COMMIT}"\nhash = "${HASH}"\n`,
+  );
+
+  const lock = readLockfile(root);
+
+  assert.deepEqual(lock?.skills.map((s) => s.name), ["example"]);
+  assert.deepEqual(lock?.plugins, []);
+});
+
+test("readLockfile rejects a `version` that is not a version at all", () => {
+  const root = tempDir();
+  writeFileSync(lockfilePath(root), 'version = "two"\n');
+
+  assert.throws(
+    () => readLockfile(root),
+    (err: Error) => err instanceof LockfileError && /version/.test(err.message),
+  );
+});
+
+test("readLockfile rejects a plugin pinned without a commit", () => {
+  const root = tempDir();
+  writeFileSync(
+    lockfilePath(root),
+    `version = 2\n\n[[plugins]]\nname = "superpowers"\nmarketplace = "https://example.com/m.git"\nhash = "${HASH}"\n`,
+  );
+
+  assert.throws(
+    () => readLockfile(root),
+    (err: Error) => err instanceof LockfileError && /commit/.test(err.message),
+  );
+});
+
+test("readLockfile rejects a plugin name that would escape the plugins directory", () => {
+  const root = tempDir();
+  writeFileSync(
+    lockfilePath(root),
+    `version = 2\n\n[[plugins]]\nname = "../skills"\nmarketplace = "https://example.com/m.git"\ncommit = "${COMMIT}"\nhash = "${HASH}"\n`,
+  );
+
+  assert.throws(
+    () => readLockfile(root),
+    (err: Error) => err instanceof LockfileError && /plugin name/.test(err.message),
+  );
+});
+
+test("readLockfile rejects a plugin hash that is not a content hash", () => {
+  const root = tempDir();
+  writeFileSync(
+    lockfilePath(root),
+    `version = 2\n\n[[plugins]]\nname = "superpowers"\nmarketplace = "https://example.com/m.git"\ncommit = "${COMMIT}"\nhash = "sha256:../../etc"\n`,
+  );
+
+  assert.throws(
+    () => readLockfile(root),
+    (err: Error) => err instanceof LockfileError && /hash/.test(err.message),
+  );
+});
+
+test("driftAgainst names a plugin the Manifest declares and the Lockfile does not", () => {
+  const { root, manifest } = project('[plugins]\nsuperpowers = { marketplace = "https://example.com/m.git" }\n');
+  writeLockfile(root, []);
+
+  assert.deepEqual(driftAgainst(manifest, readLockfile(root)), [
+    { name: "superpowers", reason: "declared in the Manifest but not locked" },
+  ]);
+});
+
+test("driftAgainst names a plugin whose marketplace ref moved, quoting both", () => {
+  const { root, manifest } = project(
+    '[plugins]\nsuperpowers = { marketplace = "https://example.com/m.git", ref = "v7" }\n',
+  );
+  writeLockfile(root, [], [pluginLock("superpowers", { ref: "v6" })]);
+
+  const drift = driftAgainst(manifest, readLockfile(root));
+
+  assert.equal(drift.length, 1);
+  assert.match(drift[0]?.reason ?? "", /v6/);
+  assert.match(drift[0]?.reason ?? "", /v7/);
+});
+
+test("driftAgainst names a plugin the Lockfile holds and the Manifest has dropped", () => {
+  const { root, manifest } = project("");
+  writeLockfile(root, [], [pluginLock("superpowers")]);
+
+  assert.deepEqual(driftAgainst(manifest, readLockfile(root)), [
+    { name: "superpowers", reason: "locked but no longer declared in the Manifest" },
+  ]);
+});
+
+test("driftAgainst reports nothing when a plugin pin and its Lockfile entry agree", () => {
+  const { root, manifest } = project(
+    '[plugins]\nsuperpowers = { marketplace = "https://example.com/m.git", ref = "v6" }\n',
+  );
+  writeLockfile(root, [], [pluginLock("superpowers", { ref: "v6" })]);
+
+  assert.deepEqual(driftAgainst(manifest, readLockfile(root)), []);
+});
+
+test("a skill and a plugin of the same name drift independently", () => {
+  const { root, manifest } = project(
+    '[skills]\nshared = { git = "https://example.com/s.git" }\n\n' +
+      '[plugins]\nshared = { marketplace = "https://example.com/m.git" }\n',
+  );
+  writeLockfile(root, [gitLock("shared")]);
+
+  assert.deepEqual(driftAgainst(manifest, readLockfile(root)), [
+    { name: "shared", reason: "declared in the Manifest but not locked" },
+  ]);
 });
 
 test("driftAgainst reports nothing when the Manifest and the Lockfile agree", () => {

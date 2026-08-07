@@ -110,3 +110,37 @@ export const argsOf = (stdout: string): string[] =>
 /** The `who=` line of a stand-in's output. */
 export const whoRan = (stdout: string): string | undefined =>
   stdout.split("\n").find((l) => l.startsWith("who="))?.slice("who=".length);
+
+/** A plugin's own manifest — what names it once it is served. */
+export const pluginFile = (name: string, extra: Record<string, unknown> = {}): string =>
+  `${JSON.stringify({ name, version: "1.0.0", description: `Fixture plugin ${name}.`, ...extra }, null, 2)}\n`;
+
+/** A marketplace catalogue listing each plugin at the directory it occupies. */
+export const marketplaceFile = (name: string, plugins: Record<string, unknown>): string =>
+  `${JSON.stringify(
+    {
+      name,
+      owner: { name: "harvenv tests" },
+      plugins: Object.entries(plugins).map(([plugin, source]) => ({
+        name: plugin,
+        source,
+        description: `Fixture plugin ${plugin}.`,
+      })),
+    },
+    null,
+    2,
+  )}\n`;
+
+/**
+ * The files of a marketplace holding one plugin in a subdirectory: a catalogue,
+ * the plugin's own manifest, and one skill and one command to find in a session.
+ */
+export function marketplaceWith(plugin: string, marketplace = "fixture-marketplace", body = "Marker.\n"): Record<string, string> {
+  return {
+    ".claude-plugin/marketplace.json": marketplaceFile(marketplace, { [plugin]: `./plugins/${plugin}` }),
+    [`plugins/${plugin}/.claude-plugin/plugin.json`]: pluginFile(plugin),
+    [`plugins/${plugin}/skills/${plugin}-skill/SKILL.md`]: skillFile(`${plugin}-skill`, body),
+    [`plugins/${plugin}/commands/${plugin}-command.md`]: `---\ndescription: Fixture command\n---\n\n${body}`,
+    "README.md": "The rest of the marketplace, which resolving a plugin must leave behind.\n",
+  };
+}

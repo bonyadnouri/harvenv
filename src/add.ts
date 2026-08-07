@@ -10,7 +10,7 @@
  */
 
 import { COMPONENT_NAME_RULE, isComponentName } from "./manifest.ts";
-import type { Source } from "./manifest.ts";
+import type { MarketplaceSource, Source } from "./manifest.ts";
 
 export class AddError extends Error {
   override name = "AddError";
@@ -38,39 +38,43 @@ export function parseCoordinate(coordinate: string): { repo: string; ref?: strin
   };
 }
 
-/** The line a Source becomes in the `[skills]` table. */
-export function entryLine(name: string, source: Source): string {
+/** The table an added Source belongs in — which is decided by what it is. */
+export const tableFor = (source: Source | MarketplaceSource): string =>
+  source.kind === "marketplace" ? "plugins" : "skills";
+
+/** The line a Source becomes in its table. */
+export function entryLine(name: string, source: Source | MarketplaceSource): string {
   const fields =
     source.kind === "path"
       ? [`path = ${quote(source.declared)}`]
       : [
-          `git = ${quote(source.repo)}`,
+          `${source.kind === "marketplace" ? "marketplace" : "git"} = ${quote(source.repo)}`,
           ...(source.ref === undefined ? [] : [`ref = ${quote(source.ref)}`]),
-          ...(source.subdir === undefined ? [] : [`subdir = ${quote(source.subdir)}`]),
+          ...(source.kind === "git" && source.subdir !== undefined ? [`subdir = ${quote(source.subdir)}`] : []),
         ];
   return `${quoteKey(name)} = { ${fields.join(", ")} }`;
 }
 
 /**
- * The Manifest text with `line` added to its `[skills]` table.
+ * The Manifest text with `line` added to its `[<table>]` table.
  *
  * The table runs from its header to the next table header or the end of the
  * file, and the entry lands after its last non-blank line — so repeated adds
  * accumulate in order rather than pushing each other apart.
  */
-export function withEntry(text: string, line: string): string {
+export function withEntry(text: string, line: string, table = "skills"): string {
   const lines = text.split("\n");
-  const header = lines.findIndex((entry) => /^\s*\[skills\]\s*(#.*)?$/.test(entry));
+  const header = lines.findIndex((entry) => new RegExp(`^\\s*\\[${table}\\]\\s*(#.*)?$`).test(entry));
 
   if (header === -1) {
-    if (/^\s*skills\s*=/m.test(text)) {
+    if (new RegExp(`^\\s*${table}\\s*=`, "m").test(text)) {
       throw new AddError(
-        "this Manifest writes `skills` as an inline table, which harv will not rewrite safely. " +
+        `this Manifest writes \`${table}\` as an inline table, which harv will not rewrite safely. ` +
           "Add the entry by hand, then run `harv sync`.",
       );
     }
     const separator = text === "" || text.endsWith("\n\n") ? "" : text.endsWith("\n") ? "\n" : "\n\n";
-    return `${text}${separator}[skills]\n${line}\n`;
+    return `${text}${separator}[${table}]\n${line}\n`;
   }
 
   let end = header + 1;
@@ -91,7 +95,7 @@ export function validateName(name: string | undefined): string {
   }
   if (!isComponentName(name)) {
     throw new AddError(
-      `\`${name}\` is not a usable skill name: ${COMPONENT_NAME_RULE}. ` +
+      `\`${name}\` is not a usable Component name: ${COMPONENT_NAME_RULE}. ` +
         `The name is also the name the session answers to (ADR 0008).`,
     );
   }

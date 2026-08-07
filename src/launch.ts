@@ -14,14 +14,22 @@
  *                                     Servers live in ~/.claude.json, which is
  *                                     not a settings source, so suppressing the
  *                                     machine's own takes its own pair of flags
+ *   --plugin-dir <link>               one per pinned plugin, and nothing else:
+ *                                     the flag renames what it serves, which is
+ *                                     wrong for a skill and right for a plugin
+ *                                     (ADR 0008)
  *
  * Declared skills are not passed here at all: they reach the session through
- * project scope, because `--plugin-dir` renames what it serves (ADR 0008).
+ * project scope, so they keep their bare names. Pinned plugins do come through
+ * `--plugin-dir`, because the `<plugin>:<name>` prefix it adds is the name they
+ * are published under — and suppressing the user's plugins with
+ * `--setting-sources` while re-adding the Manifest's own is what makes the two
+ * sets disjoint rather than merged.
  *
- * The two payloads are built here rather than merged into one settings blob
- * because they answer to different flags — but both are built by harv rather
- * than assembled by Claude Code out of layers, which is what lets ADR 0005's
- * rules be enforced at all (spike 0001, finding 2).
+ * The settings and MCP payloads are built here rather than merged into one
+ * settings blob because they answer to different flags — but both are built by
+ * harv rather than assembled by Claude Code out of layers, which is what lets
+ * ADR 0005's rules be enforced at all (spike 0001, finding 2).
  */
 
 import { spawn } from "node:child_process";
@@ -31,6 +39,7 @@ import { generateSettings } from "./settings.ts";
 import { resolveRealClaude } from "./shim.ts";
 import { LAUNCHER_ENV } from "./tripwire.ts";
 import type { Manifest } from "./manifest.ts";
+import { pluginDir } from "./materialize.ts";
 
 /** A session that cannot be started at all — as opposed to one that fails. */
 export class LaunchError extends Error {
@@ -57,6 +66,10 @@ export function buildLaunchArgs(
     "--strict-mcp-config",
     "--mcp-config",
     generateMcpConfig(manifest.mcpServers, env),
+    // The link, never the Store entry it points at: a plugin with no
+    // `plugin.json` is named after the directory it is served from, and that
+    // directory has to be called what the Manifest calls it.
+    ...manifest.plugins.flatMap((plugin) => ["--plugin-dir", pluginDir(manifest.root, plugin.name)]),
     ...passthrough,
   ];
 }

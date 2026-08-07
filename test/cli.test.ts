@@ -7,11 +7,20 @@ import type { Manifest } from "../src/manifest.ts";
 import type { ShimContext } from "../src/shim.ts";
 import type { Env } from "../src/store.ts";
 import { run } from "../src/cli.ts";
+import { buildLaunchArgs } from "../src/launch.ts";
 import { MISE_VERSION, MiseError } from "../src/mise.ts";
 import { currentPlatform } from "../src/platform.ts";
 import { hasTripwire } from "../src/tripwire.ts";
 import { VERSION } from "../src/version.ts";
-import { commitFiles, gitRepo, shimSandbox, skillFile, tempDir } from "./helpers.ts";
+import {
+  commitFiles,
+  git,
+  gitRepo,
+  marketplaceWith,
+  shimSandbox,
+  skillFile,
+  tempDir,
+} from "./helpers.ts";
 
 interface Recorded {
   exit: number;
@@ -747,7 +756,7 @@ test("harv reports a broken Manifest without a stack trace", async () => {
   const { exit, err } = await harv(root)(["sync"]);
 
   assert.notEqual(exit, 0);
-  assert.match(err, /cannot fetch yet/);
+  assert.match(err, /\[plugins\]/);
   assert.doesNotMatch(err, /at .*\.ts:\d+/, "no stack trace leaks to the user");
 });
 
@@ -767,4 +776,115 @@ test("a Lockfile survives a fresh clone: sync, wipe the Store and the tree, sync
 
   assert.equal(readFileSync(join(root, ".claude", "skills", "example", "SKILL.md"), "utf8"), materialized);
   assert.equal(readFileSync(join(root, "harvenv.lock"), "utf8"), lock);
+});
+
+// ---------------------------------------------------------------------------
+// Plugin pins, end to end through the CLI
+// ---------------------------------------------------------------------------
+
+test("harv add --marketplace declares the plugin under [plugins] and syncs it", async () => {
+  const marketplace = gitRepo(marketplaceWith("alpha-pack"));
+  const root = project("");
+
+  const { exit, out } = await harv(root)(["add", "alpha-pack", "--marketplace", marketplace.url]);
+
+  assert.equal(exit, 0, out);
+  assert.match(manifestText(root), /\[plugins\]\nalpha-pack = \{ marketplace = "[^"]+" \}/);
+  assert.match(out, /alpha-pack/);
+  assert.equal(existsSync(join(root, ".claude", "harv-plugins", "alpha-pack", "SKILL.md")), false);
+  assert.equal(
+    existsSync(join(root, ".claude", "harv-plugins", "alpha-pack", "skills", "alpha-pack-skill", "SKILL.md")),
+    true,
+  );
+});
+
+test("harv add --marketplace carries a ref from the coordinate", async () => {
+  const marketplace = gitRepo(marketplaceWith("alpha-pack"));
+  git(["tag", "v1"], marketplace.dir);
+  const root = project("");
+
+  await harv(root)(["add", "alpha-pack", "--marketplace", `${marketplace.url}@v1`]);
+
+  assert.match(manifestText(root), /ref = "v1"/);
+  assert.match(readFileSync(join(root, "harvenv.lock"), "utf8"), /\[\[plugins\]\]/);
+});
+
+test("harv add --marketplace refuses a subdirectory the marketplace decides", async () => {
+  const root = project("");
+
+  const { exit, err } = await harv(root)([
+    "add",
+    "alpha-pack",
+    "--marketplace",
+    "https://example.com/m.git#plugins/alpha-pack",
+  ]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /subdirectory/);
+  assert.doesNotMatch(manifestText(root), /alpha-pack/, "the Manifest is left as it was");
+});
+
+test("harv add puts the Manifest back when a marketplace does not offer the plugin", async () => {
+  const marketplace = gitRepo(marketplaceWith("alpha-pack"));
+  const root = project("");
+  const before = manifestText(root);
+
+  const { exit, err } = await harv(root)(["add", "beta-pack", "--marketplace", marketplace.url]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /beta-pack/);
+  assert.match(err, /alpha-pack/, "the plugins the marketplace does offer are named");
+  assert.equal(manifestText(root), before);
+});
+
+test("harv claude serves a pinned plugin through --plugin-dir, and no skill that way", async () => {
+  const marketplace = gitRepo(marketplaceWith("alpha-pack"));
+  const root = project(
+    '[skills]\nexample-skill = { path = "vendor/example-skill" }\n\n' +
+      `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`,
+  );
+  const cli = harv(root);
+  await cli(["sync"]);
+
+  const { exit, launched } = await cli(["claude"]);
+
+  assert.equal(exit, 0);
+  const args = buildLaunchArgs(launched[0]!.manifest, [], {});
+  assert.deepEqual(args.slice(args.indexOf("--plugin-dir")), [
+    "--plugin-dir",
+    join(root, ".claude", "harv-plugins", "alpha-pack"),
+  ]);
+});
+
+test("harv claude refuses to start when a plugin pin has drifted from the Lockfile", async () => {
+  const marketplace = gitRepo(marketplaceWith("alpha-pack"));
+  const root = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+  const cli = harv(root);
+  await cli(["sync"]);
+
+  writeFileSync(
+    join(root, "harvenv.toml"),
+    `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}", ref = "main" }\n`,
+  );
+  const { exit, err, launched } = await cli(["claude"]);
+
+  assert.notEqual(exit, 0);
+  assert.equal(launched.length, 0, "no session is started while the Harvenv is drifted");
+  assert.match(err, /alpha-pack/);
+  assert.match(err, /harv sync/);
+});
+
+test("harv sync reports a pinned plugin's suppressed MCP servers as a warning", async () => {
+  const files = marketplaceWith("alpha-pack");
+  files["plugins/alpha-pack/.mcp.json"] = JSON.stringify({ mcpServers: { docs: { command: "node" } } });
+  const marketplace = gitRepo(files);
+  const root = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+
+  const { exit, out, err } = await harv(root)(["sync"]);
+
+  assert.equal(exit, 0);
+  assert.match(err, /warning/i);
+  assert.match(err, /alpha-pack/);
+  assert.match(err, /docs/);
+  assert.doesNotMatch(out, /warning/i, "a warning belongs on stderr");
 });

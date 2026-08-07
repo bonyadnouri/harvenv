@@ -17,16 +17,26 @@
  * Step 3 is where "a clean clone reproduces byte-identical Components" is won
  * or lost: it fetches the commit the Lockfile names, never the ref the
  * Manifest names, so a branch that moved cannot change what a teammate gets.
+ *
+ * A pinned plugin runs the same three steps against its marketplace, with one
+ * question inserted between the fetch and the hash: *which directory is the
+ * plugin?* The marketplace's own catalogue answers it, read at the fetched
+ * commit — so the Store ends up holding the plugin rather than the catalogue it
+ * was listed in, and the hash covers exactly the tree a session will load.
  */
 
+import { existsSync, rmSync } from "node:fs";
+import { join } from "node:path";
+
 import { driftAgainst, readLockfile, writeLockfile } from "./lockfile.ts";
-import type { DriftEntry, Lockfile, LockedSkill } from "./lockfile.ts";
-import { describeSource } from "./manifest.ts";
-import type { GitSource, Manifest, Source } from "./manifest.ts";
+import type { DriftEntry, Lockfile, LockedPlugin, LockedSkill } from "./lockfile.ts";
+import { describePlugin, describeSource } from "./manifest.ts";
+import type { GitSource, Manifest, MarketplaceSource, PluginEntry, Source } from "./manifest.ts";
 import { fetchSource as realFetch, resolveCommit as realResolve } from "./git.ts";
 import type { Fetched } from "./git.ts";
+import { declaredMcpServers, MarketplaceError, resolvePlugin } from "./marketplace.ts";
 import { materialize } from "./materialize.ts";
-import type { MaterializePlan, MaterializeResult } from "./materialize.ts";
+import type { MaterializePlan, MaterializeResult, Resolved } from "./materialize.ts";
 import { hashTree, insert, isStored, storePath } from "./store.ts";
 import type { Env } from "./store.ts";
 
@@ -60,6 +70,7 @@ export function sync(manifest: Manifest, deps: Partial<SyncDeps> = {}): SyncResu
   const lock = readLockfile(manifest.root);
   const drift = driftAgainst(manifest, lock);
   const locked = new Map((lock?.skills ?? []).map((entry) => [entry.name, entry]));
+  const lockedPlugins = new Map((lock?.plugins ?? []).map((entry) => [entry.name, entry]));
 
   const result: SyncResult = {
     fetched: [],
@@ -67,11 +78,11 @@ export function sync(manifest: Manifest, deps: Partial<SyncDeps> = {}): SyncResu
     local: [],
     drift,
     warnings: [],
-    materialized: { linked: [], removed: [] },
+    materialized: { linked: [], plugins: [], removed: [] },
   };
 
   const entries: LockedSkill[] = [];
-  const resolved: MaterializePlan["skills"] = [];
+  const resolved: Resolved[] = [];
 
   for (const skill of manifest.skills) {
     if (skill.source.kind === "path") {
@@ -95,15 +106,7 @@ export function sync(manifest: Manifest, deps: Partial<SyncDeps> = {}): SyncResu
     const fetched = fetchSource(skill.source, commit, env);
     const hash = hashTree(fetched.staged);
     if (pin.hash !== undefined && pin.hash !== hash) {
-      throw new SyncError(
-        `Skill \`${skill.name}\` fetched content that does not match the hash its Lockfile pins.\n` +
-          `  Source:        ${describeSource(skill.source)}\n` +
-          `  Commit:        ${commit}\n` +
-          `  Locked hash:   ${pin.hash}\n` +
-          `  Fetched hash:  ${hash}\n` +
-          `The commit is the one the Lockfile names, so the content changed underneath the pin — ` +
-          `a rewritten tag or a tampered remote. Verify the Source before re-running \`harv sync\`.`,
-      );
+      throw new SyncError(mismatch(`Skill \`${skill.name}\``, skill.source, commit, pin.hash, hash));
     }
 
     result.fetched.push(skill.name);
@@ -111,13 +114,108 @@ export function sync(manifest: Manifest, deps: Partial<SyncDeps> = {}): SyncResu
     resolved.push({ name: skill.name, path: insert(fetched.staged, hash, env) });
   }
 
+  const pinned: LockedPlugin[] = [];
+  const plugins: Resolved[] = [];
+
+  for (const plugin of manifest.plugins) {
+    const pin = pinFor(plugin.source, lockedPlugins.get(plugin.name));
+    const marketplace = repositoryOf(plugin.source);
+
+    let path: string;
+    let commit: string;
+    let hash: string;
+
+    // A plugin pin has both halves or neither, so the Store can answer for it
+    // without a remote: the Lockfile already says which bytes are wanted.
+    if (pin.commit !== undefined && pin.hash !== undefined && isStored(pin.hash, env)) {
+      commit = pin.commit;
+      hash = pin.hash;
+      path = storePath(hash, env);
+      result.reused.push(plugin.name);
+    } else {
+      commit = pin.commit ?? resolveCommit(marketplace);
+      const fetched = fetchSource(marketplace, commit, env);
+      // The catalogue is read out of the fetched commit, not out of the
+      // coordinate: where a plugin sits is the marketplace's to state, and
+      // stating it at a commit is what keeps the answer the same everywhere.
+      const root = located(plugin, fetched.staged);
+
+      // The Store holds the plugin, not the marketplace that published it. A
+      // session loads one directory, ADR 0010 addresses exactly the tree a
+      // session loads, and pinning one plugin should not store a catalogue of
+      // the hundreds it was listed beside.
+      hash = hashTree(root);
+      if (pin.hash !== undefined && pin.hash !== hash) {
+        rmSync(fetched.staged, { recursive: true, force: true });
+        throw new SyncError(mismatch(`Plugin \`${plugin.name}\``, plugin.source, commit, pin.hash, hash));
+      }
+      path = insert(root, hash, env);
+      rmSync(fetched.staged, { recursive: true, force: true });
+      result.fetched.push(plugin.name);
+    }
+
+    pinned.push({ name: plugin.name, source: plugin.source, commit, hash });
+    plugins.push({ name: plugin.name, path });
+
+    const servers = declaredMcpServers(path);
+    if (servers.length > 0) result.warnings.push(unservedMcp(plugin.name, servers));
+  }
+
   // Materialization runs before the Lockfile is written: it is the step that
-  // validates each fetched tree really is the skill its key names (ADR 0008),
-  // and a Lockfile is a promise that should not outlive a failed one.
-  result.materialized = materialize({ root: manifest.root, skills: resolved });
-  writeLockfile(manifest.root, entries);
+  // validates each fetched tree really is the Component its key names
+  // (ADR 0008), and a Lockfile is a promise that should not outlive a failed one.
+  result.materialized = materialize({ root: manifest.root, skills: resolved, plugins });
+  writeLockfile(manifest.root, entries, pinned);
   return result;
 }
+
+/** A marketplace, addressed as what it is underneath: a repository at a ref. */
+const repositoryOf = (source: MarketplaceSource): GitSource => ({
+  kind: "git",
+  repo: source.repo,
+  ...(source.ref === undefined ? {} : { ref: source.ref }),
+});
+
+/**
+ * The directory a pinned plugin occupies in a fetched marketplace — with the
+ * failure re-stated in the Manifest's own terms, because `resolvePlugin` knows
+ * about a catalogue and the reader knows about a `[plugins]` entry.
+ */
+function located(plugin: PluginEntry, checkout: string): string {
+  let subdir: string;
+  try {
+    subdir = resolvePlugin(checkout, plugin.name).subdir;
+  } catch (err) {
+    if (err instanceof MarketplaceError) {
+      throw new MarketplaceError(`Plugin \`${describePlugin(plugin)}\`: ${err.message}`);
+    }
+    throw err;
+  }
+
+  const root = subdir === "" ? checkout : join(checkout, subdir);
+  if (!existsSync(root)) {
+    throw new MarketplaceError(
+      `Plugin \`${describePlugin(plugin)}\`: its marketplace lists it at \`${subdir}\`, ` +
+        `and that directory does not exist at the commit harv fetched.`,
+    );
+  }
+  return root;
+}
+
+const mismatch = (
+  what: string,
+  source: Source | MarketplaceSource,
+  commit: string,
+  locked: string,
+  fetched: string,
+): string =>
+  `${what} fetched content that does not match the hash its Lockfile pins.\n` +
+  `  Source:        ${describeSource(source)}\n` +
+  `  Commit:        ${commit}\n` +
+  `  Locked hash:   ${locked}\n` +
+  `  Fetched hash:  ${fetched}\n` +
+  `The commit is the one the Lockfile names, so the content changed underneath the pin — ` +
+  `a rewritten tag or a tampered remote. Verify the Source before re-running \`harv sync\`.`;
 
 /**
  * Where each declared Component lives, from the Lockfile alone.
@@ -128,24 +226,28 @@ export function sync(manifest: Manifest, deps: Partial<SyncDeps> = {}): SyncResu
  */
 export function plan(manifest: Manifest, lock: Lockfile | null, env: Env = process.env): MaterializePlan {
   const locked = new Map((lock?.skills ?? []).map((entry) => [entry.name, entry]));
+  const lockedPlugins = new Map((lock?.plugins ?? []).map((entry) => [entry.name, entry]));
 
   return {
     root: manifest.root,
     skills: manifest.skills.map((skill) => {
       if (skill.source.kind === "path") return { name: skill.name, path: skill.source.path };
-
-      const entry = locked.get(skill.name);
-      if (entry?.hash === undefined) {
-        throw new SyncError(`Skill \`${skill.name}\` is not in the Lockfile. Run \`harv sync\`.`);
-      }
-      if (!isStored(entry.hash, env)) {
-        throw new SyncError(
-          `Skill \`${skill.name}\` is locked at ${entry.hash} but the Store does not hold it. Run \`harv sync\`.`,
-        );
-      }
-      return { name: skill.name, path: storePath(entry.hash, env) };
+      return { name: skill.name, path: fromStore(`Skill \`${skill.name}\``, locked.get(skill.name)?.hash, env) };
     }),
+    plugins: manifest.plugins.map((plugin) => ({
+      name: plugin.name,
+      path: fromStore(`Plugin \`${plugin.name}\``, lockedPlugins.get(plugin.name)?.hash, env),
+    })),
   };
+}
+
+/** A locked hash turned into a Store path, or the reason it cannot be. */
+function fromStore(what: string, hash: string | undefined, env: Env): string {
+  if (hash === undefined) throw new SyncError(`${what} is not in the Lockfile. Run \`harv sync\`.`);
+  if (!isStored(hash, env)) {
+    throw new SyncError(`${what} is locked at ${hash} but the Store does not hold it. Run \`harv sync\`.`);
+  }
+  return storePath(hash, env);
 }
 
 export const nonPortable = (name: string, declared: string): string =>
@@ -153,17 +255,35 @@ export const nonPortable = (name: string, declared: string): string =>
   `Push it to a git repository and declare that instead to make this Harvenv portable.`;
 
 /**
+ * A pinned plugin ships MCP servers the recipe does not serve.
+ *
+ * `--strict-mcp-config` makes a session's servers exactly the ones `[mcp]`
+ * declares, which is what keeps the user's own out (ADR 0003) — and measurement
+ * shows it keeps a plugin's own out with them. Everything else the plugin
+ * carries does load, so the gap is narrow, invisible from inside a session, and
+ * exactly the kind of thing that has to be said out loud rather than found.
+ */
+export const unservedMcp = (name: string, servers: string[]): string =>
+  `plugin \`${name}\` declares the MCP server${servers.length > 1 ? "s" : ""} ${servers.map((s) => `\`${s}\``).join(", ")}, ` +
+  `which will not reach the session: \`--strict-mcp-config\` serves only the servers \`[mcp]\` declares. ` +
+  `Declare ${servers.length > 1 ? "them" : "it"} in \`[mcp]\` to use ${servers.length > 1 ? "them" : "it"}. ` +
+  `Everything else the plugin carries does load.`;
+
+/**
  * The commit and content a Lockfile entry pins for this Source — but only if it
  * still describes the same Source. A Manifest that moved to another ref has
  * nothing to reuse, and reusing it anyway would silently ignore the edit.
  */
-function pinFor(source: Source, entry: LockedSkill | undefined): { commit?: string; hash?: string } {
+function pinFor(
+  source: Source | MarketplaceSource,
+  entry: LockedSkill | LockedPlugin | undefined,
+): { commit?: string; hash?: string } {
   if (entry === undefined) return {};
   const same = coordinate(entry.source) === coordinate(source);
   return same ? { commit: entry.commit, hash: entry.hash } : {};
 }
 
-const coordinate = (source: Source): string => `${source.kind}:${describeSource(source)}`;
+const coordinate = (source: Source | MarketplaceSource): string => `${source.kind}:${describeSource(source)}`;
 
 const withDefaults = (deps: Partial<SyncDeps>): SyncDeps => ({
   env: deps.env ?? process.env,

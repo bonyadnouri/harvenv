@@ -140,13 +140,100 @@ test("loadManifest rejects a skill declared without a source", () => {
   );
 });
 
-test("loadManifest rejects a source kind this version cannot fetch", () => {
-  const path = manifestIn(tempDir(), '[skills]\nexample-skill = { marketplace = "anthropics/claude-code" }\n');
+test("loadManifest sends a marketplace declared under [skills] to the table it belongs in", () => {
+  const path = manifestIn(tempDir(), '[skills]\nexample-skill = { marketplace = "https://example.com/m.git" }\n');
 
   assert.throws(
     () => loadManifest(path),
-    (err: Error) => err instanceof ManifestError && /marketplace/.test(err.message),
+    (err: Error) =>
+      err instanceof ManifestError && /marketplace/.test(err.message) && /\[plugins\]/.test(err.message),
   );
+});
+
+// ---------------------------------------------------------------------------
+// [plugins] — ADR 0004's `name@marketplace` pins
+// ---------------------------------------------------------------------------
+
+test("loadManifest reads a plugin pin keyed by the plugin's own name", () => {
+  const path = manifestIn(
+    tempDir(),
+    '[plugins]\nsuperpowers = { marketplace = "https://example.com/m.git", ref = "v6.2.0" }\n',
+  );
+
+  assert.deepEqual(loadManifest(path).plugins, [
+    { name: "superpowers", source: { kind: "marketplace", repo: "https://example.com/m.git", ref: "v6.2.0" } },
+  ]);
+});
+
+test("loadManifest leaves a plugin's ref unset when the Manifest does not pin one", () => {
+  const path = manifestIn(tempDir(), '[plugins]\nsuperpowers = { marketplace = "https://example.com/m.git" }\n');
+
+  assert.deepEqual(loadManifest(path).plugins[0]?.source, {
+    kind: "marketplace",
+    repo: "https://example.com/m.git",
+  });
+});
+
+test("loadManifest reads skills and plugins from the same Manifest", () => {
+  const path = manifestIn(
+    tempDir(),
+    '[skills]\nexample-skill = { git = "https://example.com/s.git" }\n\n' +
+      '[plugins]\nsuperpowers = { marketplace = "https://example.com/m.git" }\n',
+  );
+
+  const manifest = loadManifest(path);
+
+  assert.deepEqual(manifest.skills.map((s) => s.name), ["example-skill"]);
+  assert.deepEqual(manifest.plugins.map((p) => p.name), ["superpowers"]);
+});
+
+test("loadManifest gives an empty plugin list to a Manifest that declares none", () => {
+  assert.deepEqual(loadManifest(manifestIn(tempDir(), '[skills]\nx = { path = "vendor/x" }\n')).plugins, []);
+});
+
+test("loadManifest rejects a plugin entry with no marketplace", () => {
+  const path = manifestIn(tempDir(), "[plugins]\nsuperpowers = { }\n");
+
+  assert.throws(
+    () => loadManifest(path),
+    (err: Error) => err instanceof ManifestError && /marketplace/.test(err.message) && /superpowers/.test(err.message),
+  );
+});
+
+test("loadManifest rejects a plugin declared by git, and says how to declare it", () => {
+  const path = manifestIn(tempDir(), '[plugins]\nsuperpowers = { git = "https://example.com/m.git" }\n');
+
+  assert.throws(
+    () => loadManifest(path),
+    (err: Error) => err instanceof ManifestError && /git/.test(err.message) && /marketplace/.test(err.message),
+  );
+});
+
+test("loadManifest rejects a subdir on a plugin, which the marketplace states instead", () => {
+  const path = manifestIn(
+    tempDir(),
+    '[plugins]\nsuperpowers = { marketplace = "https://example.com/m.git", subdir = "plugins/superpowers" }\n',
+  );
+
+  assert.throws(
+    () => loadManifest(path),
+    (err: Error) => err instanceof ManifestError && /subdir/.test(err.message) && /marketplace\.json/.test(err.message),
+  );
+});
+
+test("loadManifest rejects a plugin name that is not one path segment", () => {
+  const path = manifestIn(tempDir(), '[plugins]\n"../evil" = { marketplace = "https://example.com/m.git" }\n');
+
+  assert.throws(
+    () => loadManifest(path),
+    (err: Error) => err instanceof ManifestError && /plugin name/.test(err.message),
+  );
+});
+
+test("loadManifest rejects a plugin entry that is not a table", () => {
+  const path = manifestIn(tempDir(), '[plugins]\nsuperpowers = "https://example.com/m.git"\n');
+
+  assert.throws(() => loadManifest(path), ManifestError);
 });
 
 test("loadManifest rejects a skill entry that is not a table", () => {

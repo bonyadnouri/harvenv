@@ -18,7 +18,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 import { loadManifest, MANIFEST_FILENAME } from "./manifest.ts";
-import { MATERIALIZED_STATE_FILE } from "./materialize.ts";
+import { MATERIALIZED_STATE_FILE, PLUGINS_DIRNAME } from "./materialize.ts";
 import { hasTripwire, plantTripwire } from "./tripwire.ts";
 
 /** Claude Code's committed project settings — the file the Tripwire lives in. */
@@ -36,6 +36,7 @@ export class InitError extends Error {
  */
 export const GITIGNORE_ENTRIES = [
   ".claude/skills/",
+  `.claude/${PLUGINS_DIRNAME}/`,
   `.claude/${MATERIALIZED_STATE_FILE}`,
   ".claude/settings.local.json",
   "harvenv.local.toml",
@@ -62,6 +63,12 @@ const MANIFEST_TEMPLATE = `# ${MANIFEST_FILENAME} — this project's Harvenv.
 # The key is the name the session answers to, and has to match the skill's own
 # \`name:\` in its SKILL.md.
 # brainstorming = { git = "https://github.com/obra/superpowers.git", ref = "v6.2.0", subdir = "skills/brainstorming" }
+
+[plugins]
+# The key is the plugin's name in its marketplace, and the prefix everything it
+# carries answers to. A plugin arrives whole — its skills, commands, subagents
+# and hooks all load, and there is no way to take part of one.
+# gsap-skills = { marketplace = "https://github.com/greensock/gsap-skills.git", ref = "v1.0.0" }
 
 [settings]
 # Settings declared here are binding for everyone on the project: a personal
