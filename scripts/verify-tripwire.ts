@@ -25,8 +25,9 @@
  * Check 1 launches through a stand-in `claude` that records its argv, so the
  * scaffolded Manifest is proven launchable without spending a model turn.
  *
- * The machine's `~/.claude` is read, never written, and every probe runs with
- * `--no-session-persistence`.
+ * Nothing of the machine's is written: every probe runs against a Store inside
+ * the fixture tree via `HARV_HOME`, and `~/.claude` is read but never written
+ * (each session uses `--no-session-persistence`).
  *
  * Run:  bun scripts/verify-tripwire.ts [--json] [--keep]
  *       node scripts/verify-tripwire.ts [--json] [--keep]   (Node >= 22.18)
@@ -171,9 +172,21 @@ interface Fixtures {
   fresh: string;
   /** A project that already has committed settings and a `.gitignore`. */
   existing: string;
+  /** The Store these probes use. Never the machine's own. */
+  store: string;
   /** A stand-in `claude` that records its argv instead of starting a session. */
   fakeClaudeDir: string;
   fakeClaudeDump: string;
+}
+
+/**
+ * The environment every probe runs in: the fixture's Store rather than the
+ * user's, and no Launcher marker unless the Launcher itself sets one. Verifying
+ * from inside a harv session must not silence the Tripwire and pass vacuously.
+ */
+function probeEnv(fx: Fixtures, extra: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+  const { [LAUNCHER_ENV]: _inherited, ...clean } = process.env;
+  return { ...clean, HARV_HOME: fx.store, ...extra };
 }
 
 /** What a project might plausibly already have in its committed Claude settings. */
@@ -214,7 +227,7 @@ function buildFixtures(): Fixtures {
     { mode: 0o755 },
   );
 
-  return { fresh, existing, fakeClaudeDir, fakeClaudeDump };
+  return { fresh, existing, store: dir("store-home"), fakeClaudeDir, fakeClaudeDump };
 }
 
 // ---------------------------------------------------------------------------
@@ -252,7 +265,7 @@ const ignoreLines = (path: string): string[] =>
 // ---------------------------------------------------------------------------
 
 async function checkScaffold(fx: Fixtures): Promise<Check> {
-  const init = await harv(["init"], fx.fresh);
+  const init = await harv(["init"], fx.fresh, probeEnv(fx));
 
   const manifestPath = join(fx.fresh, MANIFEST_FILENAME);
   const gitignorePath = join(fx.fresh, ".gitignore");
@@ -264,7 +277,7 @@ async function checkScaffold(fx: Fixtures): Promise<Check> {
 
   // Launching through a stand-in `claude` proves harv accepted the scaffolded
   // Manifest — the strongest available reading of "valid" — for no model turn.
-  const launch = await harv(["claude"], fx.fresh, { ...process.env, PATH: `${fx.fakeClaudeDir}:${process.env.PATH ?? ""}` });
+  const launch = await harv(["claude"], fx.fresh, probeEnv(fx, { PATH: `${fx.fakeClaudeDir}:${process.env.PATH ?? ""}` }));
   const handover = existsSync(fx.fakeClaudeDump)
     ? (JSON.parse(readFileSync(fx.fakeClaudeDump, "utf8")) as { argv: string[]; marker: string | null })
     : null;
@@ -309,15 +322,14 @@ async function checkScaffold(fx: Fixtures): Promise<Check> {
 
 /**
  * Both sessions start in the same scaffolded project, so the only variable is
- * how they were started. The bare probe explicitly clears the Launcher marker:
- * verifying from inside a harv session must not make the warning vanish and
- * the check pass anyway.
+ * how they were started — and neither inherits a Launcher marker, so the only
+ * thing that can set one is the Launcher itself.
  */
 async function checkWarnings(fx: Fixtures): Promise<Check> {
-  const { [LAUNCHER_ENV]: _cleared, ...unmarked } = process.env;
+  const env = probeEnv(fx);
 
-  const bare = await probeSessionStart("claude", STREAM_JSON, fx.fresh, unmarked);
-  const launched = await probeSessionStart(process.execPath, [HARV, "claude", ...STREAM_JSON], fx.fresh, unmarked);
+  const bare = await probeSessionStart("claude", STREAM_JSON, fx.fresh, env);
+  const launched = await probeSessionStart(process.execPath, [HARV, "claude", ...STREAM_JSON], fx.fresh, env);
 
   const bareMessages = systemMessages(bare);
   const launchedMessages = systemMessages(launched);
@@ -380,17 +392,17 @@ async function checkMerge(fx: Fixtures): Promise<Check> {
   const settingsPath = join(fx.existing, ...PROJECT_SETTINGS_PATH);
   const gitignorePath = join(fx.existing, ".gitignore");
 
-  const first = await harv(["init"], fx.existing);
+  const first = await harv(["init"], fx.existing, probeEnv(fx));
   const merged = readJson(settingsPath);
   const mergedText = readFileSync(settingsPath, "utf8");
   const mergedIgnore = readFileSync(gitignorePath, "utf8");
 
-  const second = await harv(["init"], fx.existing);
+  const second = await harv(["init"], fx.existing, probeEnv(fx));
   const afterText = readFileSync(settingsPath, "utf8");
   const afterIgnore = readFileSync(gitignorePath, "utf8");
   const afterManifest = readFileSync(join(fx.existing, MANIFEST_FILENAME), "utf8");
 
-  const third = await harv(["init"], fx.existing);
+  const third = await harv(["init"], fx.existing, probeEnv(fx));
 
   const hooks = (merged.hooks ?? {}) as Record<string, Array<{ hooks: Array<{ command: string }> }>>;
   const theirSessionStart = hooks.SessionStart?.[0]?.hooks?.[0]?.command;
