@@ -284,7 +284,12 @@ async function claude(args: string[], deps: CliDeps): Promise<number> {
 
   materialize(resolved);
 
-  return deps.launch(session, passthrough, deps.env, toolPaths(locks.manifest, deps.env));
+  // A tool the Store cannot serve is said out loud and then launched around —
+  // never a refusal, because Sync may have no way to install it (ADR 0006).
+  const tools = toolPaths(locks.manifest, deps.env);
+  for (const warning of tools.missing) deps.stderr(`harv: warning: ${warning}`);
+
+  return deps.launch(session, passthrough, deps.env, tools.paths);
 }
 
 const driftReport = (drift: DriftEntry[], what: string, lockfile: string): string | null =>

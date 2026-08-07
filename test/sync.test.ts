@@ -721,9 +721,10 @@ test("toolPaths resolves every locked tool to a bin directory inside the Store",
   const manifest = project(`[tools]\nnode = "22"\n`);
   sync(solo(manifest), { env, toolchain: fakeEngine(env) });
 
-  assert.deepEqual(toolPaths(readLockfile(manifest.root), env), [
-    join(toolsRoot(env), "installs", "node", "22.99", "bin"),
-  ]);
+  assert.deepEqual(toolPaths(readLockfile(manifest.root), env), {
+    paths: [join(toolsRoot(env), "installs", "node", "22.99", "bin")],
+    missing: [],
+  });
 });
 
 test("toolPaths contributes nothing for an unscopeable tool — the session falls back to the machine", () => {
@@ -731,19 +732,42 @@ test("toolPaths contributes nothing for an unscopeable tool — the session fall
   const manifest = project(`[tools]\nobscurity = "1"\n`);
   sync(solo(manifest), { env, toolchain: fakeEngine(env, { resolveVersion: () => null, isKnown: () => false }) });
 
-  assert.deepEqual(toolPaths(readLockfile(manifest.root), env), []);
+  // Silent as well as empty: Sync already warned, and a recorded hint is a
+  // settled outcome rather than something the Launcher should re-raise.
+  assert.deepEqual(toolPaths(readLockfile(manifest.root), env), { paths: [], missing: [] });
 });
 
-test("toolPaths tells the user to sync when the Store does not hold what the Lockfile pins", () => {
+test("a pinned tool the Store lost is a warning and a fallback, never a refusal to launch", () => {
   const env = home();
   const manifest = project(`[tools]\nnode = "22"\n`);
   sync(solo(manifest), { env, toolchain: fakeEngine(env) });
   rmSync(join(toolsRoot(env), "installs", "node", "22.99"), { recursive: true });
 
-  assert.throws(
-    () => toolPaths(readLockfile(manifest.root), env),
-    (err: Error) => err instanceof SyncError && err.message.includes("harv sync"),
+  const tools = toolPaths(readLockfile(manifest.root), env);
+
+  // Refusing here would name `harv sync` as the remedy on a machine where Sync
+  // may have no engine to install with — an error whose fix does nothing.
+  assert.deepEqual(tools.paths, [], "nothing is put on PATH that is not there");
+  assert.equal(tools.missing.length, 1);
+  assert.match(tools.missing[0] ?? "", /node/);
+  assert.match(tools.missing[0] ?? "", /harv sync/);
+});
+
+test("a clone with no engine and an empty Store still launches, keeping its pin", () => {
+  const env = home();
+  const manifest = project(`[tools]\nnode = "22"\n`);
+  writeFileSync(
+    join(manifest.root, "harvenv.lock"),
+    `version = 1\nskills = []\nplugins = []\n\n[[tools]]\nname = "node"\nspec = "22"\n` +
+      `version = "22.18.0"\nbins = ["installs/node/22.18.0/bin"]\n`,
   );
+
+  sync(solo(manifest), { env, toolchain: { findMise: () => ({ unavailable: "no vendored mise" }) } });
+  const tools = toolPaths(readLockfile(manifest.root), env);
+
+  assert.deepEqual(readLockfile(manifest.root)?.tools[0]?.version, "22.18.0", "the pin survived the Sync");
+  assert.deepEqual(tools.paths, []);
+  assert.equal(tools.missing.length, 1, "the session is told, and starts anyway");
 });
 
 test("a clone onto a machine with no engine leaves the committed tool pin intact", () => {

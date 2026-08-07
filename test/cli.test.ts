@@ -1218,6 +1218,9 @@ const invocations = (receipt: string): Array<{ argv: string[]; env: Record<strin
         .map((line) => JSON.parse(line))
     : [];
 
+/** Where each engine-backed CLI put its Store, so a test can empty one. */
+const stores = new Map<string, string>();
+
 /**
  * A CLI whose Toolchain engine is the stub above, pointed at through the same
  * `HARV_MISE_BIN` a user would use — so these exercise the real resolution and
@@ -1225,6 +1228,7 @@ const invocations = (receipt: string): Array<{ argv: string[]; env: Record<strin
  */
 function harvWithEngine(cwd: string, receipt: string) {
   const store = tempDir();
+  stores.set(cwd, store);
   const launched: Recorded["launched"] = [];
   const mised: string[][] = [];
 
@@ -1320,4 +1324,20 @@ test("an unscopeable tool is a warning and a launch, not a failure", async () =>
   assert.match(synced.err, /no scoped installer/);
   assert.equal(exit, 0);
   assert.deepEqual(launched[0]?.toolPaths, [], "the session falls back to the machine's own PATH");
+});
+
+test("harv claude launches without a pinned tool the Store lost, and says which", async () => {
+  const receipt = join(tempDir(), "mise.jsonl");
+  const root = project('[tools]\nnode = "22"\n');
+  const cli = harvWithEngine(root, receipt);
+  await cli(["sync"]);
+  // What a teammate has after cloning onto a machine harv cannot install on.
+  rmSync(join(stores.get(root)!, "store", "tools", "installs"), { recursive: true, force: true });
+
+  const { exit, err, launched } = await cli(["claude"]);
+
+  assert.equal(exit, 0, "a tool harv cannot serve is never a refusal to launch (ADR 0006)");
+  assert.deepEqual(launched[0]?.toolPaths, [], "the session falls back to the machine's own PATH");
+  assert.match(err, /node/);
+  assert.match(err, /harv sync/);
 });

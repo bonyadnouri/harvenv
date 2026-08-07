@@ -24,11 +24,7 @@ harv --version           # which harv, which mise, and whether you are behind
 
 ## Status
 
-<<<<<<< HEAD
-Skills and plugin pins work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate and plugins by marketplace coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, your personal staples survive through an Overlay that adds to the Manifest without overriding it, and a GitHub Actions workflow runs that whole path on a clean runner on every push. No Toolchain or Doctor yet, and standalone agents and commands are still ahead. mise ships inside harv but nothing drives it yet; `harv mise` reaches it for diagnosis.
-=======
-Skills, plugin pins and the Toolchain work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate, plugins by marketplace coordinate and system tools by version, `harv sync` fetches and installs them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it with the pinned tools in front of its PATH — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, and a GitHub Actions workflow runs that whole path on a clean runner on every push. No Overlay or Doctor yet, and standalone agents and commands are still ahead.
->>>>>>> 7f029fa (Toolchain: project-scoped tool installs with session PATH injection)
+Skills, plugin pins and the Toolchain work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate, plugins by marketplace coordinate and system tools by version, `harv sync` fetches and installs them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it with the pinned tools in front of its PATH — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, your personal staples survive through an Overlay that adds to the Manifest without overriding it, and a GitHub Actions workflow runs that whole path on a clean runner on every push. No Doctor yet, and standalone agents and commands are still ahead.
 
 The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their trade-offs live in [docs/adr/](./docs/adr/). The implementation plan is the issue tracker — issues are thin vertical slices in dependency order.
 
@@ -290,34 +286,26 @@ The eighth builds a binary and checks what shipping it promises: that it runs wi
 bun scripts/verify-packaging.ts          # add --all to build every platform
 ```
 
-<<<<<<< HEAD
-The ninth does the second's job for the Shim: it installs one into a scratch `HARV_HOME`, types `claude` into a real shell inside and outside a harvenv project, and compares the resulting sessions against an unshimmed control. Its own last check re-reads the machine's dotfiles and `claude` and asserts the run left them exactly as it found them:
-=======
-The eighth runs `harv` against a real, pinned mise and installs a real Node into a fixture Store, then reads back what a session's PATH actually resolves to. Two of its claims are again about absences — no second install, and nothing global touched — so it proves them by removing the possibility: the second project syncs with a `mise` that records being run and then fails, and `sudo` plus every system package manager sit on PATH ahead of the real ones for the whole run, recording any call. It also snapshots the machine's own tool directories before and after and diffs them:
+The ninth runs `harv` against a real, pinned mise and installs a real Node into a fixture Store, then reads back what a session's PATH actually resolves to. Two of its claims are again about absences — no second install, and nothing global touched — so it proves them by removing the possibility: the second project syncs with a `mise` that records being run and then fails, and `sudo` plus every system package manager sit on PATH ahead of the real ones for the whole run, recording any call. It also snapshots the machine's own tool directories before and after and diffs them:
 
 ```
 node scripts/verify-toolchain.ts         # needs network; uses the vendored or pinned mise
 ```
 
-The last does the second's job for the Shim: it installs one into a scratch `HARV_HOME`, types `claude` into a real shell inside and outside a harvenv project, and compares the resulting sessions against an unshimmed control. Its own last check re-reads the machine's dotfiles and `claude` and asserts the run left them exactly as it found them:
->>>>>>> 7f029fa (Toolchain: project-scoped tool installs with session PATH injection)
+The tenth does the second's job for the Shim: it installs one into a scratch `HARV_HOME`, types `claude` into a real shell inside and outside a harvenv project, and compares the resulting sessions against an unshimmed control. Its own last check re-reads the machine's dotfiles and `claude` and asserts the run left them exactly as it found them:
 
 ```
 node scripts/verify-shim.ts              # exits non-zero if interception, uninstall or
                                          # pass-through has stopped holding
 ```
 
-<<<<<<< HEAD
 The last is the Overlay's: that one staples file reaches two different projects, that a project's extras add a Component and a disable takes a staple out of that project alone, that an Overlay value for a Manifest-bound key is rejected with a warning while the session runs the Manifest's value, and that `--no-overlay` leaves the whole Overlay behind. It reads `init.skills` and `init.model` out of real sessions, and the one thing `init` cannot show — a resolved `statusLine` — out of the payload harv hands over:
 
 ```
 node scripts/verify-overlay.ts           # needs git and claude
 ```
 
-All ten take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your Overlay, your `~/.claude`, or your shell's startup files. The unit tests are separate and need no `claude` binary:
-=======
-All nine take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your `~/.claude`, your shell's startup files, or your own mise setup. The unit tests are separate and need no `claude` binary and no install engine:
->>>>>>> 7f029fa (Toolchain: project-scoped tool installs with session PATH injection)
+All eleven take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your Overlay, your `~/.claude`, your shell's startup files, or your own mise setup. The unit tests are separate and need no `claude` binary and no install engine:
 
 ```
 npm test

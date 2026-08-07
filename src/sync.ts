@@ -321,23 +321,36 @@ function fromStore(what: string, hash: string | undefined, env: Env): string {
  * The directories a session's PATH gets, in front of everything the machine
  * already has — the Launcher's half of the Toolchain (ADR 0006).
  *
- * Like `plan`, this reads and never installs: a locked tool the Store does not
- * hold is reported as work for `harv sync`, not quietly fetched. Unscopeable
- * entries contribute nothing, which is exactly their meaning — the session
- * falls back to whatever the machine has, and Doctor says so.
+ * Like `plan`, this reads and never installs. Unlike `plan`, a locked entry the
+ * Store cannot serve is a warning rather than a refusal, and that asymmetry is
+ * deliberate. A missing Component means the session is not the Harvenv the
+ * Manifest describes, and `harv sync` can always fix it. A missing *tool* may
+ * not be fixable at all: on a machine with no install engine, Sync keeps the
+ * pin — it is a committed decision — but cannot install it, so refusing to
+ * launch would name `harv sync` as the remedy for something `harv sync` cannot
+ * remedy, and would turn ADR 0006's degradation path back into the hard failure
+ * it exists to avoid. So the session starts, on the machine's own copy, and is
+ * told which tool it is running without.
  */
-export function toolPaths(lock: Lockfile | null, env: Env = process.env): string[] {
+export function toolPaths(lock: Lockfile | null, env: Env = process.env): { paths: string[]; missing: string[] } {
   const paths: string[] = [];
+  const missing: string[] = [];
+
   for (const tool of lock?.tools ?? []) {
+    // An unscopeable entry contributes nothing and says nothing here: it is a
+    // recorded outcome, and Sync has already warned about it.
     if (tool.version === undefined || tool.bins === undefined) continue;
-    if (!hasBins(tool.bins, env)) {
-      throw new SyncError(
-        `Tool \`${tool.tool}\` is locked at ${tool.version} but the Store does not hold it. Run \`harv sync\`.`,
+
+    if (hasBins(tool.bins, env)) {
+      for (const bin of tool.bins) paths.push(resolveBinPath(bin, env));
+    } else {
+      missing.push(
+        `\`${tool.tool}\` is locked at ${tool.version} but the Store does not hold it, so this session will use ` +
+          `whatever ${tool.tool} is on your PATH. Run \`harv sync\` to install the pinned version.`,
       );
     }
-    for (const bin of tool.bins) paths.push(resolveBinPath(bin, env));
   }
-  return paths;
+  return { paths, missing };
 }
 
 export const nonPortable = (name: string, declared: string): string =>
