@@ -1,11 +1,12 @@
 /**
  * `harv` — the command line surface.
  *
- * Three subcommands, and the split between them is deliberate. `sync` is the
- * only one that reaches a network or writes a Lockfile; `claude` only ever
- * reads one. A Launcher that quietly fetched would be a second, invisible
- * Sync, and the reproducibility the Lockfile exists for would depend on which
- * command a teammate happened to run.
+ * The splits between the subcommands are deliberate. `init` is the only one
+ * that runs before there is a project at all. `sync` is the only one that
+ * reaches a network or writes a Lockfile; `claude` only ever reads one. A
+ * Launcher that quietly fetched would be a second, invisible Sync, and the
+ * reproducibility the Lockfile exists for would depend on which command a
+ * teammate happened to run.
  *
  * `mise` and `--version` sit outside that split: they answer questions about
  * the installation rather than about a project, so neither looks for a
@@ -25,8 +26,11 @@ import { launch as launchSession } from "./launch.ts";
 import { McpError, validateMcpServers } from "./mcp.ts";
 import { SettingsError, validateSettings } from "./settings.ts";
 import { GitError } from "./git.ts";
+import { init as initProject, InitError } from "./init.ts";
+import type { InitResult } from "./init.ts";
 import { MISE_VERSION, MiseError, runMise as runMiseBinary } from "./mise.ts";
 import { currentPlatform } from "./platform.ts";
+import { TripwireError } from "./tripwire.ts";
 import { plan, sync, SyncError } from "./sync.ts";
 import type { Env } from "./store.ts";
 import { defaultUpdateCheckDeps, isDevBuild, updateHint, VERSION } from "./version.ts";
@@ -52,6 +56,10 @@ export interface CliDeps {
 const USAGE = `Usage: harv <command> [args...]
 
 Commands:
+  init               Scaffold this directory into a harvenv project: a
+                     ${MANIFEST_FILENAME}, gitignore entries for generated and
+                     personal files, and the Tripwire that warns an un-isolated
+                     session. Safe to re-run; it only tops up what is missing.
   sync               Resolve every Manifest entry into the Store and write
                      ${"harvenv.lock"}. Run it after editing the Manifest, and
                      after cloning a project that has one.
@@ -83,6 +91,8 @@ const EXPECTED_ERRORS = [
   GitError,
   AddError,
   MiseError,
+  InitError,
+  TripwireError,
 ];
 
 export function defaultDeps(): CliDeps {
@@ -113,6 +123,7 @@ export async function run(argv: string[], deps: CliDeps): Promise<number> {
   }
 
   const commands: Record<string, (args: string[], deps: CliDeps) => Promise<number> | number> = {
+    init,
     claude,
     sync: syncCommand,
     add,
@@ -153,6 +164,37 @@ async function version(deps: CliDeps): Promise<number> {
   const hint = await deps.updateHint();
   if (hint !== null) deps.stderr(`\n${hint}`);
   return 0;
+}
+
+// ---------------------------------------------------------------------------
+// init
+// ---------------------------------------------------------------------------
+
+function init(args: string[], deps: CliDeps): number {
+  if (args.length > 0) {
+    deps.stderr(`harv: \`init\` takes no arguments, but got \`${args.join(" ")}\`. It scaffolds the current directory.`);
+    return 2;
+  }
+  reportInit(initProject(deps.cwd), deps);
+  return 0;
+}
+
+function reportInit(result: InitResult, deps: CliDeps): void {
+  const untouched = result.steps.every((step) => step.action === "unchanged");
+  const column = Math.max(...result.steps.map((step) => step.path.length));
+
+  deps.stdout(untouched ? `Already a harvenv project: ${result.root}` : `Initialized a Harvenv in ${result.root}`);
+  deps.stdout("");
+  for (const step of result.steps) {
+    deps.stdout(`  ${step.action.padEnd(9)} ${step.path.padEnd(column)}   ${step.detail}`);
+  }
+  // Only worth saying once. A re-run is someone checking, not someone starting.
+  if (untouched) return;
+  deps.stdout("");
+  deps.stdout(
+    `A bare \`claude\` here now warns that its session is not isolated. Declare a skill with ` +
+      `\`harv add\`, then run \`harv claude\`.`,
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -315,7 +357,7 @@ function requireManifest(deps: CliDeps): Manifest | null {
     deps.stderr(
       `harv: no Manifest found — this is not a harvenv project.\n` +
         `  Searched for ${MANIFEST_FILENAME} in ${deps.cwd} and every directory above it.\n` +
-        `  Create one to declare this project's Harvenv, or run \`claude\` directly for an un-isolated session.`,
+        `  Run \`harv init\` to declare this project's Harvenv, or run \`claude\` directly for an un-isolated session.`,
     );
     return null;
   }

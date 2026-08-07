@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { join } from "node:path";
 
 import type { Manifest } from "../src/manifest.ts";
-import { buildLaunchArgs } from "../src/launch.ts";
+import { buildLaunchArgs, launchEnv } from "../src/launch.ts";
+import { LAUNCHER_ENV } from "../src/tripwire.ts";
 import { tempDir } from "./helpers.ts";
 
 function manifestWith(overrides: Partial<Manifest> = {}): Manifest {
@@ -89,4 +90,23 @@ test("buildLaunchArgs never serves skills through --plugin-dir", () => {
   });
 
   assert.equal(buildLaunchArgs(manifest, [], {}).includes("--plugin-dir"), false);
+});
+
+test("launchEnv marks the session, so the project's Tripwire stays quiet", () => {
+  assert.equal(launchEnv({ PATH: "/usr/bin" })[LAUNCHER_ENV], "1");
+});
+
+test("launchEnv only adds — the environment Claude Code inherits is otherwise the caller's", () => {
+  const base = { PATH: "/usr/bin", HOME: "/home/dev", ANTHROPIC_API_KEY: "sk-test" };
+
+  const { [LAUNCHER_ENV]: _marker, ...rest } = launchEnv(base);
+
+  assert.deepEqual(rest, base);
+});
+
+test("launchEnv redirects nothing about where Claude Code finds its configuration", () => {
+  // ADR 0003: isolation is a flag recipe, never a config-dir swap.
+  const injected = Object.keys(launchEnv({ PATH: "/usr/bin" })).filter((key) => key !== "PATH");
+
+  assert.deepEqual(injected, [LAUNCHER_ENV]);
 });
