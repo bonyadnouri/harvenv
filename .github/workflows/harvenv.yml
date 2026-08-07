@@ -1,0 +1,205 @@
+# The CI recipe of ADR 0002: a Claude Code session composed from a committed
+# Manifest and nothing else, on a machine that has never seen this project.
+#
+# The `recipe` job is meant to be copied. It runs against the sample Manifest
+# in examples/ci/, but nothing in it is specific to that project or to this
+# repository except two clearly-marked steps: installing harv, and standing in
+# for `claude` because this repository's CI has no credentials. Replace those
+# two and the rest is the recipe for any harvenv project.
+#
+# The reasoning behind each step — auth, Store caching, what a run without
+# credentials can and cannot prove — is in docs/ci.md.
+
+name: harvenv
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: harvenv-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The floor package.json promises, not the newest node — if harv needs more
+  # than it claims, this is where that should hurt.
+  NODE_VERSION: "22.18"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # The recipe. This is the job to copy.
+  # ---------------------------------------------------------------------------
+  recipe:
+    name: Manifest-only session
+    runs-on: ubuntu-latest
+    env:
+      # Auth in CI, in one line. Claude Code reads ANTHROPIC_API_KEY from the
+      # environment and harv passes the environment through untouched — it
+      # composes launch flags, it never handles credentials, and a session's
+      # login is not a Component (CONTEXT.md). Add the secret to your
+      # repository and there is nothing else to wire up.
+      #
+      # This repository has no Claude subscription and sets no such secret, so
+      # the value below is empty and the steps react accordingly. docs/ci.md
+      # says exactly which claims that costs.
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      # ▸ Step one of two you would write differently. In your project this is
+      #   the install.sh one-liner from the README. Here it has to be the
+      #   checkout — a workflow that installed a published harv would be
+      #   checking the last release rather than this pull request — so the
+      #   checkout gets a wrapper on PATH and everything below can say `harv`
+      #   exactly as you would write it.
+      - name: install harv
+        run: |
+          set -eu
+          npm ci
+          mkdir -p "$HOME/.local/bin"
+          printf '#!/bin/sh\nexec node "%s/bin/harv.ts" "$@"\n' "$GITHUB_WORKSPACE" > "$HOME/.local/bin/harv"
+          chmod +x "$HOME/.local/bin/harv"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # A Store entry is named by a hash of its own content (ADR 0010), so
+      # entries are immutable and a restored cache can never be stale — there
+      # is no invalidation problem to get wrong here. The key moves with the
+      # Lockfile only so a changed Harvenv gets its own snapshot, and
+      # `restore-keys` makes the previous snapshot a warm base rather than a
+      # cold start for the entries that did not change.
+      - name: cache the Store
+        uses: actions/cache@v6
+        with:
+          path: ~/.harv/store
+          key: harv-store-${{ runner.os }}-${{ hashFiles('examples/ci/harvenv.lock') }}
+          restore-keys: harv-store-${{ runner.os }}-
+
+      # Clone, sync, launch — the same three steps a teammate performs, in the
+      # same order (ADR 0009: the Launcher never syncs, so this one is not
+      # optional). Everything it fetches is pinned by the committed Lockfile.
+      - name: harv sync
+        working-directory: examples/ci
+        run: harv sync
+
+      # A Sync that rewrote the Lockfile means the committed one is not what a
+      # clean machine produces, so a teammate cloning this repository would not
+      # get this Harvenv. The cheapest gate in the file, and it fails on the
+      # pull request that forgot to commit the Lockfile rather than later.
+      - name: the committed Lockfile is what a clean machine produces
+        run: git diff --exit-code -- examples/ci/harvenv.lock
+
+      # TODO(#9): the Doctor gate belongs here, once `harv doctor` exists.
+      #
+      #   - name: the Harvenv is runnable
+      #     working-directory: examples/ci
+      #     run: harv doctor --json
+      #
+      # It is what turns the steps below from "a session started" into "a
+      # session could have worked": pending MCP auth, tools that could not be
+      # scoped, and the one CI needs most — the Claude Code version smoke test
+      # ADR 0003 requires, because the flag behaviours the whole recipe rests
+      # on are observed rather than documented and can retire on any release.
+      # Until then, `verify-launch-recipe.ts` in the `session` job below covers
+      # that last part, and only when credentials are available.
+
+      - name: install Claude Code
+        if: env.ANTHROPIC_API_KEY != ''
+        run: npm install --global @anthropic-ai/claude-code
+
+      # ▸ Step two of two. Delete it: it exists only because this repository's
+      #   CI has no credentials. The stand-in prints the recipe harv composed —
+      #   readable in the log above the next step — and answers the way `-p
+      #   --output-format json` does, so the run below is genuinely end to end
+      #   in everything except the model.
+      - name: stand in for claude (this repository's CI has no credentials)
+        if: env.ANTHROPIC_API_KEY == ''
+        run: |
+          set -eu
+          cat > "$HOME/.local/bin/claude" <<'STANDIN'
+          #!/bin/sh
+          echo "harv handed claude:" >&2
+          for arg in "$@"; do echo "  $arg" >&2; done
+          echo '{"type":"result","subtype":"success","is_error":false,"result":"ok"}'
+          STANDIN
+          chmod +x "$HOME/.local/bin/claude"
+
+      # The headless run. `harv claude` passes everything after it through
+      # untouched, so this is an ordinary `claude -p`, and harv adopts its exit
+      # code — which is what makes it usable as a gate at all.
+      - name: a headless Manifest-only run
+        working-directory: examples/ci
+        run: |
+          set -euo pipefail
+          harv claude -p 'Reply with the single word: ok' --output-format json \
+            | tee "$RUNNER_TEMP/result.json"
+          jq -e '.is_error == false' "$RUNNER_TEMP/result.json" > /dev/null
+
+      # The steps above show the recipe; this one measures it. It re-runs the
+      # same thing under instrumentation — against a fixture Store and a
+      # fixture $HOME with a personal skill planted in it — and checks what a
+      # runner actually ends up with: the Manifest's Components and no others,
+      # the Manifest's settings and not the machine's, no user scope, no MCP
+      # servers, a Lockfile it did not rewrite, and an API key that travels
+      # only through the environment.
+      - name: the run was Manifest-only
+        run: node scripts/verify-ci-recipe.ts
+
+  # ---------------------------------------------------------------------------
+  # What only a real session can answer, and where any further real-session
+  # check belongs. Skipped without a key — including in this repository, so
+  # treat these steps as documentation that happens to be executable rather
+  # than as checks this workflow has ever run.
+  # ---------------------------------------------------------------------------
+  session:
+    name: real-session checks
+    runs-on: ubuntu-latest
+    env:
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+    steps:
+      - name: no credentials, no session
+        if: env.ANTHROPIC_API_KEY == ''
+        run: |
+          echo "::notice title=Real-session checks skipped::ANTHROPIC_API_KEY is not set for this repository, so what Claude Code does with harv's flags was not measured on this run. See docs/ci.md."
+
+      - uses: actions/checkout@v7
+        if: env.ANTHROPIC_API_KEY != ''
+
+      - uses: actions/setup-node@v7
+        if: env.ANTHROPIC_API_KEY != ''
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+
+      - name: install harv and Claude Code
+        if: env.ANTHROPIC_API_KEY != ''
+        run: |
+          set -eu
+          npm ci
+          npm install --global @anthropic-ai/claude-code
+
+      # ADR 0003 is built on three behaviours that are observed, not documented
+      # — above all that `--setting-sources project,local` really does suppress
+      # user scope. Re-measuring them against the Claude Code a runner just
+      # installed is how a silent regression is caught on the release that
+      # causes it rather than on the pull request that trips over it.
+      - name: the launch recipe still behaves as ADR 0003 says
+        if: env.ANTHROPIC_API_KEY != ''
+        run: node scripts/verify-launch-recipe.ts
+
+      # And the end-to-end claims: a real `harv claude` session containing the
+      # declared skills, the built-ins and nothing else, running under the
+      # Manifest's settings and the Manifest's MCP servers alone.
+      - name: a real session loads the Harvenv and nothing else
+        if: env.ANTHROPIC_API_KEY != ''
+        run: node scripts/verify-walking-skeleton.ts
+
+      - name: settings and MCP definitions are binding in a real session
+        if: env.ANTHROPIC_API_KEY != ''
+        run: node scripts/verify-manifest-settings.ts

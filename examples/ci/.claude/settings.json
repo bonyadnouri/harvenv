@@ -1,0 +1,14 @@
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "[ -n \"$HARV_SESSION\" ] || printf '%s' '{\"systemMessage\":\"harvenv: this session is NOT isolated — it loads your user scope, not the Harvenv that harvenv.toml declares. Run `harv claude` instead, or opt into the harv shim to route plain claude through it here.\"}'"
+          }
+        ]
+      }
+    ]
+  }
+}

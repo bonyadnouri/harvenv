@@ -31,6 +31,14 @@ jobs:
       - run: npm run typecheck
       - run: npm test
 
+      # The one acceptance check that needs neither a `claude` binary nor the
+      # network: real git repositories, a real Store, and the guarantees the
+      # Manifest-only CI recipe rests on — byte-identical reproduction from a
+      # Lockfile, no re-fetch for content the Store already holds, and a loud
+      # failure when a fetch does not match its pin.
+      - name: the Store's own guarantees
+        run: node scripts/verify-sync-store.ts
+
       # install.sh is piped into a shell on machines that have nothing else.
       - name: shellcheck install.sh
         run: shellcheck install.sh

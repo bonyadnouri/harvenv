@@ -1,0 +1,11 @@
+# What `harv init` writes here, and what `harv sync` generates: symlinks into
+# the Store, harv's record of which of them it owns, and the personal settings
+# file that is nobody else's business.
+#
+# Two files in this project are deliberately absent from this list. `.claude/
+# settings.json` carries the Tripwire, which only warns the teammate who clones
+# the repository if it arrives with it. And `harvenv.lock` is what makes their
+# Harvenv — and this repository's CI run — identical to yours.
+.claude/skills/
+.claude/.harv-materialized.json
+.claude/settings.local.json
