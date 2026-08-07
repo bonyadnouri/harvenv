@@ -104,18 +104,32 @@ export class SettingsError extends Error {
   override name = "SettingsError";
 }
 
+export interface SettingsOptions {
+  /**
+   * Whether ADR 0005's personal side may appear. False for a Manifest, which
+   * is the whole point of the split; true for an Overlay, which is the remedy
+   * the Manifest's rejection points at, and true for the merged payload the
+   * Launcher injects, because by then the Overlay has legitimately contributed
+   * some.
+   */
+  allowPersonalKeys?: boolean;
+}
+
 /**
- * Throws if the Manifest asks for settings Claude Code would not honour, or for
- * settings ADR 0005 does not let it ask for.
+ * Throws if the settings ask for something Claude Code would not honour, or for
+ * something ADR 0005 does not let this file ask for.
  *
  * Exported so a caller can find that out *before* it starts writing into the
  * project tree: a Manifest that can never launch has no business leaving
  * materialized Components behind.
  */
-export function validateSettings(settings: Record<string, unknown>): void {
+export function validateSettings(
+  settings: Record<string, unknown>,
+  options: SettingsOptions = {},
+): void {
   for (const key of Object.keys(settings)) {
     const category = PERSONAL_KEYS.get(key);
-    if (category !== undefined) {
+    if (category !== undefined && options.allowPersonalKeys !== true) {
       const named = category === key ? "" : ` — one of ADR 0005's \`${category}\` keys`;
       throw new SettingsError(
         `[settings] declares \`${key}\`${named}, which a Manifest may not set. ${PERSONAL_KEY_RULE}.`,
@@ -145,8 +159,11 @@ export function validateSettings(settings: Record<string, unknown>): void {
 }
 
 /** The Harvenv's settings as a `--settings` payload. Inline JSON is accepted. */
-export function generateSettings(settings: Record<string, unknown>): string {
-  validateSettings(settings);
+export function generateSettings(
+  settings: Record<string, unknown>,
+  options: SettingsOptions = {},
+): string {
+  validateSettings(settings, options);
   return JSON.stringify(settings);
 }
 

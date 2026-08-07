@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-import type { Manifest } from "../src/manifest.ts";
+import type { Session } from "../src/overlay.ts";
 import type { ShimContext } from "../src/shim.ts";
 import type { Env } from "../src/store.ts";
 import { run } from "../src/cli.ts";
@@ -26,7 +26,7 @@ interface Recorded {
   exit: number;
   out: string;
   err: string;
-  launched: Array<{ manifest: Manifest; passthrough: string[]; env: Env }>;
+  launched: Array<{ session: Session; passthrough: string[]; env: Env }>;
   mised: string[][];
 }
 
@@ -38,11 +38,13 @@ interface Options {
   hint?: string | null;
   /** Scratch by default, so no test reaches the real HOME, PATH or dotfiles. */
   shim?: ShimContext;
+  /** harv's home — the Store, and the global Overlay. Shared to share either. */
+  home?: string;
 }
 
 /** One project, one Store, one shim sandbox, one CLI — reused within one test. */
 function harv(cwd: string, options: Options = {}) {
-  const store = tempDir();
+  const store = options.home ?? tempDir();
   const shim = options.shim ?? shimSandbox();
   const launched: Recorded["launched"] = [];
   const mised: string[][] = [];
@@ -59,8 +61,8 @@ function harv(cwd: string, options: Options = {}) {
       stderr: (line) => {
         err += `${line}\n`;
       },
-      launch: async (manifest, passthrough, env) => {
-        launched.push({ manifest, passthrough, env });
+      launch: async (session, passthrough, env) => {
+        launched.push({ session, passthrough, env });
         return options.exitCode ?? 0;
       },
       runMise: async (args) => {
@@ -114,7 +116,7 @@ test("harv claude launches from a synced project", async () => {
 
   assert.equal(exit, 0);
   assert.equal(launched.length, 1);
-  assert.equal(launched[0]?.manifest.root, root);
+  assert.equal(launched[0]?.session.manifest.root, root);
   assert.deepEqual(launched[0]?.passthrough, []);
 });
 
@@ -138,7 +140,7 @@ test("harv claude works from a subdirectory of the project", async () => {
 
   const { launched } = await cli(["claude"], nested);
 
-  assert.equal(launched[0]?.manifest.root, root);
+  assert.equal(launched[0]?.session.manifest.root, root);
 });
 
 test("harv claude passes extra arguments through to claude", async () => {
@@ -338,7 +340,7 @@ test("harv claude launches when every ${VAR} the Manifest references is set", as
   const { exit, launched } = await harv(root, { env: { HARVENV_TEST_PRESENT: "s3cret" } })(["claude"]);
 
   assert.equal(exit, 0);
-  assert.equal(launched[0]?.manifest.mcpServers.length, 1);
+  assert.equal(launched[0]?.session.manifest.mcpServers.length, 1);
   assert.equal(
     launched[0]?.env.HARVENV_TEST_PRESENT,
     "s3cret",
@@ -849,7 +851,7 @@ test("harv claude serves a pinned plugin through --plugin-dir, and no skill that
   const { exit, launched } = await cli(["claude"]);
 
   assert.equal(exit, 0);
-  const args = buildLaunchArgs(launched[0]!.manifest, [], {});
+  const args = buildLaunchArgs(launched[0]!.session, [], {});
   assert.deepEqual(args.slice(args.indexOf("--plugin-dir")), [
     "--plugin-dir",
     join(root, ".claude", "harv-plugins", "alpha-pack"),
@@ -887,4 +889,285 @@ test("harv sync reports a pinned plugin's suppressed MCP servers as a warning", 
   assert.match(err, /alpha-pack/);
   assert.match(err, /docs/);
   assert.doesNotMatch(out, /warning/i, "a warning belongs on stderr");
+});
+// ---------------------------------------------------------------------------
+// The Overlay
+// ---------------------------------------------------------------------------
+
+/** The global staples file, in the harv home this CLI was pointed at. */
+const staples = (home: string, body: string) => writeFileSync(join(home, "overlay.toml"), body);
+
+/** This project's extras — gitignored, and the half that wins inside the Overlay. */
+const extras = (root: string, body: string) => writeFileSync(join(root, "harvenv.local.toml"), body);
+
+const materialized = (root: string, name: string) => existsSync(join(root, ".claude", "skills", name, "SKILL.md"));
+
+/** A skill directory outside any project, for a staple every project can reach. */
+function stapleDir(name: string): string {
+  const dir = join(tempDir(), name);
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "SKILL.md"), skillFile(name));
+  return dir;
+}
+
+test("a staple declared once in the global Overlay reaches two different projects", async () => {
+  const home = tempDir();
+  const repo = gitRepo({ "SKILL.md": skillFile("staple") });
+  staples(home, `[skills]\nstaple = { git = "${repo.url}" }\n`);
+  const one = project();
+  const two = project();
+
+  await harv(one, { home })(["sync"]);
+  await harv(two, { home })(["sync"]);
+
+  assert.equal(materialized(one, "staple"), true);
+  assert.equal(materialized(two, "staple"), true);
+  assert.equal(materialized(one, "example-skill"), true, "the Manifest's own Components are still there");
+});
+
+test("the Overlay is locked outside the committed Lockfile, so nothing personal is handed over", async () => {
+  const home = tempDir();
+  const repo = gitRepo({ "SKILL.md": skillFile("staple") });
+  staples(home, `[skills]\nstaple = { git = "${repo.url}" }\n`);
+  const root = project();
+
+  await harv(root, { home })(["sync"]);
+
+  assert.doesNotMatch(readFileSync(join(root, "harvenv.lock"), "utf8"), /staple/);
+  assert.match(readFileSync(join(root, ".harv", "overlay.lock"), "utf8"), /staple/);
+});
+
+test("project-local extras add a Component to that project alone", async () => {
+  const home = tempDir();
+  const one = project();
+  const two = project();
+  mkdirSync(join(one, "vendor", "scratch"), { recursive: true });
+  writeFileSync(join(one, "vendor", "scratch", "SKILL.md"), skillFile("scratch"));
+  extras(one, '[skills]\nscratch = { path = "vendor/scratch" }\n');
+
+  await harv(one, { home })(["sync"]);
+  await harv(two, { home })(["sync"]);
+
+  assert.equal(materialized(one, "scratch"), true);
+  assert.equal(materialized(two, "scratch"), false);
+});
+
+test("a disable entry in the extras file removes a staple in that project only", async () => {
+  const home = tempDir();
+  const repo = gitRepo({ "SKILL.md": skillFile("staple") });
+  staples(home, `[skills]\nstaple = { git = "${repo.url}" }\n`);
+  const kept = project();
+  const without = project();
+  extras(without, "[skills]\nstaple = { disable = true }\n");
+
+  await harv(kept, { home })(["sync"]);
+  await harv(without, { home })(["sync"]);
+
+  assert.equal(materialized(kept, "staple"), true);
+  assert.equal(materialized(without, "staple"), false);
+});
+
+test("disabling a staple after it was synced takes it back out of the project", async () => {
+  const home = tempDir();
+  const repo = gitRepo({ "SKILL.md": skillFile("staple") });
+  staples(home, `[skills]\nstaple = { git = "${repo.url}" }\n`);
+  const root = project();
+  const cli = harv(root, { home });
+  await cli(["sync"]);
+
+  extras(root, "[skills]\nstaple = { disable = true }\n");
+  const { exit } = await cli(["sync"]);
+
+  assert.equal(exit, 0);
+  assert.equal(materialized(root, "staple"), false);
+});
+
+test("an Overlay value for a Manifest-bound key is rejected at sync, and the warning names the key", async () => {
+  const home = tempDir();
+  const root = project('[settings]\nmodel = "opus"\n');
+  staples(home, '[settings]\nmodel = "haiku"\n');
+
+  const { exit, err } = await harv(root, { home })(["sync"]);
+
+  assert.equal(exit, 0, "a personal file may not fail a project's sync");
+  assert.match(err, /warning/i);
+  assert.match(err, /\bmodel\b/, "names the locked key");
+  assert.match(err, /ADR 0005/, "names the rule");
+});
+
+test("a rejected Overlay setting never reaches the session; the Manifest's value does", async () => {
+  const home = tempDir();
+  const root = project('[settings]\nmodel = "opus"\n');
+  staples(home, '[settings]\nmodel = "haiku"\ntheme = "dark"\n');
+  const cli = harv(root, { home });
+  await cli(["sync"]);
+
+  const { launched } = await cli(["claude"]);
+
+  assert.deepEqual(launched[0]?.session.settings, { model: "opus", theme: "dark" });
+});
+
+test("an Overlay MCP server the Manifest leaves alone joins the session", async () => {
+  const home = tempDir();
+  const root = project('[mcp.tickets]\ncommand = "project-tickets"\n');
+  staples(home, '[mcp.notes]\ncommand = "notes-mcp"\n');
+  const cli = harv(root, { home });
+  await cli(["sync"]);
+
+  const { launched } = await cli(["claude"]);
+
+  assert.deepEqual(
+    launched[0]?.session.mcpServers.map((server) => server.name).sort(),
+    ["notes", "tickets"],
+  );
+});
+
+test("a path Source in the Overlay is not flagged non-portable — the Overlay is never cloned", async () => {
+  const home = tempDir();
+  const root = tempDir();
+  writeFileSync(join(root, "harvenv.toml"), "");
+  staples(home, `[skills]\nstaple = { path = "${stapleDir("staple")}" }\n`);
+
+  const { exit, err } = await harv(root, { home })(["sync"]);
+
+  assert.equal(exit, 0);
+  assert.equal(materialized(root, "staple"), true);
+  assert.doesNotMatch(err, /no clone of this project can resolve/);
+});
+
+test("harv claude reports Overlay drift rather than quietly fetching it", async () => {
+  const home = tempDir();
+  const root = project();
+  const cli = harv(root, { home });
+  await cli(["sync"]);
+
+  const repo = gitRepo({ "SKILL.md": skillFile("staple") });
+  staples(home, `[skills]\nstaple = { git = "${repo.url}" }\n`);
+  const { exit, err, launched } = await cli(["claude"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /Overlay/);
+  assert.match(err, /staple/);
+  assert.match(err, /harv sync/);
+  assert.deepEqual(launched, []);
+});
+
+// ---------------------------------------------------------------------------
+// --no-overlay: the CI and headless baseline
+// ---------------------------------------------------------------------------
+
+test("harv claude --no-overlay launches a session composed from the Manifest alone", async () => {
+  const home = tempDir();
+  const repo = gitRepo({ "SKILL.md": skillFile("staple") });
+  staples(home, `[skills]\nstaple = { git = "${repo.url}" }\n[settings]\ntheme = "dark"\n`);
+  const root = project();
+  const cli = harv(root, { home });
+  await cli(["sync"]);
+
+  const { exit, launched } = await cli(["claude", "--no-overlay"]);
+
+  assert.equal(exit, 0);
+  assert.deepEqual(launched[0]?.session.settings, {}, "no Overlay settings reach the session");
+  assert.deepEqual(launched[0]?.session.overlaySkills, []);
+  assert.equal(materialized(root, "staple"), false, "and none of its Components are in project scope");
+  assert.equal(materialized(root, "example-skill"), true, "while the Manifest's still are");
+});
+
+test("--no-overlay is harv's own flag and is not passed through to claude", async () => {
+  const cli = harv(project());
+  await cli(["sync"]);
+
+  const { launched } = await cli(["claude", "-p", "hi", "--no-overlay", "--resume"]);
+
+  assert.deepEqual(launched[0]?.passthrough, ["-p", "hi", "--resume"]);
+});
+
+test("harv sync --no-overlay leaves the Overlay unfetched and unlocked", async () => {
+  const home = tempDir();
+  const repo = gitRepo({ "SKILL.md": skillFile("staple") });
+  staples(home, `[skills]\nstaple = { git = "${repo.url}" }\n`);
+  const root = project();
+
+  const { exit } = await harv(root, { home })(["sync", "--no-overlay"]);
+
+  assert.equal(exit, 0);
+  assert.equal(materialized(root, "staple"), false);
+  assert.equal(existsSync(join(root, ".harv", "overlay.lock")), false);
+});
+
+test("harv sync --no-overlay clears an Overlay a previous sync materialized", async () => {
+  const home = tempDir();
+  const repo = gitRepo({ "SKILL.md": skillFile("staple") });
+  staples(home, `[skills]\nstaple = { git = "${repo.url}" }\n`);
+  const root = project();
+  const cli = harv(root, { home });
+  await cli(["sync"]);
+
+  await cli(["sync", "--no-overlay"]);
+
+  assert.equal(materialized(root, "staple"), false);
+  assert.equal(existsSync(join(root, ".harv", "overlay.lock")), false);
+});
+
+test("harv sync still rejects an argument that is not --no-overlay", async () => {
+  const { exit, err } = await harv(project())(["sync", "--update"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /--update/);
+});
+
+test("an unusable Overlay fails the command by name rather than being skipped", async () => {
+  const home = tempDir();
+  const root = project();
+  staples(home, '[settings]\neffortLevel = "max"\n');
+
+  const { exit, err } = await harv(root, { home })(["sync"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /effortLevel/);
+  assert.match(err, /overlay\.toml/, "names the file to edit");
+});
+
+test("harv claude names the locked key too, so the warning is not only sync's to give", async () => {
+  const home = tempDir();
+  const root = project('[settings]\nmodel = "opus"\n');
+  staples(home, '[settings]\nmodel = "haiku"\n');
+  const cli = harv(root, { home });
+  await cli(["sync"]);
+
+  const { exit, err } = await cli(["claude"]);
+
+  assert.equal(exit, 0);
+  assert.match(err, /\bmodel\b/);
+  assert.match(err, /ADR 0005/);
+});
+
+test("harv add leaves the Overlay's Components in place", async () => {
+  const home = tempDir();
+  const repo = gitRepo({ "SKILL.md": skillFile("staple") });
+  staples(home, `[skills]\nstaple = { git = "${repo.url}" }\n`);
+  const added = gitRepo({ "SKILL.md": skillFile("added") });
+  const root = project();
+  const cli = harv(root, { home });
+  await cli(["sync"]);
+
+  const { exit } = await cli(["add", "added", "--git", added.url]);
+
+  assert.equal(exit, 0);
+  assert.equal(materialized(root, "added"), true);
+  assert.equal(materialized(root, "staple"), true, "adding to the Manifest does not unmaterialize a staple");
+});
+
+test("the Overlay's Lockfile says not to commit it, where the Manifest's says the opposite", async () => {
+  const home = tempDir();
+  const repo = gitRepo({ "SKILL.md": skillFile("staple") });
+  staples(home, `[skills]\nstaple = { git = "${repo.url}" }\n`);
+  const root = project();
+
+  await harv(root, { home })(["sync"]);
+
+  const overlayLock = readFileSync(join(root, ".harv", "overlay.lock"), "utf8");
+  assert.doesNotMatch(overlayLock, /Commit it/, "it is gitignored, so telling anyone to commit it is wrong");
+  assert.match(overlayLock, /not commit/i);
+  assert.match(readFileSync(join(root, "harvenv.lock"), "utf8"), /Commit it/);
 });

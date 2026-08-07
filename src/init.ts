@@ -40,6 +40,9 @@ export const GITIGNORE_ENTRIES = [
   `.claude/${MATERIALIZED_STATE_FILE}`,
   ".claude/settings.local.json",
   "harvenv.local.toml",
+  // Where Sync pins that Overlay. Same reasoning one step on: a Lockfile for a
+  // personal file is itself personal (ADR 0013).
+  ".harv/",
 ];
 
 const GITIGNORE_HEADER = "# harvenv — materialized Components and personal files, generated rather than authored";

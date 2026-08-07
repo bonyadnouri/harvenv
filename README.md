@@ -24,7 +24,7 @@ harv --version           # which harv, which mise, and whether you are behind
 
 ## Status
 
-Skills and plugin pins work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate and plugins by marketplace coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, and a GitHub Actions workflow runs that whole path on a clean runner on every push. No Overlay, Toolchain or Doctor yet, and standalone agents and commands are still ahead. mise ships inside harv but nothing drives it yet; `harv mise` reaches it for diagnosis.
+Skills and plugin pins work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate and plugins by marketplace coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, your personal staples survive through an Overlay that adds to the Manifest without overriding it, and a GitHub Actions workflow runs that whole path on a clean runner on every push. No Toolchain or Doctor yet, and standalone agents and commands are still ahead. mise ships inside harv but nothing drives it yet; `harv mise` reaches it for diagnosis.
 
 The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their trade-offs live in [docs/adr/](./docs/adr/). The implementation plan is the issue tracker — issues are thin vertical slices in dependency order.
 
@@ -78,8 +78,9 @@ harv init                # scaffold the Manifest, the gitignore entries and the 
 harv add brainstorming --git https://github.com/obra/superpowers.git@v6.2.0#skills/brainstorming
 harv add gsap-skills --marketplace https://github.com/greensock/gsap-skills.git@v1.0.0
 harv sync                # resolve every entry into the Store and write harvenv.lock
-harv claude              # a session composed strictly from this Manifest
+harv claude              # a session composed strictly from this Manifest, plus your Overlay
 harv claude -p "hi"      # anything after `claude` passes through untouched
+harv claude --no-overlay # the Manifest alone — what CI and a headless run should see
 ```
 
 `harv add` writes the entry into `[skills]` — or into `[plugins]`, for `--marketplace` — and syncs it; a coordinate may carry its ref and subdirectory as `@ref` and `#subdir`, or you can pass `--ref` and `--subdir` separately. It edits the Manifest as text, so your comments and ordering survive, and it puts the file back if the Source turns out not to be fetchable.
@@ -98,7 +99,37 @@ Both commands judge everything they can from the Manifest and your environment b
 
 Because "binding" is worth nothing if a key can be dropped in transit, harv checks what it is asked to bind. Claude Code accepts a settings payload without complaint and then discards what it does not recognise: `permissions.defaultMode = "manual"` is a valid `--permission-mode` flag but not a valid setting, and `effortLevel = "max"` is a valid `/effort` argument but not a valid setting. Both fall back in silence. harv rejects them instead, and names what to write.
 
-Personal-ergonomics keys are the other half of ADR 0005's split, and a Manifest may not set them at all — `statusLine`, `theme`, `editorMode` and their siblings are refused with an error naming the key and the rule. A key harv cannot confidently classify stays binding; if a setting should be personal, the Manifest simply doesn't set it.
+Personal-ergonomics keys are the other half of ADR 0005's split, and a Manifest may not set them at all — `statusLine`, `theme`, `editorMode` and their siblings are refused with an error naming the key and the rule. A key harv cannot confidently classify stays binding; if a setting should be personal, the Manifest simply doesn't set it. Where it goes instead is the Overlay.
+
+### Your Overlay
+
+Inside a harvenv session the machine's user scope does not load ([ADR 0002](./docs/adr/0002-user-scope-suppressed-overlay.md)) — that is what makes "same config, same quality" true, and it would make your own staples vanish everywhere if nothing replaced them. The Overlay is what replaces them, and it is declared rather than ambient. Two files, in the same TOML a Manifest uses:
+
+```toml
+# ~/.harv/overlay.toml — your staples, in every harvenv project
+[skills]
+grill-with-docs = { git = "https://github.com/you/skills.git", subdir = "grill-with-docs" }
+
+[settings]
+statusLine = { type = "command", command = "~/bin/my-status" }
+```
+
+```toml
+# harvenv.local.toml — this project only, and gitignored
+[skills]
+scratch          = { path = "vendor/scratch" }   # add one here
+grill-with-docs  = { disable = true }            # or take a staple back out
+```
+
+The extras file wins inside the Overlay: a name it declares replaces the staple of the same name, and `{ disable = true }` removes one for this project and no other. A disable that matches no staple is a warning, not a no-op — it is almost always a name that has moved. `[plugins]` is the one table an Overlay cannot carry yet; a plugin pin resolves through a marketplace catalogue the Overlay's Lockfile does not have a table for, so it is refused by name rather than parsed and then quietly not loaded.
+
+**Overlays add, never override.** Everything in the Overlay is unioned on top of the Manifest, and anything the Manifest already declares wins: an Overlay value for a bound settings key, or an Overlay skill or MCP server the Manifest already names, is dropped with a warning naming what was locked and which file tried it. That is ADR 0005 again, enforced in harv's own merge rather than by flag precedence, because `--settings` merges per key and would have resolved the conflict silently ([spike 0001](./docs/spikes/0001-launch-recipe-verification.md), finding 2). The conflict granularity is a leaf: a Manifest binding `permissions.deny` has not bound `permissions.allow`, so an Overlay may still add one.
+
+It is a warning rather than an error because the Overlay is yours and the Manifest may not be — a personal file should not be able to stop you working in someone else's project — and because the outcome that matters is already guaranteed by dropping the value.
+
+`--no-overlay` leaves the whole thing out, on `harv claude` and on `harv sync` alike. It is harv's own flag, taken out before the rest of the arguments are passed through, and it is the baseline CI and a headless run should use.
+
+Because the Launcher never fetches ([ADR 0009](./docs/adr/0009-launcher-never-syncs.md)), `harv sync` pins the Overlay too — into `.harv/overlay.lock`, which `harv init` gitignores, because one person's staples are not part of what the repository hands over ([ADR 0013](./docs/adr/0013-overlay-pinned-in-an-uncommitted-lockfile.md)). Everything else is the same as a Manifest entry: fetched once, addressed by content, shared through the Store with every other project that declares it.
 
 ### MCP servers
 
@@ -129,7 +160,7 @@ Pinned plugins are linked under `.claude/harv-plugins/<name>` and served with `-
 
 Fetched content lands in `~/.harv/store`, addressed by a hash of the tree itself rather than by the commit it came from ([ADR 0010](./docs/adr/0010-store-addressed-by-content-hash.md)). Two projects declaring the same skill share one copy, and the second one syncs with no network access at all — the Lockfile already says which bytes it needs, and the Store either has them or does not. `HARV_HOME` moves the whole thing, which is what CI and the verification scripts use.
 
-A Source declared by `path` is allowed and stays live — it is materialized straight from where it sits, never copied into the Store, so you can develop a skill in-tree. It is also the one thing a clone cannot reproduce, so every Sync warns about it by name.
+A Source declared by `path` is allowed and stays live — it is materialized straight from where it sits, never copied into the Store, so you can develop a skill in-tree. It is also the one thing a clone cannot reproduce, so every Sync warns about it by name. An Overlay's path Sources are not warned about: nobody clones an Overlay, so a local directory in one is just where you keep a skill you are still writing.
 
 Materialized Components are harv's to manage: it records what it wrote, removes only what it recorded, and refuses to touch a `.claude/skills/` or `.claude/harv-plugins/` entry it did not create. `harv init` is what gitignores them.
 
@@ -235,14 +266,20 @@ The eighth builds a binary and checks what shipping it promises: that it runs wi
 bun scripts/verify-packaging.ts          # add --all to build every platform
 ```
 
-The last does the second's job for the Shim: it installs one into a scratch `HARV_HOME`, types `claude` into a real shell inside and outside a harvenv project, and compares the resulting sessions against an unshimmed control. Its own last check re-reads the machine's dotfiles and `claude` and asserts the run left them exactly as it found them:
+The ninth does the second's job for the Shim: it installs one into a scratch `HARV_HOME`, types `claude` into a real shell inside and outside a harvenv project, and compares the resulting sessions against an unshimmed control. Its own last check re-reads the machine's dotfiles and `claude` and asserts the run left them exactly as it found them:
 
 ```
 node scripts/verify-shim.ts              # exits non-zero if interception, uninstall or
                                          # pass-through has stopped holding
 ```
 
-All nine take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your `~/.claude`, or your shell's startup files. The unit tests are separate and need no `claude` binary:
+The last is the Overlay's: that one staples file reaches two different projects, that a project's extras add a Component and a disable takes a staple out of that project alone, that an Overlay value for a Manifest-bound key is rejected with a warning while the session runs the Manifest's value, and that `--no-overlay` leaves the whole Overlay behind. It reads `init.skills` and `init.model` out of real sessions, and the one thing `init` cannot show — a resolved `statusLine` — out of the payload harv hands over:
+
+```
+node scripts/verify-overlay.ts           # needs git and claude
+```
+
+All ten take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your Overlay, your `~/.claude`, or your shell's startup files. The unit tests are separate and need no `claude` binary:
 
 ```
 npm test

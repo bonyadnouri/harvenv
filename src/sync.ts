@@ -23,20 +23,28 @@
  * plugin?* The marketplace's own catalogue answers it, read at the fetched
  * commit — so the Store ends up holding the plugin rather than the catalogue it
  * was listed in, and the hash covers exactly the tree a session will load.
+ *
+ * The Overlay's skills go through the same three questions and land in the same
+ * Store — a personal staple is fetched, hashed and deduplicated exactly like a
+ * project's own Component. What differs is where it is pinned: into an
+ * uncommitted Lockfile of its own, because the resolution of somebody's staples
+ * is not part of what the repository hands over (ADR 0013).
  */
 
 import { existsSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
-import { driftAgainst, readLockfile, writeLockfile } from "./lockfile.ts";
+import { driftAgainst, readLockfile, removeLockfile, writeLockfile } from "./lockfile.ts";
 import type { DriftEntry, Lockfile, LockedPlugin, LockedSkill } from "./lockfile.ts";
 import { describePlugin, describeSource } from "./manifest.ts";
-import type { GitSource, Manifest, MarketplaceSource, PluginEntry, Source } from "./manifest.ts";
+import type { GitSource, Manifest, MarketplaceSource, PluginEntry, SkillEntry, Source } from "./manifest.ts";
 import { fetchSource as realFetch, resolveCommit as realResolve } from "./git.ts";
 import type { Fetched } from "./git.ts";
 import { declaredMcpServers, MarketplaceError, resolvePlugin } from "./marketplace.ts";
 import { materialize } from "./materialize.ts";
 import type { MaterializePlan, MaterializeResult, Resolved } from "./materialize.ts";
+import { OVERLAY_LOCKFILE } from "./overlay.ts";
+import type { Session } from "./overlay.ts";
 import { hashTree, insert, isStored, storePath } from "./store.ts";
 import type { Env } from "./store.ts";
 
@@ -65,11 +73,11 @@ export interface SyncResult {
   materialized: MaterializeResult;
 }
 
-export function sync(manifest: Manifest, deps: Partial<SyncDeps> = {}): SyncResult {
+export function sync(session: Session, deps: Partial<SyncDeps> = {}): SyncResult {
   const { env, resolveCommit, fetchSource } = withDefaults(deps);
+  const { manifest } = session;
   const lock = readLockfile(manifest.root);
   const drift = driftAgainst(manifest, lock);
-  const locked = new Map((lock?.skills ?? []).map((entry) => [entry.name, entry]));
   const lockedPlugins = new Map((lock?.plugins ?? []).map((entry) => [entry.name, entry]));
 
   const result: SyncResult = {
@@ -77,42 +85,56 @@ export function sync(manifest: Manifest, deps: Partial<SyncDeps> = {}): SyncResu
     reused: [],
     local: [],
     drift,
-    warnings: [],
+    // Composing the session is what discovers an Overlay entry the Manifest
+    // locked, so those warnings are already waiting by the time Sync runs.
+    warnings: [...session.warnings],
     materialized: { linked: [], plugins: [], removed: [] },
   };
 
-  const entries: LockedSkill[] = [];
-  const resolved: Resolved[] = [];
+  const resolveSkills = (skills: SkillEntry[], from: Lockfile | null, portable: boolean) => {
+    const locked = new Map((from?.skills ?? []).map((entry) => [entry.name, entry]));
+    const entries: LockedSkill[] = [];
+    const resolved: Resolved[] = [];
 
-  for (const skill of manifest.skills) {
-    if (skill.source.kind === "path") {
-      result.local.push(skill.name);
-      result.warnings.push(nonPortable(skill.name, skill.source.declared));
-      entries.push({ name: skill.name, source: skill.source });
-      resolved.push({ name: skill.name, path: skill.source.path });
-      continue;
+    for (const skill of skills) {
+      if (skill.source.kind === "path") {
+        result.local.push(skill.name);
+        // An Overlay is never cloned, so a local directory in one is not a
+        // handoff problem — it is the ordinary way to keep a skill you are
+        // still writing.
+        if (portable) result.warnings.push(nonPortable(skill.name, skill.source.declared));
+        entries.push({ name: skill.name, source: skill.source });
+        resolved.push({ name: skill.name, path: skill.source.path });
+        continue;
+      }
+
+      const pin = pinFor(skill.source, locked.get(skill.name));
+
+      if (pin.hash !== undefined && isStored(pin.hash, env)) {
+        result.reused.push(skill.name);
+        entries.push({ name: skill.name, source: skill.source, commit: pin.commit, hash: pin.hash });
+        resolved.push({ name: skill.name, path: storePath(pin.hash, env) });
+        continue;
+      }
+
+      const commit = pin.commit ?? resolveCommit(skill.source);
+      const fetched = fetchSource(skill.source, commit, env);
+      const hash = hashTree(fetched.staged);
+      if (pin.hash !== undefined && pin.hash !== hash) {
+        throw new SyncError(mismatch(`Skill \`${skill.name}\``, skill.source, commit, pin.hash, hash));
+      }
+
+      result.fetched.push(skill.name);
+      entries.push({ name: skill.name, source: skill.source, commit, hash });
+      resolved.push({ name: skill.name, path: insert(fetched.staged, hash, env) });
     }
+    return { entries, resolved };
+  };
 
-    const pin = pinFor(skill.source, locked.get(skill.name));
-
-    if (pin.hash !== undefined && isStored(pin.hash, env)) {
-      result.reused.push(skill.name);
-      entries.push({ name: skill.name, source: skill.source, commit: pin.commit, hash: pin.hash });
-      resolved.push({ name: skill.name, path: storePath(pin.hash, env) });
-      continue;
-    }
-
-    const commit = pin.commit ?? resolveCommit(skill.source);
-    const fetched = fetchSource(skill.source, commit, env);
-    const hash = hashTree(fetched.staged);
-    if (pin.hash !== undefined && pin.hash !== hash) {
-      throw new SyncError(mismatch(`Skill \`${skill.name}\``, skill.source, commit, pin.hash, hash));
-    }
-
-    result.fetched.push(skill.name);
-    entries.push({ name: skill.name, source: skill.source, commit, hash });
-    resolved.push({ name: skill.name, path: insert(fetched.staged, hash, env) });
-  }
+  const own = resolveSkills(manifest.skills, lock, true);
+  const overlay = resolveSkills(session.overlaySkills, readLockfile(manifest.root, OVERLAY_LOCKFILE), false);
+  const entries = own.entries;
+  const resolved = [...own.resolved, ...overlay.resolved];
 
   const pinned: LockedPlugin[] = [];
   const plugins: Resolved[] = [];
@@ -166,6 +188,8 @@ export function sync(manifest: Manifest, deps: Partial<SyncDeps> = {}): SyncResu
   // (ADR 0008), and a Lockfile is a promise that should not outlive a failed one.
   result.materialized = materialize({ root: manifest.root, skills: resolved, plugins });
   writeLockfile(manifest.root, entries, pinned);
+  if (overlay.entries.length > 0) writeLockfile(manifest.root, overlay.entries, [], OVERLAY_LOCKFILE);
+  else removeLockfile(manifest.root, OVERLAY_LOCKFILE);
   return result;
 }
 
@@ -224,22 +248,38 @@ const mismatch = (
  * written, because a session that quietly fetched would make `harv claude` a
  * second, invisible Sync. Anything missing is reported as work for `harv sync`.
  */
-export function plan(manifest: Manifest, lock: Lockfile | null, env: Env = process.env): MaterializePlan {
-  const locked = new Map((lock?.skills ?? []).map((entry) => [entry.name, entry]));
-  const lockedPlugins = new Map((lock?.plugins ?? []).map((entry) => [entry.name, entry]));
+export function plan(session: Session, locks: Locks, env: Env = process.env): MaterializePlan {
+  const { manifest } = session;
+  const lockedPlugins = new Map((locks.manifest?.plugins ?? []).map((entry) => [entry.name, entry]));
+
+  const locate = (skills: SkillEntry[], lock: Lockfile | null): Resolved[] => {
+    const locked = new Map((lock?.skills ?? []).map((entry) => [entry.name, entry]));
+    return skills.map((skill) => {
+      if (skill.source.kind === "path") return { name: skill.name, path: skill.source.path };
+      return { name: skill.name, path: fromStore(`Skill \`${skill.name}\``, locked.get(skill.name)?.hash, env) };
+    });
+  };
 
   return {
     root: manifest.root,
-    skills: manifest.skills.map((skill) => {
-      if (skill.source.kind === "path") return { name: skill.name, path: skill.source.path };
-      return { name: skill.name, path: fromStore(`Skill \`${skill.name}\``, locked.get(skill.name)?.hash, env) };
-    }),
+    skills: [...locate(manifest.skills, locks.manifest), ...locate(session.overlaySkills, locks.overlay)],
     plugins: manifest.plugins.map((plugin) => ({
       name: plugin.name,
       path: fromStore(`Plugin \`${plugin.name}\``, lockedPlugins.get(plugin.name)?.hash, env),
     })),
   };
 }
+
+/** Both of a project's Lockfiles: the committed one and the Overlay's own. */
+export interface Locks {
+  manifest: Lockfile | null;
+  overlay: Lockfile | null;
+}
+
+export const readLocks = (root: string): Locks => ({
+  manifest: readLockfile(root),
+  overlay: readLockfile(root, OVERLAY_LOCKFILE),
+});
 
 /** A locked hash turned into a Store path, or the reason it cannot be. */
 function fromStore(what: string, hash: string | undefined, env: Env): string {

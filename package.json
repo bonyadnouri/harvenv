@@ -18,6 +18,7 @@
     "verify:tripwire": "node scripts/verify-tripwire.ts",
     "verify:ci": "node scripts/verify-ci-recipe.ts",
     "verify:shim": "node scripts/verify-shim.ts",
+    "verify:overlay": "node scripts/verify-overlay.ts",
     "verify:packaging": "bun scripts/verify-packaging.ts",
     "vendor:mise": "bun scripts/vendor-mise.ts",
     "build": "bun scripts/build.ts"

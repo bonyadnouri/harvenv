@@ -9,7 +9,8 @@ import { loadManifest } from "../src/manifest.ts";
 import type { Manifest } from "../src/manifest.ts";
 import { hashTree, storePath } from "../src/store.ts";
 import type { Env } from "../src/store.ts";
-import { plan, sync, SyncError } from "../src/sync.ts";
+import { composeSession, NO_OVERLAY } from "../src/overlay.ts";
+import { plan, readLocks, sync, SyncError } from "../src/sync.ts";
 import type { SyncDeps } from "../src/sync.ts";
 import {
   commitFiles,
@@ -24,6 +25,9 @@ import {
 
 /** A Store of this test's own. Every sync in one test must share it to dedupe. */
 const home = (): Env => ({ HARV_HOME: tempDir() });
+
+/** A Session made of this Manifest and nothing else — no Overlay in sight. */
+const solo = (manifest: Manifest) => composeSession(manifest, NO_OVERLAY);
 
 /** A project whose Manifest is `body`. */
 function project(body: string): Manifest {
@@ -66,7 +70,7 @@ test("sync locks a git Source with the commit it resolved and the hash of what i
   const repo = gitRepo({ "SKILL.md": skillFile("example") });
   const manifest = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
 
-  sync(manifest, counting(home()));
+  sync(solo(manifest), counting(home()));
 
   const locked = readLockfile(manifest.root)?.skills[0];
   assert.equal(locked?.name, "example");
@@ -79,7 +83,7 @@ test("sync materializes a git Source out of the Store, not out of the project", 
   const repo = gitRepo({ "SKILL.md": skillFile("example") });
   const manifest = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
 
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
   const link = join(skillsDir(manifest.root), "example");
   assert.equal(readFileSync(join(link, "SKILL.md"), "utf8"), skillFile("example"));
@@ -91,7 +95,7 @@ test("sync narrows a git Source to its subdirectory and names the skill by its M
   const repo = gitRepo({ "README.md": "repo\n", "skills/example/SKILL.md": skillFile("example") });
   const manifest = project(`[skills]\nexample = { git = "${repo.url}", subdir = "skills/example" }\n`);
 
-  sync(manifest, counting(home()));
+  sync(solo(manifest), counting(home()));
 
   assert.equal(existsSync(join(skillsDir(manifest.root), "example", "SKILL.md")), true);
   assert.equal(existsSync(join(skillsDir(manifest.root), "example", "README.md")), false);
@@ -103,9 +107,9 @@ test("sync run twice fetches once and leaves the Lockfile byte-identical", () =>
   const manifest = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
   const deps = counting(env);
 
-  sync(manifest, deps);
+  sync(solo(manifest), deps);
   const first = readFileSync(join(manifest.root, "harvenv.lock"), "utf8");
-  const second = sync(manifest, deps);
+  const second = sync(solo(manifest), deps);
 
   assert.equal(deps.fetches.length, 1, "the second Sync fetched nothing");
   assert.deepEqual(second.fetched, []);
@@ -118,12 +122,12 @@ test("a second project declaring an already-fetched Source reaches no network at
   const repo = gitRepo({ "SKILL.md": skillFile("example") });
   const declaration = `[skills]\nexample = { git = "${repo.url}" }\n`;
   const first = project(declaration);
-  sync(first, counting(env));
+  sync(solo(first), counting(env));
 
   // The same declaration, a different project, and a Sync that cannot fetch.
   const second = project(declaration);
   writeFileSync(join(second.root, "harvenv.lock"), readFileSync(join(first.root, "harvenv.lock"), "utf8"));
-  const result = sync(second, offline(env));
+  const result = sync(solo(second), offline(env));
 
   assert.deepEqual(result.reused, ["example"]);
   assert.equal(
@@ -136,14 +140,14 @@ test("sync reproduces the locked commit even after the branch has moved on", () 
   const env = home();
   const repo = gitRepo({ "SKILL.md": skillFile("example", "First.\n") });
   const manifest = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
   const locked = readFileSync(join(manifest.root, "harvenv.lock"), "utf8");
 
   // The world moves: a new commit lands, and this machine loses its Store.
   commitFiles(repo.dir, { "SKILL.md": skillFile("example", "Second.\n") }, "second");
   rmSync(join(env.HARV_HOME as string, "store"), { recursive: true, force: true });
   rmSync(join(manifest.root, ".claude"), { recursive: true, force: true });
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
   assert.match(readFileSync(join(skillsDir(manifest.root), "example", "SKILL.md"), "utf8"), /First\./);
   assert.equal(readFileSync(join(manifest.root, "harvenv.lock"), "utf8"), locked, "the Lockfile did not move");
@@ -153,7 +157,7 @@ test("sync fails loudly when a fetch does not produce the content the Lockfile p
   const env = home();
   const repo = gitRepo({ "SKILL.md": skillFile("example") });
   const manifest = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
   // A Lockfile that promises content this commit does not produce — what a
   // tampered repository or a corrupted Store entry looks like from here.
@@ -165,7 +169,7 @@ test("sync fails loudly when a fetch does not produce the content the Lockfile p
   rmSync(join(env.HARV_HOME as string, "store"), { recursive: true, force: true });
 
   assert.throws(
-    () => sync(manifest, counting(env)),
+    () => sync(solo(manifest), counting(env)),
     (err: Error) =>
       err instanceof SyncError &&
       /example/.test(err.message) &&
@@ -179,7 +183,7 @@ test("sync warns by name that a path Source will not survive a clone", () => {
   mkdirSync(join(manifest.root, "vendor", "local-thing"), { recursive: true });
   writeFileSync(join(manifest.root, "vendor", "local-thing", "SKILL.md"), skillFile("local-thing"));
 
-  const result = sync(manifest, counting(home()));
+  const result = sync(solo(manifest), counting(home()));
 
   assert.equal(result.warnings.length, 1);
   assert.match(result.warnings[0] ?? "", /local-thing/);
@@ -190,7 +194,7 @@ test("sync does not warn about a git Source, which does survive a clone", () => 
   const repo = gitRepo({ "SKILL.md": skillFile("example") });
   const manifest = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
 
-  assert.deepEqual(sync(manifest, counting(home())).warnings, []);
+  assert.deepEqual(sync(solo(manifest), counting(home())).warnings, []);
 });
 
 test("sync locks a path Source without a content hash, because a local directory is live", () => {
@@ -198,7 +202,7 @@ test("sync locks a path Source without a content hash, because a local directory
   mkdirSync(join(manifest.root, "vendor", "local-thing"), { recursive: true });
   writeFileSync(join(manifest.root, "vendor", "local-thing", "SKILL.md"), skillFile("local-thing"));
 
-  sync(manifest, counting(home()));
+  sync(solo(manifest), counting(home()));
 
   const locked = readLockfile(manifest.root)?.skills[0];
   assert.deepEqual(locked?.source, {
@@ -214,7 +218,7 @@ test("sync reports the drift it is about to resolve", () => {
   const repo = gitRepo({ "SKILL.md": skillFile("example") });
   const manifest = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
 
-  const result = sync(manifest, counting(env));
+  const result = sync(solo(manifest), counting(env));
 
   assert.equal(result.drift.length, 1);
   assert.equal(result.drift[0]?.name, "example");
@@ -224,12 +228,12 @@ test("sync re-resolves a Source whose ref moved in the Manifest", () => {
   const env = home();
   const repo = gitRepo({ "SKILL.md": skillFile("example", "On main.\n") });
   const manifest = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
   git(["checkout", "--quiet", "-b", "next"], repo.dir);
   const onNext = commitFiles(repo.dir, { "SKILL.md": skillFile("example", "On next.\n") }, "on next");
   writeFileSync(join(manifest.root, "harvenv.toml"), `[skills]\nexample = { git = "${repo.url}", ref = "next" }\n`);
-  sync(loadManifest(join(manifest.root, "harvenv.toml")), counting(env));
+  sync(solo(loadManifest(join(manifest.root, "harvenv.toml"))), counting(env));
 
   assert.equal(readLockfile(manifest.root)?.skills[0]?.commit, onNext);
   assert.match(readFileSync(join(skillsDir(manifest.root), "example", "SKILL.md"), "utf8"), /On next\./);
@@ -239,10 +243,10 @@ test("sync drops a skill from project scope once the Manifest stops declaring it
   const env = home();
   const repo = gitRepo({ "SKILL.md": skillFile("example") });
   const manifest = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
   writeFileSync(join(manifest.root, "harvenv.toml"), "");
-  sync(loadManifest(join(manifest.root, "harvenv.toml")), counting(env));
+  sync(solo(loadManifest(join(manifest.root, "harvenv.toml"))), counting(env));
 
   assert.equal(existsSync(join(skillsDir(manifest.root), "example")), false);
   assert.deepEqual(readLockfile(manifest.root)?.skills, []);
@@ -252,7 +256,7 @@ test("sync rejects a fetched Source whose SKILL.md disagrees with its Manifest k
   const repo = gitRepo({ "SKILL.md": skillFile("published-name") });
   const manifest = project(`[skills]\ndeclared-name = { git = "${repo.url}" }\n`);
 
-  assert.throws(() => sync(manifest, counting(home())), /published-name/);
+  assert.throws(() => sync(solo(manifest), counting(home())), /published-name/);
 });
 
 test("the Store holds one copy when two projects declare the same Source", () => {
@@ -261,9 +265,9 @@ test("the Store holds one copy when two projects declare the same Source", () =>
   const declaration = `[skills]\nexample = { git = "${repo.url}" }\n`;
 
   const first = project(declaration);
-  sync(first, counting(env));
+  sync(solo(first), counting(env));
   const second = project(declaration);
-  sync(second, counting(env));
+  sync(solo(second), counting(env));
 
   const hash = readLockfile(first.root)?.skills[0]?.hash ?? "";
   assert.equal(readLockfile(second.root)?.skills[0]?.hash, hash);
@@ -278,9 +282,9 @@ test("plan resolves every locked git Source to its Store path", () => {
   const env = home();
   const repo = gitRepo({ "SKILL.md": skillFile("example") });
   const manifest = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
-  const resolved = plan(manifest, readLockfile(manifest.root), env);
+  const resolved = plan(solo(manifest), readLocks(manifest.root), env);
 
   const hash = readLockfile(manifest.root)?.skills[0]?.hash ?? "";
   assert.deepEqual(resolved.skills, [{ name: "example", path: storePath(hash, env) }]);
@@ -290,11 +294,11 @@ test("plan tells the user to sync when the Store does not hold what the Lockfile
   const env = home();
   const repo = gitRepo({ "SKILL.md": skillFile("example") });
   const manifest = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
   rmSync(join(env.HARV_HOME as string, "store"), { recursive: true, force: true });
 
   assert.throws(
-    () => plan(manifest, readLockfile(manifest.root), env),
+    () => plan(solo(manifest), readLocks(manifest.root), env),
     (err: Error) => err instanceof SyncError && /example/.test(err.message) && /harv sync/.test(err.message),
   );
 });
@@ -304,9 +308,9 @@ test("plan resolves a locked path Source to the directory itself", () => {
   const manifest = project('[skills]\nlocal-thing = { path = "vendor/local-thing" }\n');
   mkdirSync(join(manifest.root, "vendor", "local-thing"), { recursive: true });
   writeFileSync(join(manifest.root, "vendor", "local-thing", "SKILL.md"), skillFile("local-thing"));
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
-  const resolved = plan(manifest, readLockfile(manifest.root), env);
+  const resolved = plan(solo(manifest), readLocks(manifest.root), env);
 
   assert.deepEqual(resolved.skills, [
     { name: "local-thing", path: join(manifest.root, "vendor", "local-thing") },
@@ -326,7 +330,7 @@ test("sync pins a plugin by the marketplace commit and the plugin's own content 
   const marketplace = marketplaceRepo();
   const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
 
-  sync(manifest, counting(home()));
+  sync(solo(manifest), counting(home()));
 
   const locked = readLockfile(manifest.root)?.plugins[0];
   assert.equal(locked?.name, "alpha-pack");
@@ -339,7 +343,7 @@ test("sync resolves the plugin out of the marketplace and leaves the rest of it 
   const marketplace = marketplaceRepo();
   const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
 
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
   const link = pluginLink(manifest.root);
   assert.equal(existsSync(join(link, ".claude-plugin", "plugin.json")), true, "the plugin's own manifest");
@@ -354,7 +358,7 @@ test("sync serves a plugin from the Store, through a link named after the plugin
   const marketplace = marketplaceRepo();
   const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
 
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
   const hash = readLockfile(manifest.root)?.plugins[0]?.hash ?? "";
   assert.equal(readlinkSync(pluginLink(manifest.root)), storePath(hash, env));
@@ -367,9 +371,9 @@ test("sync run twice fetches a marketplace once and leaves the Lockfile byte-ide
   const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
   const deps = counting(env);
 
-  sync(manifest, deps);
+  sync(solo(manifest), deps);
   const first = readFileSync(join(manifest.root, "harvenv.lock"), "utf8");
-  const second = sync(manifest, deps);
+  const second = sync(solo(manifest), deps);
 
   assert.equal(deps.fetches.length, 1, "the second Sync fetched nothing");
   assert.deepEqual(second.reused, ["alpha-pack"]);
@@ -381,13 +385,13 @@ test("a second machine converges on identical bytes from the Lockfile, with no n
   const marketplace = marketplaceRepo();
   const declaration = `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`;
   const original = project(declaration);
-  sync(original, counting(first));
+  sync(solo(original), counting(first));
 
   // What a teammate has after `git clone`: the Manifest and the Lockfile, and a
   // Store that already holds the content — so nothing may be fetched at all.
   const second = project(declaration);
   writeFileSync(join(second.root, "harvenv.lock"), readFileSync(join(original.root, "harvenv.lock"), "utf8"));
-  const result = sync(second, offline(first));
+  const result = sync(solo(second), offline(first));
 
   assert.deepEqual(result.reused, ["alpha-pack"]);
   assert.equal(hashTree(realpathSync(pluginLink(second.root))), readLockfile(original.root)?.plugins[0]?.hash);
@@ -397,13 +401,13 @@ test("sync reproduces the locked marketplace commit even after the marketplace m
   const env = home();
   const marketplace = marketplaceRepo("alpha-pack", "First.\n");
   const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
   const locked = readFileSync(join(manifest.root, "harvenv.lock"), "utf8");
 
   commitFiles(marketplace.dir, marketplaceWith("alpha-pack", "fixtures", "Second.\n"), "second");
   rmSync(join(env.HARV_HOME as string, "store"), { recursive: true, force: true });
   rmSync(join(manifest.root, ".claude"), { recursive: true, force: true });
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
   const skill = join(pluginLink(manifest.root), "skills", "alpha-pack-skill", "SKILL.md");
   assert.match(readFileSync(skill, "utf8"), /First\./);
@@ -416,7 +420,7 @@ test("sync follows a plugin that moved inside a marketplace it re-resolves", () 
   const env = home();
   const marketplace = gitRepo(marketplaceWith("alpha-pack"));
   const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
   git(["checkout", "--quiet", "-b", "next"], marketplace.dir);
   git(["rm", "--quiet", "-r", "plugins"], marketplace.dir);
@@ -433,7 +437,7 @@ test("sync follows a plugin that moved inside a marketplace it re-resolves", () 
     join(manifest.root, "harvenv.toml"),
     `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}", ref = "next" }\n`,
   );
-  sync(loadManifest(join(manifest.root, "harvenv.toml")), counting(env));
+  sync(solo(loadManifest(join(manifest.root, "harvenv.toml"))), counting(env));
 
   assert.equal(readLockfile(manifest.root)?.plugins[0]?.commit, moved);
   assert.match(
@@ -446,7 +450,7 @@ test("sync fails loudly when a marketplace fetch does not produce the pinned con
   const env = home();
   const marketplace = marketplaceRepo();
   const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
   const tampered = readFileSync(join(manifest.root, "harvenv.lock"), "utf8").replace(
     /hash = "sha256:[0-9a-f]{64}"/,
@@ -456,7 +460,7 @@ test("sync fails loudly when a marketplace fetch does not produce the pinned con
   rmSync(join(env.HARV_HOME as string, "store"), { recursive: true, force: true });
 
   assert.throws(
-    () => sync(manifest, counting(env)),
+    () => sync(solo(manifest), counting(env)),
     (err: Error) => err instanceof SyncError && /alpha-pack/.test(err.message) && /c{64}/.test(err.message),
   );
 });
@@ -466,7 +470,7 @@ test("sync names the plugins a marketplace does offer when the pin is not among 
   const manifest = project(`[plugins]\nbeta-pack = { marketplace = "${marketplace.url}" }\n`);
 
   assert.throws(
-    () => sync(manifest, counting(home())),
+    () => sync(solo(manifest), counting(home())),
     (err: Error) => /beta-pack/.test(err.message) && /alpha-pack/.test(err.message),
   );
 });
@@ -477,7 +481,7 @@ test("sync warns by name about MCP servers a pinned plugin ships and the recipe 
   const marketplace = gitRepo(files);
   const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
 
-  const result = sync(manifest, counting(home()));
+  const result = sync(solo(manifest), counting(home()));
 
   assert.equal(result.warnings.length, 1);
   assert.match(result.warnings[0] ?? "", /alpha-pack/);
@@ -489,17 +493,17 @@ test("sync says nothing about MCP for a plugin that ships no servers", () => {
   const marketplace = marketplaceRepo();
   const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
 
-  assert.deepEqual(sync(manifest, counting(home())).warnings, []);
+  assert.deepEqual(sync(solo(manifest), counting(home())).warnings, []);
 });
 
 test("sync drops a plugin from project scope once the Manifest stops pinning it", () => {
   const env = home();
   const marketplace = marketplaceRepo();
   const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
   writeFileSync(join(manifest.root, "harvenv.toml"), "");
-  sync(loadManifest(join(manifest.root, "harvenv.toml")), counting(env));
+  sync(solo(loadManifest(join(manifest.root, "harvenv.toml"))), counting(env));
 
   assert.equal(existsSync(pluginLink(manifest.root)), false);
   assert.deepEqual(readLockfile(manifest.root)?.plugins, []);
@@ -511,16 +515,16 @@ test("sync rejects a plugin published under a name other than the one it is pinn
   const marketplace = gitRepo(files);
   const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
 
-  assert.throws(() => sync(manifest, counting(home())), /alpha-pack-dev/);
+  assert.throws(() => sync(solo(manifest), counting(home())), /alpha-pack-dev/);
 });
 
 test("the Store holds one copy when a skill and a plugin resolve to the same bytes", () => {
   const env = home();
   const marketplace = marketplaceRepo();
   const first = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
-  sync(first, counting(env));
+  sync(solo(first), counting(env));
   const second = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
-  sync(second, counting(env));
+  sync(solo(second), counting(env));
 
   const hash = readLockfile(first.root)?.plugins[0]?.hash ?? "";
   assert.equal(readLockfile(second.root)?.plugins[0]?.hash, hash);
@@ -536,7 +540,7 @@ test("skills and plugins are synced from one Manifest without colliding", () => 
       `[plugins]\nshared = { marketplace = "${marketplace.url}" }\n`,
   );
 
-  const result = sync(manifest, counting(env));
+  const result = sync(solo(manifest), counting(env));
 
   assert.deepEqual(result.materialized.plugins, ["shared"]);
   assert.equal(existsSync(join(skillsDir(manifest.root), "shared", "SKILL.md")), true);
@@ -549,9 +553,9 @@ test("plan resolves a locked plugin to its Store entry", () => {
   const env = home();
   const marketplace = marketplaceRepo();
   const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
 
-  const resolved = plan(manifest, readLockfile(manifest.root), env);
+  const resolved = plan(solo(manifest), readLocks(manifest.root), env);
 
   const hash = readLockfile(manifest.root)?.plugins[0]?.hash ?? "";
   assert.deepEqual(resolved.plugins, [{ name: "alpha-pack", path: storePath(hash, env) }]);
@@ -561,11 +565,11 @@ test("plan tells the user to sync when the Store does not hold a pinned plugin",
   const env = home();
   const marketplace = marketplaceRepo();
   const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
-  sync(manifest, counting(env));
+  sync(solo(manifest), counting(env));
   rmSync(join(env.HARV_HOME as string, "store"), { recursive: true, force: true });
 
   assert.throws(
-    () => plan(manifest, readLockfile(manifest.root), env),
+    () => plan(solo(manifest), readLocks(manifest.root), env),
     (err: Error) => err instanceof SyncError && /alpha-pack/.test(err.message) && /harv sync/.test(err.message),
   );
 });

@@ -19,13 +19,22 @@
 import { readFileSync, writeFileSync } from "node:fs";
 
 import { AddError, entryLine, parseCoordinate, tableFor, validateName, withEntry } from "./add.ts";
-import { driftAgainst, LockfileError, readLockfile } from "./lockfile.ts";
+import { driftAgainst, driftOver, LOCKFILE_FILENAME, LockfileError } from "./lockfile.ts";
 import type { DriftEntry } from "./lockfile.ts";
 import { findManifest, loadManifest, ManifestError, MANIFEST_FILENAME } from "./manifest.ts";
 import type { Manifest, MarketplaceSource, Source } from "./manifest.ts";
 import { materialize, MaterializeError } from "./materialize.ts";
 import { launch as launchSession, LaunchError } from "./launch.ts";
 import { McpError, validateMcpServers } from "./mcp.ts";
+import {
+  composeSession,
+  loadOverlay,
+  NO_OVERLAY,
+  OVERLAY_FILENAME,
+  OVERLAY_LOCKFILE,
+  OverlayError,
+} from "./overlay.ts";
+import type { Session } from "./overlay.ts";
 import { SettingsError, validateSettings } from "./settings.ts";
 import { GitError } from "./git.ts";
 import { init as initProject, InitError } from "./init.ts";
@@ -42,7 +51,7 @@ import {
 } from "./shim.ts";
 import { TripwireError } from "./tripwire.ts";
 import { MarketplaceError } from "./marketplace.ts";
-import { plan, sync, SyncError } from "./sync.ts";
+import { plan, readLocks, sync, SyncError } from "./sync.ts";
 import type { Env } from "./store.ts";
 import { defaultUpdateCheckDeps, isDevBuild, updateHint, VERSION } from "./version.ts";
 
@@ -57,7 +66,7 @@ export interface CliDeps {
   stdout: (line: string) => void;
   stderr: (line: string) => void;
   /** Injected so tests can exercise the whole command without a real session. */
-  launch: (manifest: Manifest, passthrough: string[], env: Env) => Promise<number>;
+  launch: (session: Session, passthrough: string[], env: Env) => Promise<number>;
   /** Injected for the same reason: no test should need a 90MB binary on disk. */
   runMise: (args: string[]) => Promise<number>;
   /** Resolves to the one line worth printing, or null. Never throws. */
@@ -110,6 +119,7 @@ const EXPECTED_ERRORS = [
   MarketplaceError,
   SettingsError,
   LaunchError,
+  OverlayError,
   McpError,
   LockfileError,
   SyncError,
@@ -229,42 +239,55 @@ function reportInit(result: InitResult, deps: CliDeps): void {
 // claude — the Launcher
 // ---------------------------------------------------------------------------
 
-async function claude(passthrough: string[], deps: CliDeps): Promise<number> {
-  const manifest = requireManifest(deps);
-  if (manifest === null) return 1;
+async function claude(args: string[], deps: CliDeps): Promise<number> {
+  const { overlay, rest: passthrough } = takeOverlayFlag(args);
+  const session = requireSession(deps, overlay);
+  if (session === null) return 1;
 
-  validateSessionConfig(manifest, deps.env);
+  const locks = readLocks(session.manifest.root);
+  // Two Lockfiles, two reports, and they are not the same report: the Overlay's
+  // is uncommitted and rewritten by every Sync, so an entry it still holds that
+  // nothing declares any more is not drift — only what cannot be served is.
+  const drift = [
+    driftReport(driftAgainst(session.manifest, locks.manifest), "the Manifest", LOCKFILE_FILENAME),
+    driftReport(
+      driftOver(session.overlaySkills, locks.overlay?.skills ?? [], { source: "the Overlay", orphans: false }),
+      "the Overlay",
+      OVERLAY_LOCKFILE.filename,
+    ),
+  ].filter((report) => report !== null);
 
-  const lock = readLockfile(manifest.root);
-  const drift = driftAgainst(manifest, lock);
   if (drift.length > 0) {
-    deps.stderr(driftReport(drift));
+    for (const line of drift) deps.stderr(line);
     return 1;
   }
 
-  materialize(plan(manifest, lock, deps.env));
-  return deps.launch(manifest, passthrough, deps.env);
+  for (const warning of session.warnings) deps.stderr(`harv: warning: ${warning}`);
+  materialize(plan(session, locks, deps.env));
+  return deps.launch(session, passthrough, deps.env);
 }
 
-const driftReport = (drift: DriftEntry[]): string =>
-  `harv: the Manifest and ${"harvenv.lock"} have drifted, so this session would not be the Harvenv the Manifest ` +
-  `describes.\n${drift.map((entry) => `  ${entry.name}: ${entry.reason}`).join("\n")}\n` +
-  `  Run \`harv sync\` to reconcile them.`;
+const driftReport = (drift: DriftEntry[], what: string, lockfile: string): string | null =>
+  drift.length === 0
+    ? null
+    : `harv: ${what} and ${lockfile} have drifted, so this session would not be the Harvenv ${what} ` +
+      `describes.\n${drift.map((entry) => `  ${entry.name}: ${entry.reason}`).join("\n")}\n` +
+      `  Run \`harv sync\` to reconcile them.`;
 
 // ---------------------------------------------------------------------------
 // sync
 // ---------------------------------------------------------------------------
 
 function syncCommand(args: string[], deps: CliDeps): number {
-  if (args.length > 0) {
-    deps.stderr(`harv: \`sync\` takes no arguments, but got \`${args.join(" ")}\`.`);
+  const { overlay, rest } = takeOverlayFlag(args);
+  if (rest.length > 0) {
+    deps.stderr(`harv: \`sync\` takes no arguments, but got \`${rest.join(" ")}\`.`);
     return 2;
   }
-  const manifest = requireManifest(deps);
-  if (manifest === null) return 1;
+  const session = requireSession(deps, overlay);
+  if (session === null) return 1;
 
-  validateSessionConfig(manifest, deps.env);
-  report(sync(manifest, { env: deps.env }), deps);
+  report(sync(session, { env: deps.env }), deps);
   return 0;
 }
 
@@ -287,11 +310,12 @@ function report(result: ReturnType<typeof sync>, deps: CliDeps): void {
 // ---------------------------------------------------------------------------
 
 function add(args: string[], deps: CliDeps): number {
+  const { overlay, rest } = takeOverlayFlag(args);
   const manifest = requireManifest(deps);
   if (manifest === null) return 1;
 
-  const name = validateName(args[0]);
-  const source = sourceFrom(args.slice(1), name);
+  const name = validateName(rest[0]);
+  const source = sourceFrom(rest.slice(1), name);
   const declared = [...manifest.skills, ...manifest.plugins].find((entry) => entry.name === name);
   if (declared !== undefined) {
     throw new AddError(
@@ -306,7 +330,7 @@ function add(args: string[], deps: CliDeps): number {
   try {
     // Reloaded rather than patched in memory: the entry now has to survive the
     // same parse a teammate's clone will give it.
-    report(sync(loadManifest(manifest.path), { env: deps.env }), deps);
+    report(sync(sessionFor(loadManifest(manifest.path), deps, overlay), { env: deps.env }), deps);
   } catch (err) {
     // A Manifest declaring something that could not be fetched is worse than
     // no change at all — the next `harv claude` would refuse to start.
@@ -412,17 +436,40 @@ function requireManifest(deps: CliDeps): Manifest | null {
   return loadManifest(manifestPath);
 }
 
+/** What this project's session is made of, or null after saying there is none. */
+function requireSession(deps: CliDeps, overlay: boolean): Session | null {
+  const manifest = requireManifest(deps);
+  return manifest === null ? null : sessionFor(manifest, deps, overlay);
+}
+
 /**
- * The rules ADR 0005 makes harv responsible for: a settings key the Manifest may
- * not bind, or one Claude Code would silently discard, and a server definition
- * that could not run or whose `${VAR}` this environment cannot satisfy.
+ * The Manifest and the user's Overlay as the one thing a session loads.
  *
- * Called by every command that acts on a Manifest, and always before the first
- * write, so a Manifest that cannot launch leaves no trace in the tree.
+ * Both halves are judged here, before the first write into the project tree:
+ * the rules ADR 0005 makes harv responsible for — a settings key the Manifest
+ * may not bind, or one Claude Code would silently discard, and a server
+ * definition that could not run or whose `${VAR}` this environment cannot
+ * satisfy — plus, from the merge itself, every Overlay entry the Manifest
+ * already binds. A Manifest that cannot launch leaves no trace in the tree, and
+ * an Overlay that cannot be read fails by name rather than being skipped.
  */
-function validateSessionConfig(manifest: Manifest, env: Env): void {
+function sessionFor(manifest: Manifest, deps: CliDeps, overlay: boolean): Session {
   validateSettings(manifest.settings);
-  validateMcpServers(manifest.mcpServers, env);
+  validateMcpServers(manifest.mcpServers, deps.env);
+  return composeSession(manifest, overlay ? loadOverlay(manifest.root, deps.env) : NO_OVERLAY);
+}
+
+/**
+ * harv's own flag, taken out of the arguments before the rest is passed
+ * through. Claude Code has none by this name on 2.1.223, and the alternative —
+ * an environment variable — would make "which harness did that run load?"
+ * invisible in the shell history that CI and a bug report are both read from.
+ */
+const NO_OVERLAY_FLAG = "--no-overlay";
+
+function takeOverlayFlag(args: string[]): { overlay: boolean; rest: string[] } {
+  const rest = args.filter((arg) => arg !== NO_OVERLAY_FLAG);
+  return { overlay: rest.length === args.length, rest };
 }
 
 // ---------------------------------------------------------------------------

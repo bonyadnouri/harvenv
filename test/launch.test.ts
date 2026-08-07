@@ -4,14 +4,18 @@ import { writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
 import type { Manifest } from "../src/manifest.ts";
+import { composeSession, NO_OVERLAY } from "../src/overlay.ts";
+import type { Overlay, Session } from "../src/overlay.ts";
 import { buildLaunchArgs, claudeBinary, LaunchError, launchEnv } from "../src/launch.ts";
 import { SHIM_RECORD_FILE } from "../src/shim.ts";
 import { LAUNCHER_ENV } from "../src/tripwire.ts";
 import { fakeExecutable, tempDir } from "./helpers.ts";
 
-function manifestWith(overrides: Partial<Manifest> = {}): Manifest {
+/** What the Launcher is handed: a Manifest, and whatever the Overlay added. */
+function sessionWith(overrides: Partial<Manifest> = {}, overlay: Overlay = NO_OVERLAY): Session {
   const root = tempDir();
-  return {
+  return composeSession(
+    {
     path: join(root, "harvenv.toml"),
     root,
     skills: [],
@@ -19,14 +23,16 @@ function manifestWith(overrides: Partial<Manifest> = {}): Manifest {
     settings: {},
     mcpServers: [],
     ...overrides,
-  };
+    },
+    overlay,
+  );
 }
 
 /** The value a flag was handed, parsed back. */
 const payload = (args: string[], flag: string): unknown => JSON.parse(args[args.indexOf(flag) + 1]!);
 
 test("buildLaunchArgs composes the ADR 0003 recipe", () => {
-  const args = buildLaunchArgs(manifestWith(), [], {});
+  const args = buildLaunchArgs(sessionWith(), [], {});
 
   assert.deepEqual(args, [
     "--setting-sources",
@@ -42,17 +48,17 @@ test("buildLaunchArgs composes the ADR 0003 recipe", () => {
 test("buildLaunchArgs injects the Manifest's settings so they outrank both settings files", () => {
   const settings = { model: "opus", permissions: { defaultMode: "plan" } };
 
-  const args = buildLaunchArgs(manifestWith({ settings }), [], {});
+  const args = buildLaunchArgs(sessionWith({ settings }), [], {});
 
   assert.deepEqual(payload(args, "--settings"), settings);
 });
 
 test("buildLaunchArgs injects the Manifest's MCP servers under strict mode", () => {
-  const manifest = manifestWith({
+  const session = sessionWith({
     mcpServers: [{ name: "tickets", definition: { command: "npx", args: ["-y", "tickets-mcp"] } }],
   });
 
-  const args = buildLaunchArgs(manifest, [], {});
+  const args = buildLaunchArgs(session, [], {});
 
   assert.equal(args.includes("--strict-mcp-config"), true, "only Manifest servers exist in the session");
   assert.deepEqual(payload(args, "--mcp-config"), {
@@ -61,11 +67,11 @@ test("buildLaunchArgs injects the Manifest's MCP servers under strict mode", () 
 });
 
 test("buildLaunchArgs resolves ${VAR} from the environment it is handed", () => {
-  const manifest = manifestWith({
+  const session = sessionWith({
     mcpServers: [{ name: "tickets", definition: { command: "npx", env: { TOKEN: "${TICKETS_TOKEN}" } } }],
   });
 
-  const args = buildLaunchArgs(manifest, [], { TICKETS_TOKEN: "s3cret" });
+  const args = buildLaunchArgs(session, [], { TICKETS_TOKEN: "s3cret" });
 
   assert.deepEqual(payload(args, "--mcp-config"), {
     mcpServers: { tickets: { command: "npx", env: { TOKEN: "s3cret" } } },
@@ -74,59 +80,59 @@ test("buildLaunchArgs resolves ${VAR} from the environment it is handed", () => 
 
 test("buildLaunchArgs leaves the Manifest's own definition unresolved, so nothing can persist a secret", () => {
   const definition = { command: "npx", env: { TOKEN: "${TICKETS_TOKEN}" } };
-  const manifest = manifestWith({ mcpServers: [{ name: "tickets", definition }] });
+  const session = sessionWith({ mcpServers: [{ name: "tickets", definition }] });
 
-  buildLaunchArgs(manifest, [], { TICKETS_TOKEN: "s3cret" });
+  buildLaunchArgs(session, [], { TICKETS_TOKEN: "s3cret" });
 
   assert.deepEqual(definition, { command: "npx", env: { TOKEN: "${TICKETS_TOKEN}" } });
 });
 
 test("buildLaunchArgs appends extra arguments after the recipe, unchanged", () => {
-  const args = buildLaunchArgs(manifestWith(), ["-p", "hi", "--resume", "--", "--settings", "nope"], {});
+  const args = buildLaunchArgs(sessionWith(), ["-p", "hi", "--resume", "--", "--settings", "nope"], {});
 
   assert.deepEqual(args.slice(-6), ["-p", "hi", "--resume", "--", "--settings", "nope"]);
 });
 
 test("buildLaunchArgs never serves skills through --plugin-dir", () => {
-  const manifest = manifestWith({
+  const session = sessionWith({
     skills: [{ name: "example-skill", source: { kind: "git", repo: "https://example.com/s.git" } }],
   });
 
-  assert.equal(buildLaunchArgs(manifest, [], {}).includes("--plugin-dir"), false);
+  assert.equal(buildLaunchArgs(session, [], {}).includes("--plugin-dir"), false);
 });
 
 const pinned = (...names: string[]): Manifest["plugins"] =>
   names.map((name) => ({ name, source: { kind: "marketplace" as const, repo: "https://example.com/m.git" } }));
 
 test("buildLaunchArgs serves each pinned plugin through --plugin-dir", () => {
-  const manifest = manifestWith({ plugins: pinned("alpha-pack", "beta-pack") });
+  const session = sessionWith({ plugins: pinned("alpha-pack", "beta-pack") });
 
-  const args = buildLaunchArgs(manifest, [], {});
+  const args = buildLaunchArgs(session, [], {});
 
   assert.deepEqual(args.slice(args.indexOf("--plugin-dir")), [
     "--plugin-dir",
-    join(manifest.root, ".claude", "harv-plugins", "alpha-pack"),
+    join(session.manifest.root, ".claude", "harv-plugins", "alpha-pack"),
     "--plugin-dir",
-    join(manifest.root, ".claude", "harv-plugins", "beta-pack"),
+    join(session.manifest.root, ".claude", "harv-plugins", "beta-pack"),
   ]);
 });
 
 test("buildLaunchArgs points --plugin-dir at the named link, never at the Store", () => {
-  const manifest = manifestWith({ plugins: pinned("alpha-pack") });
+  const session = sessionWith({ plugins: pinned("alpha-pack") });
 
   // The directory a plugin is served from is the name it answers to when it
   // declares none of its own, so it has to be the plugin's name.
-  const args = buildLaunchArgs(manifest, [], {});
+  const args = buildLaunchArgs(session, [], {});
   const served = args[args.indexOf("--plugin-dir") + 1] ?? "";
 
   assert.equal(basename(served), "alpha-pack");
-  assert.equal(served.startsWith(manifest.root), true);
+  assert.equal(served.startsWith(session.manifest.root), true);
 });
 
 test("passthrough arguments still come last, after every --plugin-dir", () => {
-  const manifest = manifestWith({ plugins: pinned("alpha-pack") });
+  const session = sessionWith({ plugins: pinned("alpha-pack") });
 
-  assert.deepEqual(buildLaunchArgs(manifest, ["-p", "hi"], {}).slice(-2), ["-p", "hi"]);
+  assert.deepEqual(buildLaunchArgs(session, ["-p", "hi"], {}).slice(-2), ["-p", "hi"]);
 });
 
 test("launchEnv marks the session, so the project's Tripwire stays quiet", () => {
