@@ -155,6 +155,17 @@ jobs:
       - name: the run was Manifest-only
         run: node scripts/verify-ci-recipe.ts
 
+      # The import wizard, end to end: a fixture user scope is inventoried,
+      # answered from a pipe and then from a real pseudo-terminal, and what it
+      # declared is synced and launched. No credentials and no network — the
+      # remotes are `file://` repositories in the fixture tree — so unlike the
+      # session job below, this one really does run on every push.
+      #
+      # It reads a fixture `$HOME`, never the runner's own, and writes only
+      # inside the fixture tree.
+      - name: the import wizard declares a machine's user scope
+        run: node scripts/verify-import.ts
+
   # ---------------------------------------------------------------------------
   # What only a real session can answer, and where any further real-session
   # check belongs. Skipped without a key — including in this repository, so

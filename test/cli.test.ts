@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { Session } from "../src/overlay.ts";
@@ -28,6 +28,8 @@ interface Recorded {
   err: string;
   launched: Array<{ session: Session; passthrough: string[]; env: Env; toolPaths: string[] }>;
   mised: string[][];
+  /** Every question the import wizard put to the user, in order. */
+  asked: string[];
 }
 
 interface Options {
@@ -40,6 +42,8 @@ interface Options {
   shim?: ShimContext;
   /** harv's home — the Store, and the global Overlay. Shared to share either. */
   home?: string;
+  /** What the import wizard is answered with, in order. Empty means skip. */
+  answers?: string[];
 }
 
 /** One project, one Store, one shim sandbox, one CLI — reused within one test. */
@@ -48,6 +52,8 @@ function harv(cwd: string, options: Options = {}) {
   const shim = options.shim ?? shimSandbox();
   const launched: Recorded["launched"] = [];
   const mised: string[][] = [];
+  const asked: string[] = [];
+  const answers = [...(options.answers ?? [])];
 
   return async (argv: string[], from = cwd): Promise<Recorded> => {
     let out = "";
@@ -71,8 +77,12 @@ function harv(cwd: string, options: Options = {}) {
       },
       updateHint: async () => options.hint ?? null,
       shim,
+      ask: async (question) => {
+        asked.push(question);
+        return answers.shift() ?? "";
+      },
     });
-    return { exit, out, err, launched, mised };
+    return { exit, out, err, launched, mised, asked };
   };
 }
 
@@ -652,6 +662,92 @@ test("harv init takes no arguments and says so", async () => {
   assert.match(err, /takes no arguments/);
 });
 
+// ---------------------------------------------------------------------------
+// harv init --import
+// ---------------------------------------------------------------------------
+
+/** A `$HOME` whose user scope holds one skill of its own. */
+function userScope(name = "house-style"): string {
+  const home = tempDir();
+  const skill = join(home, ".claude", "skills", name);
+  mkdirSync(skill, { recursive: true });
+  writeFileSync(join(skill, "SKILL.md"), skillFile(name));
+  return home;
+}
+
+test("harv init --import scaffolds the project and then offers what the machine already has", async () => {
+  const root = tempDir();
+  const home = userScope();
+
+  const { exit, out, asked } = await harv(root, { env: { HOME: home }, answers: ["m"] })(["init", "--import"]);
+
+  assert.equal(exit, 0);
+  assert.match(out, /Initialized a Harvenv/, "the scaffold still runs");
+  assert.equal(asked.length, 1, "and then one question is put about the one thing found");
+  assert.match(readFileSync(join(root, "harvenv.toml"), "utf8"), /house-style/);
+});
+
+test("harv init --import sends a chosen staple to the Overlay rather than the Manifest", async () => {
+  const root = tempDir();
+  const home = userScope();
+  const store = tempDir();
+
+  await harv(root, { home: store, env: { HOME: home }, answers: ["o"] })(["init", "--import"]);
+
+  assert.doesNotMatch(readFileSync(join(root, "harvenv.toml"), "utf8"), /house-style/);
+  assert.match(readFileSync(join(store, "overlay.toml"), "utf8"), /house-style/);
+});
+
+test("harv init --import writes nothing into the user scope it read", async () => {
+  const root = tempDir();
+  const home = userScope();
+  const before = readdirSync(join(home, ".claude"));
+
+  await harv(root, { env: { HOME: home }, answers: ["m"] })(["init", "--import"]);
+
+  assert.deepEqual(readdirSync(join(home, ".claude")), before);
+  assert.equal(existsSync(join(home, ".claude", "harvenv.toml")), false);
+});
+
+test("re-running harv init --import asks nothing and changes nothing", async () => {
+  const root = tempDir();
+  const home = userScope();
+  const store = tempDir();
+  await harv(root, { home: store, env: { HOME: home }, answers: ["m"] })(["init", "--import"]);
+  const manifest = readFileSync(join(root, "harvenv.toml"), "utf8");
+
+  // A second handle, so `asked` counts only the second run's questions.
+  const { exit, out, asked } = await harv(root, { home: store, env: { HOME: home } })(["init", "--import"]);
+
+  assert.equal(exit, 0);
+  assert.deepEqual(asked, [], "the second run has nothing left to offer");
+  assert.match(out, /already declared/i);
+  assert.equal(readFileSync(join(root, "harvenv.toml"), "utf8"), manifest);
+});
+
+test("harv init --import on a machine with no user scope still scaffolds the project", async () => {
+  const root = tempDir();
+
+  const { exit, out } = await harv(root, { env: { HOME: tempDir() } })(["init", "--import"]);
+
+  assert.equal(exit, 0);
+  assert.equal(existsSync(join(root, "harvenv.toml")), true);
+  assert.match(out, /no user scope|nothing/i);
+});
+
+test("harv init still refuses an argument that is not --import", async () => {
+  const { exit, err } = await harv(tempDir())(["init", "--everything"]);
+
+  assert.equal(exit, 2);
+  assert.match(err, /--everything/);
+});
+
+test("the usage text says how to import an existing machine", async () => {
+  const { out } = await harv(tempDir())(["--help"]);
+
+  assert.match(out, /--import/);
+});
+
 test("outside a harvenv project, harv names init as the way in", async () => {
   const { err } = await harv(tempDir())(["claude"]);
 
@@ -741,6 +837,7 @@ test("harv mise reports a missing engine without a stack trace", async () => {
     },
     launch: async () => 0,
     shim: shimSandbox(),
+    ask: async () => "",
     runMise: async () => {
       throw new MiseError("No vendored mise for this platform.");
     },
@@ -1254,8 +1351,11 @@ function harvWithEngine(cwd: string, receipt: string) {
       },
       updateHint: async () => null,
       shim: shimSandbox(),
+      // These exercise the Toolchain, which asks nothing; an answer that is
+      // never given is the honest stand-in.
+      ask: async () => "",
     });
-    return { exit, out, err, launched, mised };
+    return { exit, out, err, launched, mised, asked: [] };
   };
 }
 

@@ -202,8 +202,13 @@ export function frontmatter(source: string): string | undefined {
  * `name:` from a SKILL.md YAML frontmatter block, if it has one. YAML scalars
  * may be quoted, and a skill that writes `name: "foo"` means `foo` — carrying
  * the quotes through would reject a skill whose name is in fact correct.
+ *
+ * Exported because the import wizard has to *choose* the key this check will
+ * later judge: a skill in `~/.claude/skills/old-folder` that publishes itself as
+ * `grill-me` has to be declared as `grill-me`, or the entry the wizard writes is
+ * one the next Sync refuses.
  */
-function frontmatterName(source: string): string | undefined {
+export function frontmatterName(source: string): string | undefined {
   const block = frontmatter(source);
   if (block === undefined) return undefined;
   const value = /^name:[ \t]*(.+?)[ \t]*$/m.exec(block)?.[1];

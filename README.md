@@ -24,7 +24,7 @@ harv --version           # which harv, which mise, and whether you are behind
 
 ## Status
 
-Skills, plugin pins and the Toolchain work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate, plugins by marketplace coordinate and system tools by version, `harv sync` fetches and installs them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it with the pinned tools in front of its PATH — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, your personal staples survive through an Overlay that adds to the Manifest without overriding it, and a GitHub Actions workflow runs that whole path on a clean runner on every push. No Doctor yet, and standalone agents and commands are still ahead.
+Skills, plugin pins and the Toolchain work end to end: `harv init` scaffolds a project and plants the Tripwire — or `harv init --import` walks the machine's existing `~/.claude` and declares it for you — skills are declared by git coordinate, plugins by marketplace coordinate and system tools by version, `harv sync` fetches and installs them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it with the pinned tools in front of its PATH — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, your personal staples survive through an Overlay that adds to the Manifest without overriding it, and a GitHub Actions workflow runs that whole path on a clean runner on every push. No Doctor yet, and standalone agents and commands are still ahead.
 
 The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their trade-offs live in [docs/adr/](./docs/adr/). The implementation plan is the issue tracker — issues are thin vertical slices in dependency order.
 
@@ -41,6 +41,8 @@ The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their
   A `harv claude` session runs the same hook and it stays silent, because the Launcher marks its sessions with `HARV_SESSION=1`. It is a self-contained shell one-liner, so it still warns a teammate who has never installed harv.
 
 Init is safe on a project that already has its own `.gitignore` and `.claude/settings.json`: it appends the entries that are missing, merges the Tripwire alongside whatever hooks are already there, and leaves everything else byte-identical. Re-running it changes nothing.
+
+If the machine you are on already has years of `~/.claude` behind it, `harv init --import` declares it for you rather than making you retype it — see [Importing a machine you already have](#importing-a-machine-you-already-have).
 
 A Manifest declares what the project's Harvenv contains: skills from git repositories, plugins from marketplaces, the system tools they run on, plus the settings and MCP servers the session runs with.
 
@@ -77,6 +79,7 @@ Four commands:
 
 ```
 harv init                # scaffold the Manifest, the gitignore entries and the Tripwire
+harv init --import       # ...and then declare what this machine already has
 harv add brainstorming --git https://github.com/obra/superpowers.git@v6.2.0#skills/brainstorming
 harv add gsap-skills --marketplace https://github.com/greensock/gsap-skills.git@v1.0.0
 harv sync                # resolve every entry into the Store and write harvenv.lock
@@ -183,6 +186,38 @@ Fetched content lands in `~/.harv/store`, addressed by a hash of the tree itself
 A Source declared by `path` is allowed and stays live — it is materialized straight from where it sits, never copied into the Store, so you can develop a skill in-tree. It is also the one thing a clone cannot reproduce, so every Sync warns about it by name. An Overlay's path Sources are not warned about: nobody clones an Overlay, so a local directory in one is just where you keep a skill you are still writing.
 
 Materialized Components are harv's to manage: it records what it wrote, removes only what it recorded, and refuses to touch a `.claude/skills/` or `.claude/harv-plugins/` entry it did not create. `harv init` is what gitignores them.
+
+### Importing a machine you already have
+
+Every harvenv project after the first one starts from a Manifest somebody wrote. The first one starts from a machine — months of `/plugin install`, a `~/.claude/skills` nobody has pruned since spring, MCP servers whose tokens sit in a file you have never opened. `harv init --import` scaffolds the project and then walks that pile with you:
+
+```
+harv init --import
+```
+
+It reads your user scope, groups what it finds, and asks one question per group — not one per skill:
+
+```
+  skills from a git repository  (3)
+    brainstorming             https://github.com/obra/superpowers.git#skills/brainstorming
+    ...
+  Where do these go?  [m]anifest (committed, the team baseline)  [o]verlay (personal, every project)  [s]kip  [c]hoose one by one >
+```
+
+**The Manifest or your Overlay** is the only judgement it asks you to make, and it is the one nothing else can make for you: `superpowers` is probably the team's, your statusline skill is probably not. `[c]hoose` splits a group when it needs splitting; an empty answer skips, so a stray return never writes anything.
+
+What it does decide, because these are not judgements:
+
+- **Sources are derived where they can be.** A skill that came from a repository is declared by its coordinate — repository, subdirectory, and the commit it is on right now — rather than by the path it happens to occupy on your disk. A plugin becomes its `name@marketplace` coordinate, read out of Claude Code's own registry and pinned at the commit you are running. What it cannot derive, it flags rather than guesses.
+- **A plugin can only go to the Manifest.** An Overlay refuses `[plugins]` by name, so the choice is not offered — and the group says why rather than leaving the gap to be discovered.
+- **A skill that exists only on your machine is flagged**, with the push it needs spelled out ([ADR 0004](./docs/adr/0004-git-native-addressing-no-registry.md)). It is still declarable — by `path`, which `harv sync` then warns about by name on every run — because a migration that refused half your skills is one nobody finishes. Sent to your Overlay instead, it is not flagged at all: nobody clones an Overlay.
+- **A credential is not copied into a committed file.** `~/.claude.json` holds tokens in the clear; a Manifest goes to a git remote. A server definition bound for the Manifest gets `${VAR}` where its token was, and the summary tells you what to export. The same definition sent to your Overlay is left exactly as it was — that file is uncommitted, and rewriting it would break a working server for nothing.
+
+**Nothing in `~/.claude` is written to, ever.** The wizard reads your user scope and writes to the project's Manifest and your own staples file, so adopting harvenv leaves the machine you adopted it on exactly as it was — including if you decide against it.
+
+**Re-running is a no-op.** Anything already declared is listed and not offered again, so there is no path from a second run to a second entry. Install something new next month and run it again; it will offer you that and nothing else. (Something you *skipped* is offered again — a skip is not a decision harv records anywhere.)
+
+Then `harv sync`, and the pile is a Harvenv.
 
 ## Intercepting a bare `claude`
 
@@ -299,13 +334,20 @@ node scripts/verify-shim.ts              # exits non-zero if interception, unins
                                          # pass-through has stopped holding
 ```
 
-The last is the Overlay's: that one staples file reaches two different projects, that a project's extras add a Component and a disable takes a staple out of that project alone, that an Overlay value for a Manifest-bound key is rejected with a warning while the session runs the Manifest's value, and that `--no-overlay` leaves the whole Overlay behind. It reads `init.skills` and `init.model` out of real sessions, and the one thing `init` cannot show — a resolved `statusLine` — out of the payload harv hands over:
+The eleventh is the Overlay's: that one staples file reaches two different projects, that a project's extras add a Component and a disable takes a staple out of that project alone, that an Overlay value for a Manifest-bound key is rejected with a warning while the session runs the Manifest's value, and that `--no-overlay` leaves the whole Overlay behind. It reads `init.skills` and `init.model` out of real sessions, and the one thing `init` cannot show — a resolved `statusLine` — out of the payload harv hands over:
 
 ```
 node scripts/verify-overlay.ts           # needs git and claude
 ```
 
-All eleven take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your Overlay, your `~/.claude`, your shell's startup files, or your own mise setup. The unit tests are separate and need no `claude` binary and no install engine:
+The last is the import wizard's: that a fixture user scope's skills, plugins and MCP servers are inventoried and grouped, that each group lands where it was sent with the Sources that were derivable, that a Component which exists only on that machine is flagged with the push it needs, and that a second run asks nothing and writes nothing. It then syncs and launches what the wizard declared, because a Manifest that parses and does not resolve would pass every other check. The whole run is repeated through a real pseudo-terminal, since a pipe is not a terminal and the wizard's users are at one:
+
+```
+node scripts/verify-import.ts            # needs git and python3; needs no claude binary,
+                                         # no credentials and no network
+```
+
+All twelve take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your Overlay, your `~/.claude`, your shell's startup files, or your own mise setup. The unit tests are separate and need no `claude` binary and no install engine:
 
 ```
 npm test
