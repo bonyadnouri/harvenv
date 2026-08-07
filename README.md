@@ -8,9 +8,23 @@ harvenv makes a Claude Code harness configuration a reproducible property of a p
 - Personal staples survive through a declared, uncommitted overlay — nothing loads by accident.
 - No config-dir tricks: isolation is a launch recipe of native Claude Code flags. Your login, history, and MCP auth are never touched.
 
+## Install
+
+```
+curl -fsSL https://raw.githubusercontent.com/bonyadnouri/harvenv/main/install.sh | sh
+```
+
+One file lands in `~/.local/bin` (set `HARV_INSTALL_DIR` for somewhere else, `HARV_VERSION` for a specific release). It carries its own runtime and the pinned [mise](https://mise.jdx.dev) the Toolchain will use, so there is nothing to install first — no Node, no Bun, no sudo. macOS and Linux, arm64 and x64; Windows is deferred.
+
+Or, once the tap is set up, `brew install bonyadnouri/harv/harv`. Or take the archive for your platform from [Releases](https://github.com/bonyadnouri/harvenv/releases) and put `harv` on your PATH — every release publishes `checksums.txt` beside them.
+
+```
+harv --version           # which harv, which mise, and whether you are behind
+```
+
 ## Status
 
-Skills work end to end: declare them by git coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it. No Overlay, Toolchain or Doctor yet, and Components other than skills — agents, commands, MCP servers, plugin pins — are still ahead.
+Skills work end to end: declare them by git coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it. No Overlay, Toolchain or Doctor yet, and Components other than skills — agents, commands, MCP servers, plugin pins — are still ahead. mise ships inside harv but nothing drives it yet; `harv mise` reaches it for diagnosis.
 
 The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their trade-offs live in [docs/adr/](./docs/adr/). The implementation plan is the issue tracker — issues are thin vertical slices in dependency order.
 
@@ -57,7 +71,9 @@ A Source declared by `path` is allowed and stays live — it is materialized str
 
 Materialized skills are harv's to manage: it records what it wrote, removes only what it recorded, and refuses to touch a `.claude/skills/` entry it did not create. Add `.claude/skills/` and `.claude/.harv-materialized.json` to the project's `.gitignore` — they are generated, not authored. `harvenv.lock` is not: it is committed.
 
-Running it needs Node ≥ 22.18 or Bun, `git` on PATH, and the repo's dependencies:
+## Hacking on it
+
+Running from source needs Node ≥ 22.18 or Bun, `git` on PATH, and the repo's dependencies:
 
 ```
 npm install
@@ -65,11 +81,26 @@ node bin/harv.ts sync
 node bin/harv.ts claude
 ```
 
-The self-contained binary of ADR 0007 (`bun build --compile`) is not built yet.
+Building the binaries needs [Bun](https://bun.sh) — a build-time dependency only (ADR 0007):
+
+```
+bun scripts/vendor-mise.ts --all     # fetch the pinned mise for every platform
+bun scripts/build.ts --all           # four binaries + checksums.txt + harv.rb in dist/
+```
+
+`bun scripts/vendor-mise.ts --update <version>` re-pins mise from its own published checksums, so bumping the Toolchain engine is a reviewable diff.
+
+Cutting a release is a tag — the version is baked in from it, and nothing else needs editing:
+
+```
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+The [release workflow](./.github/workflows/release.yml) cross-compiles all four platforms from one runner, publishes them, and then installs the result on four clean machines before touching the Homebrew tap. A tag with a hyphen in it (`v0.2.0-rc.1`) publishes as a pre-release and is kept out of the tap.
 
 ## Verifying
 
-Both of the behaviours this rests on are measured, not assumed.
+The behaviours this rests on are measured, not assumed.
 
 [Spike 0001](./docs/spikes/0001-launch-recipe-verification.md) records what current Claude Code does with the flags the recipe needs — behaviours that are observed rather than documented, so any release can retire them silently:
 
@@ -89,7 +120,13 @@ The third runs `harv` against real git repositories and a real Store, and confir
 node scripts/verify-sync-store.ts        # needs git; needs no claude binary and no network
 ```
 
-All three take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store or `~/.claude`. The unit tests are separate and need no `claude` binary:
+The fourth builds a binary and checks what shipping it promises: that it runs with no Node or Bun anywhere on PATH, that the mise it claims to carry is really inside it and really runs, that each archive matches its published checksum, and — once a release exists — that `install.sh` installs it and that an older build says so:
+
+```
+bun scripts/verify-packaging.ts          # add --all to build every platform
+```
+
+All four take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store or `~/.claude`. The unit tests are separate and need no `claude` binary:
 
 ```
 npm test

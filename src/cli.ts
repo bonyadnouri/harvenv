@@ -6,6 +6,11 @@
  * reads one. A Launcher that quietly fetched would be a second, invisible
  * Sync, and the reproducibility the Lockfile exists for would depend on which
  * command a teammate happened to run.
+ *
+ * `mise` and `--version` sit outside that split: they answer questions about
+ * the installation rather than about a project, so neither looks for a
+ * Manifest. That is what makes `harv --version` the one thing that always
+ * works on a machine which has just met harv.
  */
 
 import { readFileSync, writeFileSync } from "node:fs";
@@ -18,8 +23,11 @@ import type { Manifest, Source } from "./manifest.ts";
 import { materialize, MaterializeError } from "./materialize.ts";
 import { launch as launchSession, SettingsError, validateSettings } from "./launch.ts";
 import { GitError } from "./git.ts";
+import { MISE_VERSION, MiseError, runMise as runMiseBinary } from "./mise.ts";
+import { currentPlatform } from "./platform.ts";
 import { plan, sync, SyncError } from "./sync.ts";
 import type { Env } from "./store.ts";
+import { defaultUpdateCheckDeps, isDevBuild, updateHint, VERSION } from "./version.ts";
 
 export interface CliDeps {
   cwd: string;
@@ -29,6 +37,10 @@ export interface CliDeps {
   stderr: (line: string) => void;
   /** Injected so tests can exercise the whole command without a real session. */
   launch: (manifest: Manifest, passthrough: string[]) => Promise<number>;
+  /** Injected for the same reason: no test should need a 90MB binary on disk. */
+  runMise: (args: string[]) => Promise<number>;
+  /** Resolves to the one line worth printing, or null. Never throws. */
+  updateHint: () => Promise<string | null>;
 }
 
 const USAGE = `Usage: harv <command> [args...]
@@ -44,11 +56,27 @@ Commands:
   claude [args...]   Start a Claude Code session composed strictly from this
                      project's Harvenv. Arguments after \`claude\` are passed
                      through unchanged (harv claude -p "hi", --resume, ...).
+  mise [args...]     Run the vendored Toolchain engine. Mostly for diagnosis
+                     until \`harv sync\` drives it.
+
+Options:
+  --version, -v      Print the harv and mise versions, and whether harv is
+                     behind the latest release.
+  --help, -h         Print this.
 
 harv reads ${MANIFEST_FILENAME} from the current directory or the nearest ancestor.`;
 
 /** Errors whose message is written for the user, not for a debugger. */
-const EXPECTED_ERRORS = [ManifestError, MaterializeError, SettingsError, LockfileError, SyncError, GitError, AddError];
+const EXPECTED_ERRORS = [
+  ManifestError,
+  MaterializeError,
+  SettingsError,
+  LockfileError,
+  SyncError,
+  GitError,
+  AddError,
+  MiseError,
+];
 
 export function defaultDeps(): CliDeps {
   return {
@@ -57,6 +85,8 @@ export function defaultDeps(): CliDeps {
     stdout: (line) => process.stdout.write(`${line}\n`),
     stderr: (line) => process.stderr.write(`${line}\n`),
     launch: launchSession,
+    runMise: runMiseBinary,
+    updateHint: () => updateHint(defaultUpdateCheckDeps()).catch(() => null),
   };
 }
 
@@ -67,6 +97,9 @@ export async function run(argv: string[], deps: CliDeps): Promise<number> {
     deps.stdout(USAGE);
     return 0;
   }
+  if (command === "--version" || command === "-v" || command === "version") {
+    return await version(deps);
+  }
   if (command === undefined) {
     deps.stderr(USAGE);
     return 2;
@@ -76,6 +109,7 @@ export async function run(argv: string[], deps: CliDeps): Promise<number> {
     claude,
     sync: syncCommand,
     add,
+    mise: (args, d) => d.runMise(args),
   };
   const handler = commands[command];
   if (handler === undefined) {
@@ -93,6 +127,25 @@ export async function run(argv: string[], deps: CliDeps): Promise<number> {
     }
     throw err;
   }
+}
+
+// ---------------------------------------------------------------------------
+// --version
+// ---------------------------------------------------------------------------
+
+/**
+ * The facts go to stdout, so `harv --version` stays something a script can
+ * read; the "you are behind" notice goes to stderr, because it is a remark
+ * about the installation rather than an answer to the question asked.
+ */
+async function version(deps: CliDeps): Promise<number> {
+  const suffix = isDevBuild() ? " — development build, run from source" : "";
+  deps.stdout(`harv ${VERSION} (${currentPlatform()})${suffix}`);
+  deps.stdout(`vendored mise ${MISE_VERSION}`);
+
+  const hint = await deps.updateHint();
+  if (hint !== null) deps.stderr(`\n${hint}`);
+  return 0;
 }
 
 // ---------------------------------------------------------------------------
