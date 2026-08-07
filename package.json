@@ -1,0 +1,27 @@
+{
+  "name": "harvenv",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Harness virtual environments for Claude Code",
+  "type": "module",
+  "bin": {
+    "harv": "./bin/harv.ts"
+  },
+  "scripts": {
+    "test": "node --test \"test/**/*.test.ts\"",
+    "typecheck": "tsc --noEmit",
+    "verify:launch-recipe": "node scripts/verify-launch-recipe.ts",
+    "verify:skeleton": "node scripts/verify-walking-skeleton.ts",
+    "build": "bun build --compile bin/harv.ts --outfile dist/harv"
+  },
+  "dependencies": {
+    "smol-toml": "^1.4.2"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.2",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
