@@ -1,5 +1,7 @@
 .DS_Store
 *.log
+node_modules/
+dist/
 
 # personal overlay + generated environment (once harv exists)
 harvenv.local.toml
