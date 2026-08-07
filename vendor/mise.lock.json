@@ -1,0 +1,22 @@
+{
+  "_comment": "The pinned Toolchain engine (ADR 0006, ADR 0007). harv ships mise rather than asking for it, so a release is reproducible: one version, one checksum per platform, updated by a deliberate commit. Refresh with `bun scripts/vendor-mise.ts --update <version>`.",
+  "version": "2026.8.2",
+  "platforms": {
+    "darwin-arm64": {
+      "asset": "mise-v2026.8.2-macos-arm64",
+      "sha256": "c36958065f7f4286d6edf7077247302cff1da77c81ada4fa9a3566c0ea87e200"
+    },
+    "darwin-x64": {
+      "asset": "mise-v2026.8.2-macos-x64",
+      "sha256": "7252a83e77f8a8526810b1882eb1d7865ffa55266ff48b71ab55473b3d567bc0"
+    },
+    "linux-arm64": {
+      "asset": "mise-v2026.8.2-linux-arm64",
+      "sha256": "569051d8c938e448a2cfcf5011a363730998760082a088cb23e9633209e7548d"
+    },
+    "linux-x64": {
+      "asset": "mise-v2026.8.2-linux-x64",
+      "sha256": "9a6c2a8b6fe77c98f1d210b4b3cbd2a0cf31886ad1baf10698757a3234c678c1"
+    }
+  }
+}

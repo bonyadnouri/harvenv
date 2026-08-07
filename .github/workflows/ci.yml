@@ -1,0 +1,69 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Pinned, because the compiler is part of what a release is (ADR 0007).
+  BUN_VERSION: "1.3.14"
+
+jobs:
+  test:
+    name: typecheck and unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # The floor `package.json` promises, not the newest node — if harv needs
+      # more than it claims, this is where that should hurt.
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22.18"
+          cache: npm
+
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+      # install.sh is piped into a shell on machines that have nothing else.
+      - name: shellcheck install.sh
+        run: shellcheck install.sh
+
+  build:
+    name: build a binary
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22.18"
+          cache: npm
+      - run: npm ci
+
+      - name: install bun
+        run: |
+          curl -fsSL https://bun.sh/install | bash -s "bun-v${BUN_VERSION}"
+          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+
+      - name: cache the vendored mise
+        uses: actions/cache@v6
+        with:
+          path: vendor/mise
+          key: mise-${{ runner.os }}-${{ hashFiles('vendor/mise.lock.json') }}
+
+      # Not to publish anything — to find out on the pull request, rather than
+      # on the tag, that the generated entry point or the embedding broke.
+      - run: bun scripts/build.ts
+
+      - name: the binary answers for itself
+        run: |
+          set -eux
+          BIN=build/linux-x64/stage/harv
+          "$BIN" --version | tee /dev/stderr | grep -q '^harv 0\.0\.0-dev'
+          "$BIN" mise --version
