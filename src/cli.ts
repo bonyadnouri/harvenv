@@ -37,10 +37,13 @@ import {
 import type { Session } from "./overlay.ts";
 import { SettingsError, validateSettings } from "./settings.ts";
 import { GitError } from "./git.ts";
+import { runImport } from "./import.ts";
 import { init as initProject, InitError } from "./init.ts";
 import type { InitResult } from "./init.ts";
 import { MISE_VERSION, MiseError, runMise as runMiseBinary } from "./mise.ts";
 import { currentPlatform } from "./platform.ts";
+import { prompt } from "./prompt.ts";
+import type { Prompt } from "./prompt.ts";
 import {
   defaultShimContext,
   installShim,
@@ -74,6 +77,12 @@ export interface CliDeps {
   updateHint: () => Promise<string | null>;
   /** Injected so tests never touch the real HOME, PATH or shell startup files. */
   shim: ShimContext;
+  /**
+   * Put one question to the user and resolve to the answer. Only `init
+   * --import` asks anything; injected so the wizard can be driven by a script
+   * rather than by a person.
+   */
+  ask: (question: string) => Promise<string>;
 }
 
 const USAGE = `Usage: harv <command> [args...]
@@ -83,6 +92,11 @@ Commands:
                      ${MANIFEST_FILENAME}, gitignore entries for generated and
                      personal files, and the Tripwire that warns an un-isolated
                      session. Safe to re-run; it only tops up what is missing.
+       --import      Then walk this machine's existing user scope — skills,
+                     enabled plugins, MCP servers — and send each one to the
+                     Manifest, to your personal Overlay, or nowhere. Reads
+                     ~/.claude and never writes to it. Safe to re-run: what is
+                     already declared is not offered again.
   sync               Resolve every Manifest entry into the Store, install the
                      system tools it needs, and write ${"harvenv.lock"}. Run it
                      after editing the Manifest, and after cloning a project
@@ -145,10 +159,34 @@ export function defaultDeps(): CliDeps {
     runMise: runMiseBinary,
     updateHint: () => updateHint(defaultUpdateCheckDeps()).catch(() => null),
     shim: defaultShimContext(),
+    ask: askOnStdin,
   };
 }
 
+/**
+ * One reader for the whole run, opened on the first question and closed after
+ * the command finishes.
+ *
+ * It outlives a single question because a pipe delivers a whole script at once
+ * and the lines nobody has asked for yet have to be kept (see `prompt.ts`); it
+ * is closed at the end because the listener it holds on stdin would otherwise
+ * keep the process alive after the work is done.
+ */
+let reader: Prompt | null = null;
+
+const askOnStdin = (question: string): Promise<string> =>
+  (reader ??= prompt(process.stdin, process.stdout)).ask(question);
+
 export async function run(argv: string[], deps: CliDeps): Promise<number> {
+  try {
+    return await dispatch(argv, deps);
+  } finally {
+    reader?.close();
+    reader = null;
+  }
+}
+
+async function dispatch(argv: string[], deps: CliDeps): Promise<number> {
   const [command, ...rest] = argv;
 
   if (command === "--help" || command === "-h" || command === "help") {
@@ -212,14 +250,36 @@ async function version(deps: CliDeps): Promise<number> {
 // init
 // ---------------------------------------------------------------------------
 
-function init(args: string[], deps: CliDeps): number {
-  if (args.length > 0) {
-    deps.stderr(`harv: \`init\` takes no arguments, but got \`${args.join(" ")}\`. It scaffolds the current directory.`);
+/**
+ * `init` scaffolds; `init --import` scaffolds and then offers the machine's own
+ * user scope for the new Manifest.
+ *
+ * One command rather than two because the two never happen apart: importing
+ * needs a Manifest to write into, and somebody with years of `~/.claude` behind
+ * them is initializing a project *because* they want it declared. The scaffold
+ * still runs first and unchanged, so `--import` adds a step rather than
+ * replacing one — and skipping every question leaves exactly a plain `harv init`.
+ */
+async function init(args: string[], deps: CliDeps): Promise<number> {
+  const wanted = args.filter((arg) => arg !== IMPORT_FLAG);
+  if (wanted.length > 0) {
+    deps.stderr(
+      `harv: \`init\` takes no arguments except \`${IMPORT_FLAG}\`, but got \`${wanted.join(" ")}\`. ` +
+        `It scaffolds the current directory.`,
+    );
     return 2;
   }
+
   reportInit(initProject(deps.cwd), deps);
+  if (wanted.length === args.length) return 0;
+
+  deps.stdout("");
+  await runImport({ root: deps.cwd, env: deps.env, ask: deps.ask, say: deps.stdout });
   return 0;
 }
+
+/** harv's own flag on `init`, and the only one it takes. */
+const IMPORT_FLAG = "--import";
 
 function reportInit(result: InitResult, deps: CliDeps): void {
   const untouched = result.steps.every((step) => step.action === "unchanged");
