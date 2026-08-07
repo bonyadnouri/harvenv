@@ -147,7 +147,7 @@ function planManifest(root: string): PlannedStep {
 
 function planGitignore(root: string): PlannedStep {
   const absolutePath = join(root, ".gitignore");
-  const existing = read(absolutePath);
+  const existing = read(absolutePath, ".gitignore");
   const missing = GITIGNORE_ENTRIES.filter((entry) => !ignored(existing ?? "", entry));
 
   if (missing.length === 0) {
@@ -197,7 +197,7 @@ const trimSlash = (value: string): string => value.replace(/\/+$/, "");
 function planSettings(root: string): PlannedStep {
   const absolutePath = join(root, ...PROJECT_SETTINGS_PATH);
   const path = PROJECT_SETTINGS_PATH.join("/");
-  const existing = read(absolutePath);
+  const existing = read(absolutePath, path);
 
   if (existing === undefined) {
     const settings: Record<string, unknown> = {};
@@ -247,10 +247,23 @@ function indentOf(source: string): string {
 
 const serialize = (value: unknown, indent: string): string => `${JSON.stringify(value, null, indent)}\n`;
 
-function read(path: string): string | undefined {
+/**
+ * The file's contents, or `undefined` when it genuinely is not there.
+ *
+ * Only ENOENT counts as absent. Every other failure — a permission wall, a
+ * directory standing where a file belongs — is reported rather than smoothed
+ * over, because init plans a *create* for anything it reads as missing, and a
+ * create is precisely what must not happen to a file that exists and could not
+ * be read.
+ */
+function read(path: string, label: string): string | undefined {
   try {
     return readFileSync(path, "utf8");
-  } catch {
-    return undefined;
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return undefined;
+    throw new InitError(
+      `Cannot read ${label}: ${(err as Error).message}. ` +
+        `Fix it by hand — harv will not replace a file it was unable to read.`,
+    );
   }
 }

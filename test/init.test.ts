@@ -275,6 +275,22 @@ test("a project init refuses to touch is left exactly as it was", () => {
   assert.throws(() => read(root, ".gitignore"), "no gitignore entries were added");
 });
 
+test("init refuses a file it cannot read rather than replacing it", () => {
+  // Absent and unreadable are not the same thing: init plans a *create* for
+  // anything missing, so a file it failed to read must never look missing.
+  for (const relative of [".gitignore", ".claude/settings.json"]) {
+    const root = tempDir();
+    mkdirSync(join(root, relative), { recursive: true });
+
+    assert.throws(
+      () => init(root),
+      (err: Error) => err instanceof InitError && /Cannot read/.test(err.message),
+      `${relative} was treated as absent`,
+    );
+    assert.throws(() => read(root, MANIFEST_FILENAME), "and nothing was scaffolded around it");
+  }
+});
+
 test("init surfaces a broken existing Manifest instead of scaffolding around it", () => {
   const root = tempDir();
   put(root, MANIFEST_FILENAME, "[skills\nbroken");
