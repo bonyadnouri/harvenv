@@ -8,15 +8,16 @@
  * recorded. harv only ever removes paths it recorded creating; anything else
  * in `.claude/skills/` is a hand-written Component and is left untouched.
  *
- * Sync will own this once it exists. Until then the Launcher runs it, which is
- * what makes the walking skeleton walk.
+ * What arrives here is already resolved: a name and the directory that holds
+ * it, which for a git Source is a Store entry and for a path Source is the
+ * directory the Manifest pointed at. Deciding which is Sync's job, not this
+ * one's — this step only has to link it safely and be able to undo itself.
  */
 
 import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { COMPONENT_NAME_RULE, isComponentName } from "./manifest.ts";
-import type { Manifest } from "./manifest.ts";
 
 /** harv's ownership record, kept beside the Components it materialized. */
 export const MATERIALIZED_STATE_FILE = ".harv-materialized.json";
@@ -25,6 +26,13 @@ const STATE_VERSION = 1;
 
 export class MaterializeError extends Error {
   override name = "MaterializeError";
+}
+
+/** Resolved Components: where each declared name's content actually is. */
+export interface MaterializePlan {
+  /** The project root — `.claude/` is created beneath it. */
+  root: string;
+  skills: Array<{ name: string; path: string }>;
 }
 
 export interface MaterializeResult {
@@ -39,19 +47,19 @@ interface State {
   skills: string[];
 }
 
-export function materialize(manifest: Manifest): MaterializeResult {
-  const claudeDir = join(manifest.root, ".claude");
+export function materialize(plan: MaterializePlan): MaterializeResult {
+  const claudeDir = join(plan.root, ".claude");
   const skillsDir = join(claudeDir, "skills");
   const previous = readState(claudeDir);
 
-  for (const skill of manifest.skills) validateSkill(skill.name, skill.path);
+  for (const skill of plan.skills) validateSkill(skill.name, skill.path);
 
-  const declared = manifest.skills.map((s) => s.name);
+  const declared = plan.skills.map((s) => s.name);
   const removed = previous.skills.filter((name) => !declared.includes(name));
   for (const name of removed) removeOwned(join(skillsDir, name));
 
-  if (manifest.skills.length > 0) mkdirSync(skillsDir, { recursive: true });
-  for (const skill of manifest.skills) {
+  if (plan.skills.length > 0) mkdirSync(skillsDir, { recursive: true });
+  for (const skill of plan.skills) {
     link(join(skillsDir, skill.name), skill.path, previous.skills.includes(skill.name));
   }
 

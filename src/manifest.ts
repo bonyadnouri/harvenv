@@ -3,19 +3,23 @@
  * contains. Discovery walks up from the working directory, so "switching
  * environments is just `cd`" (ADR 0001).
  *
- * This slice reads the walking-skeleton subset — skills from local paths, plus
- * a settings table. ADR 0004's other Sources (git coordinates, marketplace
- * plugin pins) parse far enough to be rejected by name rather than ignored.
+ * Two of ADR 0004's Sources are readable here: git coordinates (repository,
+ * optional ref, optional subdirectory) and local paths, which are allowed but
+ * non-portable and flagged as such at Sync. Marketplace plugin pins parse far
+ * enough to be rejected by name rather than ignored.
  */
 
 import { existsSync, readFileSync } from "node:fs";
-import { dirname, isAbsolute, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, normalize, resolve, sep } from "node:path";
 import { parse as parseToml, TomlError } from "smol-toml";
 
 export const MANIFEST_FILENAME = "harvenv.toml";
 
 /** Sources ADR 0004 defines but this slice cannot yet fetch. */
-const DEFERRED_SOURCE_KEYS = ["git", "ref", "subdir", "marketplace", "version"];
+const DEFERRED_SOURCE_KEYS = ["marketplace", "version"];
+
+/** Keys that only mean something alongside `git`. */
+const GIT_MODIFIERS = ["ref", "subdir"] as const;
 
 /**
  * A Component name is one path segment, and a conservative one.
@@ -35,11 +39,38 @@ export const COMPONENT_NAME_RULE =
   "a name must be a single path segment starting with a letter or digit and made of letters, digits, " +
   "`.`, `-` and `_` — no `/`, `\\` or `..`";
 
+/**
+ * A local directory. Allowed, but it describes only this machine — nothing in
+ * a clone can reproduce it, which is why Sync flags every one of these.
+ */
+export interface PathSource {
+  kind: "path";
+  /** As written in the Manifest, so messages and the Lockfile stay portable. */
+  declared: string;
+  /** Resolved against the project root, so callers never re-resolve it. */
+  path: string;
+}
+
+/** A git repository, optionally at a ref and narrowed to a subdirectory. */
+export interface GitSource {
+  kind: "git";
+  repo: string;
+  ref?: string;
+  subdir?: string;
+}
+
+export type Source = PathSource | GitSource;
+
 export interface SkillEntry {
   /** The Manifest key — and, per ADR 0008, the name the session answers to. */
   name: string;
-  /** Absolute path to the skill directory. */
-  path: string;
+  source: Source;
+}
+
+/** A git coordinate as one line, for messages and Lockfile-drift reports. */
+export function describeSource(source: Source): string {
+  if (source.kind === "path") return source.declared;
+  return source.repo + (source.ref ? `@${source.ref}` : "") + (source.subdir ? `#${source.subdir}` : "");
 }
 
 export interface Manifest {
@@ -106,24 +137,88 @@ function parseSkills(value: unknown, root: string, manifestPath: string): SkillE
       throw new ManifestError(`${where} is not a usable skill name: ${COMPONENT_NAME_RULE}.`);
     }
     if (!isTable(entry)) {
-      throw new ManifestError(`${where} must be a table, e.g. ${name} = { path = "vendor/${name}" }`);
+      throw new ManifestError(`${where} must be a table, e.g. ${name} = { git = "https://…" }`);
     }
 
     const deferred = DEFERRED_SOURCE_KEYS.filter((key) => key in entry);
     if (deferred.length > 0) {
       throw new ManifestError(
         `${where} declares \`${deferred.join("`, `")}\`, which this version of harv cannot fetch yet. ` +
-          `Only local paths are supported so far: ${name} = { path = "vendor/${name}" }`,
+          `Declare a git repository or a local path instead: ${name} = { git = "https://…" }`,
       );
     }
 
-    const path = entry.path;
-    if (typeof path !== "string" || path.length === 0) {
-      throw new ManifestError(`${where} needs a \`path\`, e.g. ${name} = { path = "vendor/${name}" }`);
-    }
-
-    return { name, path: isAbsolute(path) ? path : join(root, path) };
+    return { name, source: parseSource(entry, name, where, root) };
   });
+}
+
+function parseSource(
+  entry: Record<string, unknown>,
+  name: string,
+  where: string,
+  root: string,
+): Source {
+  const hasGit = "git" in entry;
+  const hasPath = "path" in entry;
+
+  if (hasGit && hasPath) {
+    throw new ManifestError(
+      `${where} declares both \`git\` and \`path\`, so there is no telling which one a Sync should fetch. ` +
+        `Keep one.`,
+    );
+  }
+  if (!hasGit && !hasPath) {
+    throw new ManifestError(
+      `${where} needs a Source: \`git\` for a repository (with optional \`ref\` and \`subdir\`), ` +
+        `or \`path\` for a local directory, e.g. ${name} = { git = "https://example.com/skills.git", subdir = "${name}" }`,
+    );
+  }
+
+  if (hasPath) {
+    const stray = GIT_MODIFIERS.filter((key) => key in entry);
+    if (stray.length > 0) {
+      throw new ManifestError(
+        `${where} declares \`${stray.join("`, `")}\` alongside \`path\`, but a local directory has no ` +
+          `repository to apply them to. Remove them, or declare a \`git\` Source.`,
+      );
+    }
+    const declared = requireString(entry.path, "path", where, name);
+    return { kind: "path", declared, path: isAbsolute(declared) ? declared : join(root, declared) };
+  }
+
+  const source: GitSource = { kind: "git", repo: requireString(entry.git, "git", where, name) };
+  if ("ref" in entry) source.ref = requireString(entry.ref, "ref", where, name);
+  if ("subdir" in entry) source.subdir = parseSubdir(requireString(entry.subdir, "subdir", where, name), where);
+  return source;
+}
+
+/**
+ * A subdirectory selects part of a fetched repository, so it is joined onto a
+ * directory harv created and then read from. A Manifest arrives from a clone,
+ * so `..` or an absolute path — which would reach outside the checkout — is
+ * refused rather than normalized into something that happens to work.
+ */
+function parseSubdir(subdir: string, where: string): string {
+  const normalized = normalize(subdir);
+  const escapes =
+    isAbsolute(normalized) || normalized === ".." || normalized.startsWith(`..${sep}`);
+  if (escapes) {
+    throw new ManifestError(
+      `${where} has a \`subdir\` that points outside the repository: ${subdir}. ` +
+        `A subdir is a path within the fetched repository, e.g. subdir = "skills/example".`,
+    );
+  }
+  return subdir;
+}
+
+function requireString(value: unknown, key: string, where: string, name: string): string {
+  if (typeof value !== "string" || value.length === 0) {
+    throw new ManifestError(
+      `${where} has a \`${key}\` that is not a non-empty string. ` +
+        `Example: ${name} = { git = "https://example.com/skills.git", subdir = "${name}" }`,
+    );
+  }
+  return value;
 }
 
 const isTable = (value: unknown): value is Record<string, unknown> =>

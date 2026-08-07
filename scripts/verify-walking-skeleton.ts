@@ -163,13 +163,18 @@ interface Fixtures {
   fakeClaudeDump: string;
 }
 
-function buildFixtures(): Fixtures {
+async function buildFixtures(): Promise<Fixtures> {
   rmSync(FIXTURE_ROOT, { recursive: true, force: true });
   const dir = (...parts: string[]) => {
     const p = join(FIXTURE_ROOT, ...parts);
     mkdirSync(p, { recursive: true });
     return p;
   };
+
+  // Every `harv` below inherits this, so the Store this run touches is the
+  // fixture's own. These skills come from local paths and so never reach it,
+  // but the isolation should not depend on that staying true.
+  process.env.HARV_HOME = dir("harv-home");
 
   const project = dir("project");
   for (const name of DECLARED_SKILLS) {
@@ -182,6 +187,12 @@ function buildFixtures(): Fixtures {
     join(project, "harvenv.toml"),
     `[skills]\n${DECLARED_SKILLS.map((n) => `${n} = { path = "vendor/${n}" }`).join("\n")}\n`,
   );
+
+  // The Launcher reads a Lockfile and refuses to start a drifted Harvenv, so a
+  // project has to be synced before it can be launched — which is the user's
+  // first step too, right after cloning.
+  const synced = await harv(["sync"], project);
+  if (synced.code !== 0) throw new Error(`\`harv sync\` failed on the fixture: ${synced.stderr.trim()}`);
 
   // `bare` sits under the fixture root, which has no Manifest above it either.
   const bare = dir("bare");
@@ -587,7 +598,7 @@ async function main(): Promise<number> {
   const keep = process.argv.includes("--keep");
   const log = asJson ? () => {} : console.log;
 
-  const fx = buildFixtures();
+  const fx = await buildFixtures();
   log("harvenv walking-skeleton verification");
   log(`${DIM}fixtures: ${FIXTURE_ROOT}${RESET}`);
 
