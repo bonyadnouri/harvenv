@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "verify:launch-recipe": "node scripts/verify-launch-recipe.ts",
     "verify:skeleton": "node scripts/verify-walking-skeleton.ts",
+    "verify:sync": "node scripts/verify-sync-store.ts",
     "build": "bun build --compile bin/harv.ts --outfile dist/harv"
   },
   "dependencies": {

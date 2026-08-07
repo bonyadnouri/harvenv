@@ -44,7 +44,9 @@ test("buildLaunchArgs appends extra arguments after the recipe, unchanged", () =
 
 test("buildLaunchArgs never serves skills through --plugin-dir", () => {
   const manifest = manifestWith();
-  manifest.skills = [{ name: "example-skill", path: "/store/example-skill" }];
+  manifest.skills = [
+    { name: "example-skill", source: { kind: "git", repo: "https://example.com/s.git" } },
+  ];
 
   assert.equal(buildLaunchArgs(manifest, []).includes("--plugin-dir"), false);
 });

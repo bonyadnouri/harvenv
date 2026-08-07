@@ -1,11 +1,11 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import type { Manifest } from "../src/manifest.ts";
 import { run } from "../src/cli.ts";
-import { tempDir } from "./helpers.ts";
+import { commitFiles, gitRepo, skillFile, tempDir } from "./helpers.ts";
 
 interface Recorded {
   exit: number;
@@ -14,27 +14,30 @@ interface Recorded {
   launched: Array<{ manifest: Manifest; passthrough: string[] }>;
 }
 
-/** Run the CLI against a scratch project, capturing everything it emits. */
-async function cli(argv: string[], cwd: string, exitCode = 0): Promise<Recorded> {
+/** One project, one Store, one CLI — reused across the calls of a single test. */
+function harv(cwd: string, exitCode = 0) {
+  const store = tempDir();
   const launched: Recorded["launched"] = [];
-  let out = "";
-  let err = "";
 
-  const exit = await run(argv, {
-    cwd,
-    stdout: (line) => {
-      out += `${line}\n`;
-    },
-    stderr: (line) => {
-      err += `${line}\n`;
-    },
-    launch: async (manifest, passthrough) => {
-      launched.push({ manifest, passthrough });
-      return exitCode;
-    },
-  });
-
-  return { exit, out, err, launched };
+  return async (argv: string[], from = cwd): Promise<Recorded> => {
+    let out = "";
+    let err = "";
+    const exit = await run(argv, {
+      cwd: from,
+      env: { HARV_HOME: store },
+      stdout: (line) => {
+        out += `${line}\n`;
+      },
+      stderr: (line) => {
+        err += `${line}\n`;
+      },
+      launch: async (manifest, passthrough) => {
+        launched.push({ manifest, passthrough });
+        return exitCode;
+      },
+    });
+    return { exit, out, err, launched };
+  };
 }
 
 /** A project with a Manifest declaring one local skill that really exists. */
@@ -42,10 +45,7 @@ function project(manifestBody?: string): string {
   const root = tempDir();
   const skill = join(root, "vendor", "example-skill");
   mkdirSync(skill, { recursive: true });
-  writeFileSync(
-    join(skill, "SKILL.md"),
-    "---\nname: example-skill\ndescription: Fixture skill for harvenv tests.\n---\n\nMarker.\n",
-  );
+  writeFileSync(join(skill, "SKILL.md"), skillFile("example-skill"));
   writeFileSync(
     join(root, "harvenv.toml"),
     manifestBody ?? '[skills]\nexample-skill = { path = "vendor/example-skill" }\n',
@@ -53,10 +53,16 @@ function project(manifestBody?: string): string {
   return root;
 }
 
+const manifestText = (root: string) => readFileSync(join(root, "harvenv.toml"), "utf8");
+
+// ---------------------------------------------------------------------------
+// harv claude
+// ---------------------------------------------------------------------------
+
 test("harv claude outside a harvenv project fails with a clear no-Manifest error", async () => {
   const empty = tempDir();
 
-  const { exit, err, launched } = await cli(["claude"], empty);
+  const { exit, err, launched } = await harv(empty)(["claude"]);
 
   assert.notEqual(exit, 0);
   assert.match(err, /no Manifest found/i);
@@ -65,10 +71,12 @@ test("harv claude outside a harvenv project fails with a clear no-Manifest error
   assert.deepEqual(launched, [], "nothing is launched without a Manifest");
 });
 
-test("harv claude launches from a Manifest-bearing project", async () => {
+test("harv claude launches from a synced project", async () => {
   const root = project();
+  const cli = harv(root);
+  await cli(["sync"]);
 
-  const { exit, launched } = await cli(["claude"], root);
+  const { exit, launched } = await cli(["claude"]);
 
   assert.equal(exit, 0);
   assert.equal(launched.length, 1);
@@ -78,8 +86,11 @@ test("harv claude launches from a Manifest-bearing project", async () => {
 
 test("harv claude materializes declared skills before launching", async () => {
   const root = project();
+  const cli = harv(root);
+  await cli(["sync"]);
+  rmSync(join(root, ".claude"), { recursive: true, force: true });
 
-  await cli(["claude"], root);
+  await cli(["claude"]);
 
   assert.equal(existsSync(join(root, ".claude", "skills", "example-skill", "SKILL.md")), true);
 });
@@ -88,6 +99,8 @@ test("harv claude works from a subdirectory of the project", async () => {
   const root = project();
   const nested = join(root, "src", "deep");
   mkdirSync(nested, { recursive: true });
+  const cli = harv(root);
+  await cli(["sync"]);
 
   const { launched } = await cli(["claude"], nested);
 
@@ -95,48 +108,56 @@ test("harv claude works from a subdirectory of the project", async () => {
 });
 
 test("harv claude passes extra arguments through to claude", async () => {
-  const root = project();
+  const cli = harv(project());
+  await cli(["sync"]);
 
-  const { launched } = await cli(["claude", "-p", "hi", "--resume"], root);
+  const { launched } = await cli(["claude", "-p", "hi", "--resume"]);
 
   assert.deepEqual(launched[0]?.passthrough, ["-p", "hi", "--resume"]);
 });
 
 test("harv claude adopts claude's exit code", async () => {
-  const { exit } = await cli(["claude"], project(), 42);
+  const cli = harv(project(), 42);
+  await cli(["sync"]);
 
-  assert.equal(exit, 42);
+  assert.equal((await cli(["claude"])).exit, 42);
 });
 
-test("harv reports a broken Manifest without a stack trace", async () => {
-  const root = project('[skills]\nexample-skill = { git = "https://example.com/s.git" }\n');
+test("harv claude refuses to launch a project that was never synced, naming the skill", async () => {
+  const root = project();
 
-  const { exit, err } = await cli(["claude"], root);
+  const { exit, err, launched } = await harv(root)(["claude"]);
 
   assert.notEqual(exit, 0);
-  assert.match(err, /cannot fetch yet/);
-  assert.doesNotMatch(err, /at .*\.ts:\d+/, "no stack trace leaks to the user");
+  assert.match(err, /example-skill/);
+  assert.match(err, /harv sync/);
+  assert.deepEqual(launched, [], "a drifted Harvenv is not the one the Manifest describes");
 });
 
-test("harv with no subcommand prints usage and fails", async () => {
-  const { exit, err } = await cli([], tempDir());
+test("harv claude refuses to launch once the Manifest has moved past the Lockfile", async () => {
+  const repo = gitRepo({ "SKILL.md": skillFile("example") });
+  const root = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
+  const cli = harv(root);
+  await cli(["sync"]);
+
+  writeFileSync(join(root, "harvenv.toml"), `[skills]\nexample = { git = "${repo.url}", ref = "main" }\n`);
+  const { exit, err, launched } = await cli(["claude"]);
 
   assert.notEqual(exit, 0);
-  assert.match(err, /usage/i);
+  assert.match(err, /drift/i);
+  assert.match(err, /example/);
+  assert.match(err, /harv sync/);
+  assert.deepEqual(launched, []);
 });
 
-test("harv rejects an unknown subcommand by name", async () => {
-  const { exit, err } = await cli(["sync"], tempDir());
+test("harv claude launches a Manifest that declares nothing but settings", async () => {
+  const root = tempDir();
+  writeFileSync(join(root, "harvenv.toml"), '[settings]\nmodel = "opus"\n');
 
-  assert.notEqual(exit, 0);
-  assert.match(err, /sync/);
-});
-
-test("harv --help prints usage and succeeds", async () => {
-  const { exit, out } = await cli(["--help"], tempDir());
+  const { exit, launched } = await harv(root)(["claude"]);
 
   assert.equal(exit, 0);
-  assert.match(out, /usage/i);
+  assert.equal(launched.length, 1);
 });
 
 test("harv claude rejects unusable settings before writing anything into the project", async () => {
@@ -144,10 +165,297 @@ test("harv claude rejects unusable settings before writing anything into the pro
     '[skills]\nexample-skill = { path = "vendor/example-skill" }\n\n[settings.permissions]\ndefaultMode = "manual"\n',
   );
 
-  const { exit, err, launched } = await cli(["claude"], root);
+  const { exit, err, launched } = await harv(root)(["claude"]);
 
   assert.notEqual(exit, 0);
   assert.match(err, /manual/);
   assert.deepEqual(launched, []);
   assert.equal(existsSync(join(root, ".claude")), false, "the project tree is untouched when launch cannot succeed");
+});
+
+// ---------------------------------------------------------------------------
+// harv sync
+// ---------------------------------------------------------------------------
+
+test("harv sync writes a Lockfile pinning the commit and content hash of a git Source", async () => {
+  const repo = gitRepo({ "SKILL.md": skillFile("example") });
+  const root = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
+
+  const { exit } = await harv(root)(["sync"]);
+
+  assert.equal(exit, 0);
+  const lock = readFileSync(join(root, "harvenv.lock"), "utf8");
+  assert.match(lock, new RegExp(`commit = "${repo.commit}"`));
+  assert.match(lock, /hash = "sha256:[0-9a-f]{64}"/);
+});
+
+test("harv sync says what it fetched and what it reused", async () => {
+  const repo = gitRepo({ "SKILL.md": skillFile("example") });
+  const cli = harv(project(`[skills]\nexample = { git = "${repo.url}" }\n`));
+
+  const first = await cli(["sync"]);
+  const second = await cli(["sync"]);
+
+  assert.match(first.out, /fetched/i);
+  assert.match(first.out, /example/);
+  assert.match(second.out, /reused|up to date/i);
+});
+
+test("harv sync warns on stderr that a path Source is not portable, naming the entry", async () => {
+  const { out, err, exit } = await harv(project())(["sync"]);
+
+  assert.equal(exit, 0, "a non-portable Source is a warning, not a failure");
+  assert.match(err, /example-skill/);
+  assert.match(err, /vendor\/example-skill/);
+  assert.doesNotMatch(out, /warning/i, "warnings belong on stderr");
+});
+
+test("harv sync reports the drift it is resolving", async () => {
+  const repo = gitRepo({ "SKILL.md": skillFile("example") });
+  const cli = harv(project(`[skills]\nexample = { git = "${repo.url}" }\n`));
+
+  const { out } = await cli(["sync"]);
+
+  assert.match(out, /example/);
+});
+
+test("harv sync rejects arguments rather than silently ignoring them", async () => {
+  const { exit, err } = await harv(project())(["sync", "--update"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /--update/);
+});
+
+test("harv sync outside a harvenv project fails with the same clear error as claude", async () => {
+  const { exit, err } = await harv(tempDir())(["sync"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /no Manifest found/i);
+});
+
+test("harv sync reports a fetch failure without a stack trace", async () => {
+  const root = project('[skills]\nexample = { git = "file:///harvenv/not/a/repo" }\n');
+
+  const { exit, err } = await harv(root)(["sync"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /not\/a\/repo/);
+  assert.doesNotMatch(err, /at .*\.ts:\d+/, "no stack trace leaks to the user");
+});
+
+// ---------------------------------------------------------------------------
+// harv add
+// ---------------------------------------------------------------------------
+
+test("harv add appends a git entry to the Manifest and syncs it", async () => {
+  const repo = gitRepo({ "SKILL.md": skillFile("example") });
+  const root = tempDir();
+  writeFileSync(join(root, "harvenv.toml"), "");
+
+  const { exit } = await harv(root)(["add", "example", "--git", repo.url]);
+
+  assert.equal(exit, 0);
+  assert.match(manifestText(root), new RegExp(`example = \\{ git = "${repo.url}" \\}`));
+  assert.equal(existsSync(join(root, ".claude", "skills", "example", "SKILL.md")), true);
+  assert.match(readFileSync(join(root, "harvenv.lock"), "utf8"), new RegExp(repo.commit));
+});
+
+test("harv add adds to an existing [skills] table, leaving the rest of the Manifest alone", async () => {
+  const repo = gitRepo({ "SKILL.md": skillFile("added") });
+  const root = project();
+
+  await harv(root)(["add", "added", "--git", repo.url]);
+
+  const text = manifestText(root);
+  assert.match(text, /example-skill = \{ path = "vendor\/example-skill" \}/, "the existing entry survives");
+  assert.match(text, /added = \{ git = /);
+  assert.equal(text.match(/\[skills\]/g)?.length, 1, "one [skills] table, not two");
+});
+
+test("harv add keeps a Manifest's comments and settings", async () => {
+  const repo = gitRepo({ "SKILL.md": skillFile("added") });
+  const root = tempDir();
+  writeFileSync(
+    join(root, "harvenv.toml"),
+    '# what this project needs\n[skills]\n\n[settings]\nmodel = "opus"\n',
+  );
+
+  await harv(root)(["add", "added", "--git", repo.url]);
+
+  const text = manifestText(root);
+  assert.match(text, /# what this project needs/);
+  assert.match(text, /model = "opus"/);
+  assert.match(text, /added = \{ git = /);
+  assert.equal(text.indexOf("added ="), text.search(/added =/));
+  assert.equal(text.indexOf("added =") < text.indexOf("[settings]"), true, "the entry lands inside [skills]");
+});
+
+test("harv add reads a ref and a subdirectory out of the coordinate", async () => {
+  const repo = gitRepo({ "skills/example/SKILL.md": skillFile("example") });
+  const root = tempDir();
+  writeFileSync(join(root, "harvenv.toml"), "");
+
+  const { exit, err } = await harv(root)(["add", "example", "--git", `${repo.url}@main#skills/example`]);
+
+  assert.equal(exit, 0, err);
+  assert.match(manifestText(root), /ref = "main"/);
+  assert.match(manifestText(root), /subdir = "skills\/example"/);
+  assert.equal(existsSync(join(root, ".claude", "skills", "example", "SKILL.md")), true);
+});
+
+test("harv add takes the ref and subdirectory as flags too", async () => {
+  const repo = gitRepo({ "skills/example/SKILL.md": skillFile("example") });
+  const root = tempDir();
+  writeFileSync(join(root, "harvenv.toml"), "");
+
+  const { exit, err } = await harv(root)([
+    "add", "example", "--git", repo.url, "--ref", "main", "--subdir", "skills/example",
+  ]);
+
+  assert.equal(exit, 0, err);
+  assert.match(manifestText(root), /ref = "main"/);
+  assert.match(manifestText(root), /subdir = "skills\/example"/);
+});
+
+test("harv add leaves an SSH coordinate's user@host alone", async () => {
+  const root = tempDir();
+  writeFileSync(join(root, "harvenv.toml"), "");
+
+  // Unreachable on purpose: what the entry says is the point, not the fetch.
+  const { err } = await harv(root)(["add", "example", "--git", "git@github.com:owner/repo.git"]);
+
+  assert.match(err, /git@github\.com:owner\/repo\.git/, "the coordinate is reported whole");
+  assert.doesNotMatch(err, /ref/, "no ref was invented from the user@host");
+});
+
+test("harv add refuses a name the Manifest already declares", async () => {
+  const root = project();
+
+  const { exit, err } = await harv(root)(["add", "example-skill", "--git", "https://example.com/s.git"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /already/);
+  assert.match(manifestText(root), /path = "vendor\/example-skill"/, "the Manifest is not touched");
+});
+
+test("harv add refuses a name that would escape the skills directory", async () => {
+  const root = project();
+
+  const { exit, err } = await harv(root)(["add", "../agents", "--git", "https://example.com/s.git"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /name/i);
+  assert.doesNotMatch(manifestText(root), /agents/);
+});
+
+test("harv add refuses to declare two Sources at once", async () => {
+  const root = project();
+
+  const { exit, err } = await harv(root)([
+    "add", "thing", "--git", "https://example.com/s.git", "--path", "vendor/thing",
+  ]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /--git/);
+  assert.match(err, /--path/);
+});
+
+test("harv add needs a Source", async () => {
+  const { exit, err } = await harv(project())(["add", "thing"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /--git/);
+});
+
+test("harv add needs a name", async () => {
+  const { exit, err } = await harv(project())(["add", "--git", "https://example.com/s.git"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /name/i);
+});
+
+test("harv add declares a local path when asked, warning that it is not portable", async () => {
+  const root = project();
+  mkdirSync(join(root, "vendor", "local-thing"), { recursive: true });
+  writeFileSync(join(root, "vendor", "local-thing", "SKILL.md"), skillFile("local-thing"));
+
+  const { exit, err } = await harv(root)(["add", "local-thing", "--path", "vendor/local-thing"]);
+
+  assert.equal(exit, 0);
+  assert.match(manifestText(root), /local-thing = \{ path = "vendor\/local-thing" \}/);
+  assert.match(err, /local-thing/);
+});
+
+test("harv add leaves the Manifest unchanged when the Source cannot be fetched", async () => {
+  const root = project();
+  const before = manifestText(root);
+
+  const { exit } = await harv(root)(["add", "example", "--git", "file:///harvenv/not/a/repo"]);
+
+  assert.notEqual(exit, 0);
+  assert.equal(manifestText(root), before, "a failed add does not leave a half-declared Manifest");
+});
+
+test("harv add refuses a Manifest whose [skills] it cannot edit safely", async () => {
+  const root = tempDir();
+  writeFileSync(join(root, "harvenv.toml"), 'skills = { example-skill = { path = "vendor/x" } }\n');
+
+  const { exit, err } = await harv(root)(["add", "thing", "--git", "https://example.com/s.git"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /by hand/i);
+});
+
+// ---------------------------------------------------------------------------
+// harv itself
+// ---------------------------------------------------------------------------
+
+test("harv with no subcommand prints usage and fails", async () => {
+  const { exit, err } = await harv(tempDir())([]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /usage/i);
+});
+
+test("harv rejects an unknown subcommand by name", async () => {
+  const { exit, err } = await harv(tempDir())(["frobnicate"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /frobnicate/);
+});
+
+test("harv --help lists every command it has", async () => {
+  const { exit, out } = await harv(tempDir())(["--help"]);
+
+  assert.equal(exit, 0);
+  assert.match(out, /usage/i);
+  for (const command of ["sync", "add", "claude"]) assert.match(out, new RegExp(`\\b${command}\\b`));
+});
+
+test("harv reports a broken Manifest without a stack trace", async () => {
+  const root = project('[skills]\nexample-skill = { marketplace = "vendor/pack" }\n');
+
+  const { exit, err } = await harv(root)(["sync"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /cannot fetch yet/);
+  assert.doesNotMatch(err, /at .*\.ts:\d+/, "no stack trace leaks to the user");
+});
+
+test("a Lockfile survives a fresh clone: sync, wipe the Store and the tree, sync again", async () => {
+  const repo = gitRepo({ "SKILL.md": skillFile("example", "First.\n") });
+  const root = project(`[skills]\nexample = { git = "${repo.url}" }\n`);
+  const cli = harv(root);
+  await cli(["sync"]);
+  const lock = readFileSync(join(root, "harvenv.lock"), "utf8");
+  const materialized = readFileSync(join(root, ".claude", "skills", "example", "SKILL.md"), "utf8");
+
+  // What a teammate's clone looks like — plus a repository that moved on.
+  commitFiles(repo.dir, { "SKILL.md": skillFile("example", "Second.\n") }, "second");
+  rmSync(join(root, ".claude"), { recursive: true, force: true });
+  const clone = harv(root);
+  await clone(["sync"]);
+
+  assert.equal(readFileSync(join(root, ".claude", "skills", "example", "SKILL.md"), "utf8"), materialized);
+  assert.equal(readFileSync(join(root, "harvenv.lock"), "utf8"), lock);
 });
