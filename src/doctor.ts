@@ -36,8 +36,7 @@
  * teach everyone to stop running Doctor.
  */
 
-import { existsSync, readFileSync } from "node:fs";
-import { accessSync, constants } from "node:fs";
+import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 
 import { driftAgainst, driftOver, LOCKFILE_FILENAME, LockfileError, readLockfile, toolDrift } from "./lockfile.ts";
@@ -590,14 +589,18 @@ function checkToolchain(
     // ADR 0006's honest degradation path: harv could not scope this one, so the
     // machine's own copy is what a session gets. That is only survivable if the
     // machine has one.
-    const found = findOnPath(binaryFor(tool.tool), search);
+    const command = binaryFor(tool.tool);
+    // Named when it differs from the tool, because then it is a guess and the
+    // reader is the one who can tell whether harv guessed right.
+    const looked = command === tool.tool ? "" : ` (harv looked for \`${command}\`)`;
+    const found = findOnPath(command, search);
     if (found !== null) {
       degraded.push(tool.tool);
       findings.push({
         level: "note",
         message:
-          `\`${tool.tool}\` could not be scoped to this project, so sessions will use the machine's own: ${found}. ` +
-          sentence(tool.hint),
+          `\`${tool.tool}\` could not be scoped to this project, so sessions will use the machine's own: ` +
+          `${found}${looked}. ${sentence(tool.hint)}`.trimEnd(),
       });
       continue;
     }
@@ -605,8 +608,8 @@ function checkToolchain(
     findings.push({
       level: "problem",
       message:
-        `\`${tool.tool}\` could not be scoped to this project and is not on your PATH either, so the skill that ` +
-        `needs it will fail at the moment it runs. ${sentence(tool.hint)}`.trimEnd(),
+        `\`${tool.tool}\` could not be scoped to this project and is not on your PATH either${looked}, so the skill ` +
+        `that needs it will fail at the moment it runs. ${sentence(tool.hint)}`.trimEnd(),
       hint: `Install ${tool.tool} the way this machine normally would, or pin a version harv can install in [tools].`,
     });
   }
