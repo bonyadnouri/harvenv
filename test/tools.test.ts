@@ -335,3 +335,55 @@ test("a Harvenv that needs no tools never looks for an engine", () => {
 
   assert.deepEqual(resolveToolchain([], locked(), mise).tools, []);
 });
+
+// ---------------------------------------------------------------------------
+// What a Sync must never destroy
+// ---------------------------------------------------------------------------
+
+test("a machine with no engine keeps the team's pin rather than replacing it with a hint", () => {
+  const pin = { tool: "node", spec: "22", version: "22.18.0", bins: ["installs/node/22.18.0/bin"] };
+  const mise = engine({
+    findMise: () => ({ unavailable: "no vendored mise for this platform" }),
+    hasBins: () => false,
+  });
+
+  const result = resolveToolchain([{ tool: "node", spec: "22", from: "the Manifest" }], locked(pin), mise);
+
+  // Written back unchanged: this Sync cannot install it, but the pin is a
+  // committed decision and erasing it would delete it for the whole team.
+  assert.deepEqual(result.tools, [pin]);
+  assert.deepEqual(result.unscopeable, ["node"]);
+});
+
+test("a tool that was never pinned still degrades to a hint when there is no engine", () => {
+  const mise = engine({ findMise: () => ({ unavailable: "none" }), hasBins: () => false });
+
+  const result = resolveToolchain([{ tool: "node", spec: "22", from: "the Manifest" }], locked(), mise);
+
+  assert.deepEqual(result.tools[0]?.version, undefined);
+  assert.match(result.tools[0]?.hint ?? "", /node/);
+});
+
+test("a pin for a spec the Manifest has moved past is not preserved", () => {
+  const mise = engine({ findMise: () => ({ unavailable: "none" }), hasBins: () => false });
+
+  const result = resolveToolchain(
+    [{ tool: "node", spec: "24", from: "the Manifest" }],
+    locked({ tool: "node", spec: "22", version: "22.18.0", bins: ["installs/node/22.18.0/bin"] }),
+    mise,
+  );
+
+  assert.deepEqual(result.tools[0]?.version, undefined, "the old spec's pin is not what the Manifest now asks for");
+});
+
+test("a tool that contributes no bin directory is a hint, not a pin harv cannot read back", () => {
+  const mise = engine({ binPaths: () => [] });
+
+  const result = resolveToolchain([{ tool: "oddity", spec: "1", from: "the Manifest" }], locked(), mise);
+
+  assert.deepEqual(result.tools[0]?.version, undefined);
+  assert.deepEqual(result.tools[0]?.bins, undefined);
+  assert.deepEqual(result.installed, []);
+  assert.deepEqual(result.unscopeable, ["oddity"]);
+  assert.match(result.tools[0]?.hint ?? "", /no directory harv can put on a session's PATH/);
+});

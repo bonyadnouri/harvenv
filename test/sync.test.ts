@@ -12,6 +12,7 @@ import type { Env } from "../src/store.ts";
 import { composeSession, NO_OVERLAY } from "../src/overlay.ts";
 import { plan, readLocks, sync, SyncError, toolPaths } from "../src/sync.ts";
 import type { SyncDeps } from "../src/sync.ts";
+import { ToolchainError } from "../src/tools.ts";
 import type { ToolchainDeps } from "../src/tools.ts";
 import {
   commitFiles,
@@ -743,4 +744,33 @@ test("toolPaths tells the user to sync when the Store does not hold what the Loc
     () => toolPaths(readLockfile(manifest.root), env),
     (err: Error) => err instanceof SyncError && err.message.includes("harv sync"),
   );
+});
+
+test("a clone onto a machine with no engine leaves the committed tool pin intact", () => {
+  const env = home();
+  const manifest = project(`[tools]\nnode = "22"\n`);
+  const committed =
+    `version = 1\nskills = []\n\n[[tools]]\nname = "node"\nspec = "22"\nversion = "22.18.0"\n` +
+    `bins = ["installs/node/22.18.0/bin"]\n`;
+  writeFileSync(join(manifest.root, "harvenv.lock"), committed);
+
+  // An empty Store and nothing to install with: the worst case for a pin.
+  sync(solo(manifest), { env, toolchain: { findMise: () => ({ unavailable: "no vendored mise" }) } });
+
+  assert.deepEqual(readLockfile(manifest.root)?.tools, [
+    { tool: "node", spec: "22", version: "22.18.0", bins: ["installs/node/22.18.0/bin"] },
+  ]);
+});
+
+test("two skills that contradict each other stop a Sync before it writes into the project", () => {
+  const env = home();
+  const alpha = gitRepo({ "SKILL.md": `---\nname: alpha\ndescription: F.\nrequires: node@22\n---\n\nB.\n` });
+  const beta = gitRepo({ "SKILL.md": `---\nname: beta\ndescription: F.\nrequires: node@24\n---\n\nB.\n` });
+  const manifest = project(
+    `[skills]\nalpha = { git = "${alpha.url}" }\nbeta = { git = "${beta.url}" }\n`,
+  );
+
+  assert.throws(() => sync(solo(manifest), { ...counting(env), toolchain: fakeEngine(env) }), ToolchainError);
+  assert.equal(existsSync(skillsDir(manifest.root)), false, "no Component was linked into a Harvenv that cannot sync");
+  assert.equal(existsSync(join(manifest.root, "harvenv.lock")), false);
 });

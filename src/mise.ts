@@ -197,9 +197,11 @@ function unpack(sources: MiseSources): string {
 export function runMise(args: string[]): Promise<number> {
   const bin = miseBinary();
   return new Promise((resolveExit, reject) => {
-    // Isolated like every other invocation: this is an escape hatch onto the
-    // engine, not a way around the promise that harv leaves the machine alone.
-    const child = spawn(bin, args, { stdio: "inherit", env: { ...process.env, ...miseEnv() } });
+    // Isolated like every other invocation — same environment and same neutral
+    // working directory. This is an escape hatch onto the engine, not a way
+    // around the promise that harv leaves the machine alone, and a diagnosis
+    // that answered differently from `harv sync` would be worse than none.
+    const child = spawn(bin, args, { stdio: "inherit", cwd: neutralCwd(), env: { ...process.env, ...miseEnv() } });
     child.on("error", reject);
     child.on("exit", (code, signal) => resolveExit(signal ? 128 : (code ?? 0)));
   });
@@ -242,6 +244,18 @@ export function miseEnv(env: Env = process.env): Record<string, string> {
 }
 
 /**
+ * A directory with nothing in it, inside harv's home. Every invocation runs
+ * from here rather than from the project, because mise's normal job is to
+ * notice the `mise.toml` in your working directory — and a session's Toolchain
+ * has to come from the Manifest alone.
+ */
+function neutralCwd(env: Env = process.env): string {
+  const cwd = join(harvHome(env), "mise-work", "cwd");
+  mkdirSync(cwd, { recursive: true });
+  return cwd;
+}
+
+/**
  * The engine, or the reason there isn't one.
  *
  * A source checkout that has not run `scripts/vendor-mise.ts` has no mise, and
@@ -279,11 +293,8 @@ interface Completed {
  * tree, and a session's Toolchain has to come from the Manifest alone.
  */
 export function captureMise(bin: string, args: string[], env: Env = process.env): Completed {
-  const cwd = join(harvHome(env), "mise-work", "cwd");
-  mkdirSync(cwd, { recursive: true });
-
   const result = spawnSync(bin, args, {
-    cwd,
+    cwd: neutralCwd(env),
     encoding: "utf8",
     env: { ...process.env, ...miseEnv(env) } as NodeJS.ProcessEnv,
     // A tool that builds from source can take minutes; a tool that hangs must

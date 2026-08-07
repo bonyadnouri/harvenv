@@ -190,21 +190,22 @@ export function sync(session: Session, deps: Partial<SyncDeps> = {}): SyncResult
     const servers = declaredMcpServers(path);
     if (servers.length > 0) result.warnings.push(unservedMcp(plugin.name, servers));
   }
+  // Read before anything is written into the project tree. A `requires`
+  // declaration travels inside a skill, so this cannot happen until the skills
+  // are fetched (ADR 0006) — but it needs the fetched directories, not the
+  // materialized links, so two Components that contradict each other are caught
+  // while the tree is still untouched.
+  //
+  // Read from the project's own skills, not the Overlay's. What a personal
+  // staple needs is personal, and this Lockfile is committed — a teammate's
+  // Toolchain should not acquire a tool because of somebody's staples (ADR 0013).
+  const required = requirements(manifest, own.resolved);
 
   // Materialization runs before the Lockfile is written: it is the step that
   // validates each fetched tree really is the Component its key names
   // (ADR 0008), and a Lockfile is a promise that should not outlive a failed one.
   result.materialized = materialize({ root: manifest.root, skills: resolved, plugins });
 
-  // The Toolchain comes last because it is the only step that needs the
-  // Components themselves: a `requires` declaration travels inside a skill, so
-  // it cannot be read until that skill has been fetched (ADR 0006).
-  //
-  // Read from the project's own skills, not the Overlay's. What a personal
-  // staple needs is personal, and this Lockfile is committed — a teammate's
-  // Toolchain should not acquire a tool because of somebody's staples
-  // (ADR 0013).
-  const required = requirements(manifest, own.resolved);
   result.drift.push(...toolDrift(required, lock));
   result.toolchain = resolveToolchain(
     required,

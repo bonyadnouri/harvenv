@@ -246,8 +246,19 @@ export function resolveToolchain(
   if (engine.bin === undefined) {
     // No engine on this machine: what is left degrades at once, and says so
     // once rather than once per tool.
+    //
+    // A pin the Lockfile already carries is kept rather than replaced by the
+    // hint. This Sync cannot install it, but it is a committed decision made on
+    // a machine that could — and a Sync that overwrote it would quietly delete
+    // the team's version the first time someone cloned the repo onto a machine
+    // with no installer.
     for (const requirement of outstanding) {
-      result.tools.push({ tool: requirement.tool, spec: requirement.spec, hint: noEngineHint(requirement) });
+      const pin = pinFor(requirement, locked.get(requirement.tool));
+      result.tools.push(
+        pin?.version === undefined
+          ? { tool: requirement.tool, spec: requirement.spec, hint: noEngineHint(requirement) }
+          : pin,
+      );
       result.unscopeable.push(requirement.tool);
     }
     result.warnings.push(
@@ -264,24 +275,32 @@ export function resolveToolchain(
     const pinned = pinFor(requirement, locked.get(requirement.tool))?.version;
     const version = pinned ?? d.resolveVersion(engine.bin, requirement.tool, requirement.spec, d.env);
     if (version === null) {
-      const hint = unscopeableHint(requirement, d.isKnown(engine.bin, requirement.tool, d.env));
-      result.tools.push({ tool: requirement.tool, spec: requirement.spec, hint });
-      result.unscopeable.push(requirement.tool);
-      result.warnings.push(hint);
+      degrade(result, requirement, unscopeableHint(requirement, d.isKnown(engine.bin, requirement.tool, d.env)));
       continue;
     }
 
     d.install(engine.bin, requirement.tool, version, d.env);
+    const bins = d.binPaths(engine.bin, requirement.tool, version, d.env);
+    if (bins.length === 0) {
+      // Installed, but it contributes no directory to put on a PATH — so there
+      // is nothing to pin. Recording it as scoped would write a Lockfile harv
+      // itself refuses to read back.
+      degrade(result, requirement, noBinsHint(requirement, version));
+      continue;
+    }
+
     result.installed.push(`${requirement.tool}@${version}`);
-    result.tools.push({
-      tool: requirement.tool,
-      spec: requirement.spec,
-      version,
-      bins: d.binPaths(engine.bin, requirement.tool, version, d.env),
-    });
+    result.tools.push({ tool: requirement.tool, spec: requirement.spec, version, bins });
   }
 
   return result;
+}
+
+/** Record a requirement as unscopeable: hinted, named, and never half-pinned. */
+function degrade(result: ToolchainResult, requirement: Requirement, hint: string): void {
+  result.tools.push({ tool: requirement.tool, spec: requirement.spec, hint });
+  result.unscopeable.push(requirement.tool);
+  result.warnings.push(hint);
 }
 
 /**
@@ -302,6 +321,11 @@ const unscopeableHint = (requirement: Requirement, known: boolean): string =>
     : `${requirement.from} needs ${requirement.tool}@${requirement.spec}, which harv has no scoped installer for. ` +
       `Sessions will use whatever ${requirement.tool} is already on your PATH — install it the way your ` +
       `machine normally would.`;
+
+const noBinsHint = (requirement: Requirement, version: string): string =>
+  `${requirement.from} needs ${requirement.tool}@${requirement.spec}, and harv installed ${version} of it, but it ` +
+  `contributes no directory harv can put on a session's PATH. Sessions will use whatever ${requirement.tool} is ` +
+  `already on your PATH.`;
 
 const noEngineHint = (requirement: Requirement): string =>
   `${requirement.from} needs ${requirement.tool}@${requirement.spec}, and this machine has no install engine ` +
