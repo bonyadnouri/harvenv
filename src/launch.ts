@@ -28,6 +28,7 @@ import { spawn } from "node:child_process";
 
 import { generateMcpConfig } from "./mcp.ts";
 import { generateSettings } from "./settings.ts";
+import { LAUNCHER_ENV } from "./tripwire.ts";
 import type { Manifest } from "./manifest.ts";
 
 /**
@@ -55,6 +56,18 @@ export function buildLaunchArgs(
 }
 
 /**
+ * The session's environment: the caller's, plus the marker that tells the
+ * project's Tripwire this session is a Launcher session and needs no warning.
+ *
+ * Additive on purpose. ADR 0003's whole point is that harv does not reach into
+ * how Claude Code finds the user's configuration, so nothing here redirects or
+ * removes anything — it only leaves a note for a hook harv itself planted.
+ */
+export function launchEnv(base: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+  return { ...base, [LAUNCHER_ENV]: "1" };
+}
+
+/**
  * Hand the terminal to Claude Code and adopt its exit code. The session runs
  * from the project root so that project scope — and with it every materialized
  * Component — is the one the Manifest describes, even when harv was invoked
@@ -65,10 +78,15 @@ export function launch(
   passthrough: string[],
   env: NodeJS.ProcessEnv,
 ): Promise<number> {
+  // Marked once, then used for both jobs, so `${VAR}` resolution and the
+  // session still see the same environment — the marker is the only thing
+  // either of them has that the launching shell did not.
+  const sessionEnv = launchEnv(env);
+
   return new Promise((resolveExit, reject) => {
-    const child = spawn("claude", buildLaunchArgs(manifest, passthrough, env), {
+    const child = spawn("claude", buildLaunchArgs(manifest, passthrough, sessionEnv), {
       cwd: manifest.root,
-      env,
+      env: sessionEnv,
       stdio: "inherit",
     });
     child.on("error", reject);

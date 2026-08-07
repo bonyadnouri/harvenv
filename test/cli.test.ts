@@ -8,6 +8,7 @@ import type { Env } from "../src/store.ts";
 import { run } from "../src/cli.ts";
 import { MISE_VERSION, MiseError } from "../src/mise.ts";
 import { currentPlatform } from "../src/platform.ts";
+import { hasTripwire } from "../src/tripwire.ts";
 import { VERSION } from "../src/version.ts";
 import { commitFiles, gitRepo, skillFile, tempDir } from "./helpers.ts";
 
@@ -482,6 +483,72 @@ test("harv add refuses a Manifest whose [skills] it cannot edit safely", async (
 
   assert.notEqual(exit, 0);
   assert.match(err, /by hand/i);
+});
+
+// ---------------------------------------------------------------------------
+// harv init
+// ---------------------------------------------------------------------------
+
+test("harv init scaffolds a project a later harv claude can launch", async () => {
+  const root = tempDir();
+  const cli = harv(root);
+
+  const { exit, out } = await cli(["init"]);
+
+  assert.equal(exit, 0);
+  assert.match(out, /Initialized a Harvenv/);
+  assert.equal(existsSync(join(root, "harvenv.toml")), true);
+  assert.equal(existsSync(join(root, ".gitignore")), true);
+  assert.equal(hasTripwire(JSON.parse(readFileSync(join(root, ".claude", "settings.json"), "utf8"))), true);
+
+  const { exit: launchExit, launched } = await cli(["claude"]);
+  assert.equal(launchExit, 0);
+  assert.equal(launched.length, 1, "the scaffolded Manifest launches");
+});
+
+test("harv init lists what it did to each artifact", async () => {
+  const { out } = await harv(tempDir())(["init"]);
+
+  assert.match(out, /created\s+harvenv\.toml/);
+  assert.match(out, /created\s+\.gitignore/);
+  assert.match(out, /created\s+\.claude\/settings\.json\s+.*Tripwire/);
+});
+
+test("re-running harv init reports it changed nothing", async () => {
+  const root = tempDir();
+  const cli = harv(root);
+  await cli(["init"]);
+
+  const { exit, out } = await cli(["init"]);
+
+  assert.equal(exit, 0);
+  assert.match(out, /Already a harvenv project/);
+  assert.doesNotMatch(out, /created|updated/);
+});
+
+test("harv init reports a settings file it will not rewrite, without a stack trace", async () => {
+  const root = tempDir();
+  mkdirSync(join(root, ".claude"), { recursive: true });
+  writeFileSync(join(root, ".claude", "settings.json"), "{ nope");
+
+  const { exit, err } = await harv(root)(["init"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /not valid JSON/);
+  assert.doesNotMatch(err, /at .*\.ts:\d+/);
+});
+
+test("harv init takes no arguments and says so", async () => {
+  const { exit, err } = await harv(tempDir())(["init", "./somewhere"]);
+
+  assert.equal(exit, 2);
+  assert.match(err, /takes no arguments/);
+});
+
+test("outside a harvenv project, harv names init as the way in", async () => {
+  const { err } = await harv(tempDir())(["claude"]);
+
+  assert.match(err, /harv init/);
 });
 
 // ---------------------------------------------------------------------------
