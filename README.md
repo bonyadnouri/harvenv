@@ -24,7 +24,7 @@ harv --version           # which harv, which mise, and whether you are behind
 
 ## Status
 
-Skills work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, and a GitHub Actions workflow runs that whole path on a clean runner on every push. No Overlay, Toolchain or Doctor yet, and the remaining Components — agents, commands, plugin pins — are still ahead. mise ships inside harv but nothing drives it yet; `harv mise` reaches it for diagnosis.
+Skills and plugin pins work end to end: `harv init` scaffolds a project and plants the Tripwire, skills are declared by git coordinate and plugins by marketplace coordinate, `harv sync` fetches them into a machine-global Store and writes a Lockfile, and `harv claude` launches a hermetic session serving them from it — or a bare `claude` does, if you opt into the Shim. Settings and MCP servers are declared and binding, and a GitHub Actions workflow runs that whole path on a clean runner on every push. No Overlay, Toolchain or Doctor yet, and standalone agents and commands are still ahead. mise ships inside harv but nothing drives it yet; `harv mise` reaches it for diagnosis.
 
 The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their trade-offs live in [docs/adr/](./docs/adr/). The implementation plan is the issue tracker — issues are thin vertical slices in dependency order.
 
@@ -33,7 +33,7 @@ The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their
 `harv init` turns a directory into a harvenv project. It writes three things and overwrites none of them:
 
 - **`harvenv.toml`** — a valid, empty Manifest that documents itself.
-- **`.gitignore` entries** — `.claude/skills/` and `.claude/.harv-materialized.json` are materialized by harv, `.claude/settings.local.json` and `harvenv.local.toml` are personal. None of them belong in a commit. (`harvenv.lock` is not on that list: it is committed.)
+- **`.gitignore` entries** — `.claude/skills/`, `.claude/harv-plugins/` and `.claude/.harv-materialized.json` are materialized by harv, `.claude/settings.local.json` and `harvenv.local.toml` are personal. None of them belong in a commit. (`harvenv.lock` is not on that list: it is committed.)
 - **the Tripwire** in `.claude/settings.json` — the committed warning ([ADR 0012](./docs/adr/0012-tripwire-is-a-self-contained-session-start-hook.md)) that makes a bare `claude` announce it is not isolated:
 
   > ⏵ SessionStart:startup says: harvenv: this session is NOT isolated — it loads your user scope, not the Harvenv that harvenv.toml declares. Run `harv claude` instead, or opt into the harv shim to route plain claude through it here.
@@ -42,13 +42,16 @@ The domain language lives in [CONTEXT.md](./CONTEXT.md); the decisions and their
 
 Init is safe on a project that already has its own `.gitignore` and `.claude/settings.json`: it appends the entries that are missing, merges the Tripwire alongside whatever hooks are already there, and leaves everything else byte-identical. Re-running it changes nothing.
 
-A Manifest declares what the project's Harvenv contains: skills from git repositories, plus the settings and MCP servers the session runs with.
+A Manifest declares what the project's Harvenv contains: skills from git repositories, plugins from marketplaces, plus the settings and MCP servers the session runs with.
 
 ```toml
 # harvenv.toml
 [skills]
 brainstorming = { git = "https://github.com/obra/superpowers.git", ref = "v6.2.0", subdir = "skills/brainstorming" }
 house-style   = { path = "vendor/skills/house-style" }
+
+[plugins]
+gsap-skills = { marketplace = "https://github.com/greensock/gsap-skills.git", ref = "v1.0.0" }
 
 [settings]
 model = "opus"
@@ -73,12 +76,13 @@ Four commands:
 ```
 harv init                # scaffold the Manifest, the gitignore entries and the Tripwire
 harv add brainstorming --git https://github.com/obra/superpowers.git@v6.2.0#skills/brainstorming
+harv add gsap-skills --marketplace https://github.com/greensock/gsap-skills.git@v1.0.0
 harv sync                # resolve every entry into the Store and write harvenv.lock
 harv claude              # a session composed strictly from this Manifest
 harv claude -p "hi"      # anything after `claude` passes through untouched
 ```
 
-`harv add` writes the entry into `[skills]` and syncs it; a coordinate may carry its ref and subdirectory as `@ref` and `#subdir`, or you can pass `--ref` and `--subdir` separately. It edits the Manifest as text, so your comments and ordering survive, and it puts the file back if the Source turns out not to be fetchable.
+`harv add` writes the entry into `[skills]` — or into `[plugins]`, for `--marketplace` — and syncs it; a coordinate may carry its ref and subdirectory as `@ref` and `#subdir`, or you can pass `--ref` and `--subdir` separately. It edits the Manifest as text, so your comments and ordering survive, and it puts the file back if the Source turns out not to be fetchable.
 
 `harv sync` resolves each entry, fetches what the Store does not already hold, and writes `harvenv.lock` pinning both the commit SHA and a hash of the content that commit produced. **Commit the Lockfile** — it is what makes a teammate's Harvenv identical to yours.
 
@@ -102,13 +106,32 @@ Personal-ergonomics keys are the other half of ADR 0005's split, and a Manifest 
 
 A Manifest is committed, so it carries `${VAR}` references rather than credentials. harv resolves them from the environment of whoever is launching, at launch, and never writes the result anywhere: not into the Manifest, not into the project tree, not into a generated file. A reference whose variable is unset fails the launch naming the variable and the server — left to Claude Code, an unset `${VAR}` is substituted as the literal string and the server connects with it ([spike 0002](./docs/spikes/0002-settings-and-mcp-payloads.md), finding 4). One caveat worth knowing: the resolved payload travels in `claude`'s argv, which other processes on the machine can read via `ps`. That is the accepted trade for never writing it down.
 
+### Plugin pins
+
+A `[plugins]` entry pins one plugin out of a marketplace — ADR 0004's native `name@marketplace` coordinate, with the marketplace spelled as what it is underneath: a repository you can clone.
+
+```toml
+[plugins]
+gsap-skills = { marketplace = "https://github.com/greensock/gsap-skills.git", ref = "v1.0.0" }
+```
+
+The key is the plugin's name in that marketplace's `.claude-plugin/marketplace.json`. There is no `subdir`: where a plugin sits inside its marketplace is the marketplace's to state, and harv reads it from the catalogue at the commit it fetched — so a marketplace that reorganizes itself does not break the Manifests that pinned out of it. `harv sync` pins the marketplace commit and a hash of the plugin's own tree, and the Store holds the plugin rather than the catalogue it was listed beside.
+
+**A plugin arrives whole.** Its skills, slash commands, subagents and hooks all load together, and there is no way to take part of one — no `skills = [...]` to narrow it, no way to disable its hooks and keep its skills. That is a property of the mechanism, not a gap in harv: a plugin is one directory that Claude Code loads entire. Pinning one is therefore accepting all of it, its hooks included — and a hook runs commands from the plugin's own tree, so pin plugins you would run code from. Pin a ref you trust, and read what you are pinning.
+
+Everything a plugin carries keeps the plugin's name as a prefix — `gsap-skills:gsap-core`, not `gsap-core`. That is the name the plugin is published under, so unlike skills (which are materialized into project scope precisely to keep their bare names, [ADR 0008](./docs/adr/0008-components-materialized-into-project-scope.md)) the prefix here is correct rather than an artifact of packaging. harv refuses a pin whose key disagrees with the name the plugin publishes, so the Manifest entry and the session's prefix are always the same string.
+
+One part of "whole" is not delivered: a plugin's own MCP servers do **not** reach the session. `--strict-mcp-config` makes the session's servers exactly the ones `[mcp]` declares, which is what keeps your personal servers out ([ADR 0003](./docs/adr/0003-isolation-via-launch-flags.md)), and measurement shows it keeps a plugin's servers out with them. `harv sync` warns by name when a pinned plugin declares one, rather than letting you discover it mid-session; if you want that server, declare it in `[mcp]`, where its command and its `${VAR}` references are visible in the Manifest like every other one.
+
+Pinned plugins are linked under `.claude/harv-plugins/<name>` and served with `--plugin-dir`. The link exists because a plugin with no `.claude-plugin/plugin.json` is named after the directory it is served from, and a Store entry is named after a hash — so harv gives it a directory named what the Manifest calls it. `harv init` gitignores that path along with the others.
+
 ### The Store
 
 Fetched content lands in `~/.harv/store`, addressed by a hash of the tree itself rather than by the commit it came from ([ADR 0010](./docs/adr/0010-store-addressed-by-content-hash.md)). Two projects declaring the same skill share one copy, and the second one syncs with no network access at all — the Lockfile already says which bytes it needs, and the Store either has them or does not. `HARV_HOME` moves the whole thing, which is what CI and the verification scripts use.
 
 A Source declared by `path` is allowed and stays live — it is materialized straight from where it sits, never copied into the Store, so you can develop a skill in-tree. It is also the one thing a clone cannot reproduce, so every Sync warns about it by name.
 
-Materialized skills are harv's to manage: it records what it wrote, removes only what it recorded, and refuses to touch a `.claude/skills/` entry it did not create. `harv init` is what gitignores them.
+Materialized Components are harv's to manage: it records what it wrote, removes only what it recorded, and refuses to touch a `.claude/skills/` or `.claude/harv-plugins/` entry it did not create. `harv init` is what gitignores them.
 
 ## Intercepting a bare `claude`
 
@@ -188,19 +211,25 @@ The fourth does what the second does, for binding settings and MCP definitions �
 node scripts/verify-manifest-settings.ts # exits non-zero if a criterion no longer holds
 ```
 
-The fifth covers `harv init` and the Tripwire: that the scaffolded Manifest really launches, that a bare `claude` session really carries the warning, that a `harv claude` session really does not, and that a second init leaves the project byte-identical:
+The fifth runs a real `harv claude` against a plugin pinned out of a real git marketplace, and confirms that its skills and commands are in the session under the plugin's own name, that the user's own plugins are not, and that a second machine converges on identical bytes from the Lockfile after the marketplace has moved on and relocated the plugin. It also re-measures the three undocumented `--plugin-dir` behaviours the design leans on, recorded in [spike 0003](./docs/spikes/0003-plugin-dir-naming-and-wholeness.md) — where the plugin's name comes from, that its hooks fire, and that its MCP servers do not survive `--strict-mcp-config`:
+
+```
+node scripts/verify-plugin-pins.ts       # needs git and claude
+```
+
+The sixth covers `harv init` and the Tripwire: that the scaffolded Manifest really launches, that a bare `claude` session really carries the warning, that a `harv claude` session really does not, and that a second init leaves the project byte-identical:
 
 ```
 node scripts/verify-tripwire.ts          # exits non-zero if a criterion no longer holds
 ```
 
-The sixth is the CI recipe of [docs/ci.md](./docs/ci.md), executed: it syncs the sample Manifest into an empty Store and launches it against a fixture `$HOME` that has a personal skill, a conflicting `settings.json` and an MCP server planted in it, then checks that the Harvenv is the Manifest and nothing else — the one check that runs on every push to this repository, because it is the only one that needs no credentials. `--project <dir>` points it at your own project instead:
+The seventh is the CI recipe of [docs/ci.md](./docs/ci.md), executed: it syncs the sample Manifest into an empty Store and launches it against a fixture `$HOME` that has a personal skill, a conflicting `settings.json` and an MCP server planted in it, then checks that the Harvenv is the Manifest and nothing else — the one check that runs on every push to this repository, because it is the only one that needs no credentials. `--project <dir>` points it at your own project instead:
 
 ```
 node scripts/verify-ci-recipe.ts         # needs git and network; needs no claude binary and no credentials
 ```
 
-The seventh builds a binary and checks what shipping it promises: that it runs with no Node or Bun anywhere on PATH, that the mise it claims to carry is really inside it and really runs, that each archive matches its published checksum, and — once a release exists — that `install.sh` installs it and that an older build says so:
+The eighth builds a binary and checks what shipping it promises: that it runs with no Node or Bun anywhere on PATH, that the mise it claims to carry is really inside it and really runs, that each archive matches its published checksum, and — once a release exists — that `install.sh` installs it and that an older build says so:
 
 ```
 bun scripts/verify-packaging.ts          # add --all to build every platform
@@ -213,7 +242,7 @@ node scripts/verify-shim.ts              # exits non-zero if interception, unins
                                          # pass-through has stopped holding
 ```
 
-All eight take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your `~/.claude`, or your shell's startup files. The unit tests are separate and need no `claude` binary:
+All nine take `--json` (for Doctor, once it exists) and `--keep` (to leave the fixture tree on disk). None of them touch your Store, your `~/.claude`, or your shell's startup files. The unit tests are separate and need no `claude` binary:
 
 ```
 npm test

@@ -141,22 +141,22 @@ export function fetchSource(source: GitSource, commit: string, env: Env = proces
     // of one commit occupy two addresses.
     rmSync(join(work, ".git"), { recursive: true, force: true });
 
-    return { commit, staged: stage(source, work, scratch) };
+    return { commit, staged: stage(source, work, scratch, source.subdir ?? "") };
   } catch (err) {
     rmSync(scratch, { recursive: true, force: true });
     throw err;
   }
 }
 
-/** Move the declared subdirectory out of the checkout and drop the rest. */
-function stage(source: GitSource, work: string, scratch: string): string {
+/** Move the selected subdirectory out of the checkout and drop the rest. */
+function stage(source: GitSource, work: string, scratch: string, subdir: string): string {
   const staged = join(scratch, "staged");
-  const selected = source.subdir === undefined ? work : join(work, ...source.subdir.split(/[\\/]/));
+  const selected = subdir === "" ? work : join(work, ...subdir.split(/[\\/]/));
 
   if (!isDirectory(selected)) {
     throw new GitError(
-      `${describeSource(source)} has no directory \`${source.subdir}\`. ` +
-        `\`subdir\` names a directory inside the repository at that commit.`,
+      `${describeSource(source)} has no directory \`${subdir}\`. ` +
+        `It names a directory inside the repository at that commit.`,
     );
   }
 

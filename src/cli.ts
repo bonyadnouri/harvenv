@@ -18,11 +18,11 @@
 
 import { readFileSync, writeFileSync } from "node:fs";
 
-import { AddError, entryLine, parseCoordinate, validateName, withEntry } from "./add.ts";
+import { AddError, entryLine, parseCoordinate, tableFor, validateName, withEntry } from "./add.ts";
 import { driftAgainst, LockfileError, readLockfile } from "./lockfile.ts";
 import type { DriftEntry } from "./lockfile.ts";
 import { findManifest, loadManifest, ManifestError, MANIFEST_FILENAME } from "./manifest.ts";
-import type { Manifest, Source } from "./manifest.ts";
+import type { Manifest, MarketplaceSource, Source } from "./manifest.ts";
 import { materialize, MaterializeError } from "./materialize.ts";
 import { launch as launchSession, LaunchError } from "./launch.ts";
 import { McpError, validateMcpServers } from "./mcp.ts";
@@ -41,6 +41,7 @@ import {
   type ShimContext,
 } from "./shim.ts";
 import { TripwireError } from "./tripwire.ts";
+import { MarketplaceError } from "./marketplace.ts";
 import { plan, sync, SyncError } from "./sync.ts";
 import type { Env } from "./store.ts";
 import { defaultUpdateCheckDeps, isDevBuild, updateHint, VERSION } from "./version.ts";
@@ -79,6 +80,10 @@ Commands:
   add <name> --path <dir>
                      Declare a skill in the Manifest and sync it. A coordinate
                      may carry its ref and subdirectory: repo.git@v1#skills/x
+  add <name> --marketplace <coordinate> [--ref <ref>]
+                     Pin the plugin <name> from a marketplace repository. A
+                     plugin arrives whole — its skills, commands, subagents and
+                     hooks all load, under the plugin's own name.
   claude [args...]   Start a Claude Code session composed strictly from this
                      project's Harvenv. Arguments after \`claude\` are passed
                      through unchanged (harv claude -p "hi", --resume, ...).
@@ -102,6 +107,7 @@ harv reads ${MANIFEST_FILENAME} from the current directory or the nearest ancest
 const EXPECTED_ERRORS = [
   ManifestError,
   MaterializeError,
+  MarketplaceError,
   SettingsError,
   LaunchError,
   McpError,
@@ -286,7 +292,8 @@ function add(args: string[], deps: CliDeps): number {
 
   const name = validateName(args[0]);
   const source = sourceFrom(args.slice(1), name);
-  if (manifest.skills.some((skill) => skill.name === name)) {
+  const declared = [...manifest.skills, ...manifest.plugins].find((entry) => entry.name === name);
+  if (declared !== undefined) {
     throw new AddError(
       `\`${name}\` is already declared in ${manifest.path}. ` +
         `Edit that entry, or remove it and run \`harv add\` again.`,
@@ -294,7 +301,7 @@ function add(args: string[], deps: CliDeps): number {
   }
 
   const before = readFileSync(manifest.path, "utf8");
-  writeFileSync(manifest.path, withEntry(before, entryLine(name, source)));
+  writeFileSync(manifest.path, withEntry(before, entryLine(name, source), tableFor(source)));
 
   try {
     // Reloaded rather than patched in memory: the entry now has to survive the
@@ -309,33 +316,47 @@ function add(args: string[], deps: CliDeps): number {
   return 0;
 }
 
-function sourceFrom(args: string[], name: string): Source {
+function sourceFrom(args: string[], name: string): Source | MarketplaceSource {
   const flags = parseFlags(args);
-  const git = flags.get("--git");
-  const path = flags.get("--path");
-
-  if (git !== undefined && path !== undefined) {
-    throw new AddError("`--git` and `--path` are two different Sources. Pass one.");
+  const given = SOURCE_FLAGS.filter((flag) => flags.has(flag));
+  if (given.length > 1) {
+    throw new AddError(`\`${given.join("` and `")}\` are different Sources. Pass one.`);
   }
+  if (given.length === 0) {
+    throw new AddError(
+      `\`harv add ${name}\` needs a Source: \`--git <coordinate>\` for a repository, ` +
+        `\`--marketplace <coordinate>\` for a plugin, or \`--path <dir>\` for a local directory.`,
+    );
+  }
+
+  const path = flags.get("--path");
   if (path !== undefined) {
     for (const flag of ["--ref", "--subdir"]) {
       if (flags.has(flag)) throw new AddError(`\`${flag}\` describes a repository, and \`--path\` is not one.`);
     }
     return { kind: "path", declared: path, path };
   }
-  if (git === undefined) {
-    throw new AddError(
-      `\`harv add ${name}\` needs a Source: \`--git <coordinate>\` for a repository, or \`--path <dir>\` ` +
-        `for a local directory.`,
-    );
-  }
 
-  const coordinate = parseCoordinate(git);
+  const marketplace = flags.get("--marketplace");
+  const coordinate = parseCoordinate(marketplace ?? (flags.get("--git") as string));
   const ref = flags.get("--ref") ?? coordinate.ref;
-  const subdir = flags.get("--subdir") ?? coordinate.subdir;
   if (flags.has("--ref") && coordinate.ref !== undefined) {
     throw new AddError(`the coordinate already pins \`@${coordinate.ref}\`, so \`--ref\` has nothing to add.`);
   }
+
+  if (marketplace !== undefined) {
+    // A plugin's location inside its marketplace is the marketplace's to state,
+    // so there is no subdirectory for a caller to pass.
+    if (flags.has("--subdir") || coordinate.subdir !== undefined) {
+      throw new AddError(
+        `a plugin is found by name in its marketplace's catalogue, so \`--marketplace\` takes no subdirectory. ` +
+          `Drop it: harv reads where \`${name}\` lives from the marketplace itself.`,
+      );
+    }
+    return { kind: "marketplace", repo: coordinate.repo, ...(ref === undefined ? {} : { ref }) };
+  }
+
+  const subdir = flags.get("--subdir") ?? coordinate.subdir;
   if (flags.has("--subdir") && coordinate.subdir !== undefined) {
     throw new AddError(`the coordinate already selects \`#${coordinate.subdir}\`, so \`--subdir\` has nothing to add.`);
   }
@@ -347,6 +368,9 @@ function sourceFrom(args: string[], name: string): Source {
     ...(subdir === undefined ? {} : { subdir }),
   };
 }
+
+/** The flags that name a Source. Exactly one of them has to be present. */
+const SOURCE_FLAGS = ["--git", "--path", "--marketplace"];
 
 function parseFlags(args: string[]): Map<string, string> {
   const flags = new Map<string, string>();
@@ -361,8 +385,10 @@ function parseFlags(args: string[]): Map<string, string> {
     i += 1;
   }
   for (const flag of flags.keys()) {
-    if (!["--git", "--path", "--ref", "--subdir"].includes(flag)) {
-      throw new AddError(`unknown flag \`${flag}\`. \`harv add\` takes --git, --path, --ref and --subdir.`);
+    if (![...SOURCE_FLAGS, "--ref", "--subdir"].includes(flag)) {
+      throw new AddError(
+        `unknown flag \`${flag}\`. \`harv add\` takes --git, --marketplace, --path, --ref and --subdir.`,
+      );
     }
   }
   return flags;

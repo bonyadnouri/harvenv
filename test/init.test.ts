@@ -51,10 +51,15 @@ test("the scaffolded Manifest documents itself with commented examples", () => {
 
   const text = read(root, MANIFEST_FILENAME);
   assert.match(text, /^\[skills]$/m);
+  assert.match(text, /^\[plugins]$/m);
   assert.match(text, /^\[settings]$/m);
   // A git coordinate, not a local path: a `path` Source is the one thing a
   // clone cannot reproduce, so it has no business being the worked example.
   assert.match(text, /# \S+ = \{ git = /, "shows how to declare a skill");
+  assert.match(text, /# \S+ = \{ marketplace = /, "shows how to pin a plugin");
+  // The caveat belongs where a first-time author meets the table, not only in
+  // the README: pinning a plugin runs its hooks.
+  assert.match(text, /whole/i, "warns that a plugin cannot be taken in part");
   assert.doesNotMatch(text, /path = /);
 });
 
@@ -68,6 +73,7 @@ test("init on an empty project writes the gitignore entries", () => {
 
 test("the gitignore entries cover what Sync generates and what stays personal", () => {
   assert.ok(GITIGNORE_ENTRIES.includes(".claude/skills/"), "materialized Components");
+  assert.ok(GITIGNORE_ENTRIES.includes(".claude/harv-plugins/"), "the links pinned plugins are served from");
   assert.ok(GITIGNORE_ENTRIES.includes(".claude/.harv-materialized.json"), "harv's ownership record");
   assert.ok(GITIGNORE_ENTRIES.includes("harvenv.local.toml"), "the per-project Overlay");
 });

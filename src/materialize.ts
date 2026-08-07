@@ -1,12 +1,23 @@
 /**
  * Materialization (ADR 0008): declared Components land in the project's
  * `.claude/` tree as symlinks, and `--setting-sources project` picks them up.
- * `--plugin-dir` is deliberately not used — it renames what it serves, so the
- * name a Manifest declares would stop being the name the session answers to.
+ * For skills `--plugin-dir` is deliberately not used — it renames what it
+ * serves, so the name a Manifest declares would stop being the name the session
+ * answers to.
+ *
+ * Pinned plugins are the case that flag is reserved for, and they are linked
+ * here too, for a different reason. A plugin served with `--plugin-dir` is
+ * named by its `.claude-plugin/plugin.json`, and — measured on Claude Code
+ * 2.1.223 — by the *directory's own name* when it has no such file. Pointing
+ * the flag straight at a Store entry would therefore name a plugin after a hash
+ * digest. So each plugin is linked under its own name and the flag is pointed
+ * at the link: the directory a session sees is called what the Manifest calls
+ * it, whichever of the two rules Claude Code applies.
  *
  * Writing into someone's project demands care, so every materialized entry is
- * recorded. harv only ever removes paths it recorded creating; anything else
- * in `.claude/skills/` is a hand-written Component and is left untouched.
+ * recorded. harv only ever removes paths it recorded creating; anything else in
+ * `.claude/skills/` or `.claude/harv-plugins/` is someone's own work and is
+ * left untouched.
  *
  * What arrives here is already resolved: a name and the directory that holds
  * it, which for a git Source is a Store entry and for a path Source is the
@@ -18,9 +29,16 @@ import { existsSync, lstatSync, mkdirSync, readFileSync, rmSync, statSync, symli
 import { join } from "node:path";
 
 import { COMPONENT_NAME_RULE, isComponentName } from "./manifest.ts";
+import { declaredPluginName, MARKETPLACE_FILE } from "./marketplace.ts";
 
 /** harv's ownership record, kept beside the Components it materialized. */
 export const MATERIALIZED_STATE_FILE = ".harv-materialized.json";
+
+/**
+ * Where pinned plugins are linked. Not `.claude/plugins`: that name belongs to
+ * Claude Code's own plugin storage, and these links are harv's.
+ */
+export const PLUGINS_DIRNAME = "harv-plugins";
 
 const STATE_VERSION = 1;
 
@@ -28,16 +46,25 @@ export class MaterializeError extends Error {
   override name = "MaterializeError";
 }
 
+/** One resolved Component: a declared name and the directory holding it. */
+export interface Resolved {
+  name: string;
+  path: string;
+}
+
 /** Resolved Components: where each declared name's content actually is. */
 export interface MaterializePlan {
   /** The project root — `.claude/` is created beneath it. */
   root: string;
-  skills: Array<{ name: string; path: string }>;
+  skills: Resolved[];
+  plugins?: Resolved[];
 }
 
 export interface MaterializeResult {
   /** Manifest names now linked into project scope. */
   linked: string[];
+  /** Pinned plugins now linked, ready to be served with `--plugin-dir`. */
+  plugins: string[];
   /** Names harv had materialized before and has now removed. */
   removed: string[];
 }
@@ -45,26 +72,47 @@ export interface MaterializeResult {
 interface State {
   version: number;
   skills: string[];
+  plugins: string[];
 }
+
+/** The directory `--plugin-dir` is pointed at for a pinned plugin. */
+export const pluginDir = (root: string, name: string): string =>
+  join(root, ".claude", PLUGINS_DIRNAME, name);
 
 export function materialize(plan: MaterializePlan): MaterializeResult {
   const claudeDir = join(plan.root, ".claude");
   const skillsDir = join(claudeDir, "skills");
+  const pluginsDir = join(claudeDir, PLUGINS_DIRNAME);
+  const plugins = plan.plugins ?? [];
   const previous = readState(claudeDir);
 
+  // Every check that can fail runs before the first write, so a plan that
+  // cannot be satisfied leaves the project tree as it found it.
   for (const skill of plan.skills) validateSkill(skill.name, skill.path);
+  for (const plugin of plugins) validatePlugin(plugin.name, plugin.path);
 
   const declared = plan.skills.map((s) => s.name);
-  const removed = previous.skills.filter((name) => !declared.includes(name));
-  for (const name of removed) removeOwned(join(skillsDir, name));
+  const pinned = plugins.map((p) => p.name);
+
+  // Dropped by kind, not by name: an entry that moved from `[skills]` to
+  // `[plugins]` keeps its name while its old link stops being harv's business.
+  const droppedSkills = previous.skills.filter((name) => !declared.includes(name));
+  const droppedPlugins = previous.plugins.filter((name) => !pinned.includes(name));
+  for (const name of droppedSkills) removeOwned(join(skillsDir, name));
+  for (const name of droppedPlugins) removeOwned(join(pluginsDir, name));
 
   if (plan.skills.length > 0) mkdirSync(skillsDir, { recursive: true });
   for (const skill of plan.skills) {
     link(join(skillsDir, skill.name), skill.path, previous.skills.includes(skill.name));
   }
 
-  writeState(claudeDir, { version: STATE_VERSION, skills: declared });
-  return { linked: declared, removed };
+  if (plugins.length > 0) mkdirSync(pluginsDir, { recursive: true });
+  for (const plugin of plugins) {
+    link(pluginDir(plan.root, plugin.name), plugin.path, previous.plugins.includes(plugin.name));
+  }
+
+  writeState(claudeDir, { version: STATE_VERSION, skills: declared, plugins: pinned });
+  return { linked: declared, plugins: pinned, removed: [...droppedSkills, ...droppedPlugins] };
 }
 
 /**
@@ -98,6 +146,46 @@ function validateSkill(name: string, path: string): void {
     throw new MaterializeError(
       `Skill \`${name}\` is published as \`${published}\` in ${skillFile}. ` +
         `Rename the [skills] key to \`${published}\` so the Manifest, the invocation and the skill agree.`,
+    );
+  }
+}
+
+/**
+ * A pinned plugin must exist, be a directory, and — if it declares a name —
+ * declare the one it is pinned under.
+ *
+ * The name check is ADR 0008's rule where it bites hardest. A plugin's name is
+ * not just a label: it is the prefix on every skill, command and subagent it
+ * carries, so a plugin pinned as `superpowers` that publishes itself as
+ * `superpowers-dev` would answer to `superpowers-dev:brainstorming` — a name
+ * nothing in the Manifest mentions and nothing in the project can predict.
+ *
+ * A plugin with no `plugin.json` is not rejected: Claude Code falls back to the
+ * directory name, and materialization has already made that the pinned name.
+ */
+function validatePlugin(name: string, path: string): void {
+  if (!isComponentName(name)) {
+    throw new MaterializeError(`plugin \`${name}\` cannot be materialized: ${COMPONENT_NAME_RULE}.`);
+  }
+  if (!existsSync(path)) {
+    throw new MaterializeError(`Plugin \`${name}\` resolves to a path that does not exist: ${path}`);
+  }
+  if (!statSync(path).isDirectory()) {
+    throw new MaterializeError(`Plugin \`${name}\` must point at a directory, but ${path} is a file`);
+  }
+  // A marketplace's own checkout is not a plugin, and staging one by mistake
+  // would serve a whole catalogue as a single plugin.
+  if (existsSync(join(path, MARKETPLACE_FILE))) {
+    throw new MaterializeError(
+      `Plugin \`${name}\` resolves to a marketplace rather than to a plugin: ${path} carries ${MARKETPLACE_FILE}.`,
+    );
+  }
+
+  const published = declaredPluginName(path);
+  if (published !== undefined && published !== name) {
+    throw new MaterializeError(
+      `Plugin \`${name}\` is published as \`${published}\`, and a plugin names every skill and command it ` +
+        `carries after itself. Pin it as \`${published}\` so the Manifest and the session agree.`,
     );
   }
 }
@@ -137,17 +225,19 @@ function removeOwned(path: string): void {
 function readState(claudeDir: string): State {
   try {
     const parsed = JSON.parse(readFileSync(join(claudeDir, MATERIALIZED_STATE_FILE), "utf8"));
-    // This file lives in the project tree, so it is input, not memory. Removal
-    // walks it rather than the Manifest, and every entry becomes a recursive
-    // delete — so a name harv would never have written is one it will not act on.
-    const skills = Array.isArray(parsed?.skills)
-      ? parsed.skills.filter((s: unknown): s is string => typeof s === "string" && isComponentName(s))
-      : [];
-    return { version: STATE_VERSION, skills };
+    return { version: STATE_VERSION, skills: names(parsed?.skills), plugins: names(parsed?.plugins) };
   } catch {
-    return { version: STATE_VERSION, skills: [] };
+    return { version: STATE_VERSION, skills: [], plugins: [] };
   }
 }
+
+/**
+ * This file lives in the project tree, so it is input, not memory. Removal
+ * walks it rather than the Manifest, and every entry becomes a recursive
+ * delete — so a name harv would never have written is one it will not act on.
+ */
+const names = (value: unknown): string[] =>
+  Array.isArray(value) ? value.filter((n: unknown): n is string => typeof n === "string" && isComponentName(n)) : [];
 
 function writeState(claudeDir: string, state: State): void {
   mkdirSync(claudeDir, { recursive: true });

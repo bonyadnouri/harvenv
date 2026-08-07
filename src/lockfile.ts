@@ -23,12 +23,21 @@ import { isAbsolute, join } from "node:path";
 import { parse as parseToml, stringify as stringifyToml, TomlError } from "smol-toml";
 
 import { COMPONENT_NAME_RULE, describeSource, isComponentName } from "./manifest.ts";
-import type { Manifest, Source } from "./manifest.ts";
+import type { Manifest, MarketplaceSource, Source } from "./manifest.ts";
 
 export const LOCKFILE_FILENAME = "harvenv.lock";
 
-/** Bumped when the format changes in a way an older harv cannot read. */
-const LOCK_VERSION = 1;
+/**
+ * What this harv writes. Reading accepts anything up to it.
+ *
+ * Version 2 adds `[[plugins]]`, and the bump is the point: a harv that does not
+ * know about plugin pins would read a `[[skills]]` list out of this file,
+ * launch, and load a Harvenv missing every plugin the project declares —
+ * silently, which is the one outcome a Lockfile exists to prevent. The
+ * asymmetry is deliberate: refusing to read a *newer* file is that protection,
+ * while refusing an older one would only make upgrading harv cost a re-fetch.
+ */
+const LOCK_VERSION = 2;
 
 const HASH = /^sha256:[0-9a-f]{64}$/;
 const COMMIT = /^[0-9a-f]{40}$/;
@@ -51,9 +60,26 @@ export interface LockedSkill {
   hash?: string;
 }
 
+/**
+ * A pinned plugin. The commit is the *marketplace's*, because that is the fetch
+ * to perform; the hash is the plugin's own tree, because that is what a session
+ * loads and what a teammate's fetch has to reproduce (ADR 0010).
+ *
+ * Where the plugin sits inside the marketplace is not recorded: it is read from
+ * the catalogue at that commit, which makes it a derived fact, and a derived
+ * fact written down is a fact that can disagree with its source.
+ */
+export interface LockedPlugin {
+  name: string;
+  source: MarketplaceSource;
+  commit: string;
+  hash: string;
+}
+
 export interface Lockfile {
   version: number;
   skills: LockedSkill[];
+  plugins: LockedPlugin[];
 }
 
 export interface DriftEntry {
@@ -79,26 +105,50 @@ export function readLockfile(root: string): Lockfile | null {
     );
   }
 
+  // Only *newer* is a refusal. A Lockfile this harv predates may pin
+  // Components it has no idea how to serve, and loading the ones it does
+  // recognise would produce a Harvenv quietly missing the rest — which is the
+  // failure the version exists to prevent. An older one is simply a subset:
+  // every version so far only added a kind of entry, so reading one and
+  // rewriting it current is a migration rather than a break.
   const version = raw.version;
-  if (version !== LOCK_VERSION) {
+  if (typeof version !== "number" || !Number.isInteger(version) || version < 1) {
     throw new LockfileError(
-      `${path} is version ${JSON.stringify(version)}, and this harv writes version ${LOCK_VERSION}. ` +
-        `Upgrade harv, or delete the Lockfile and run \`harv sync\` to write it again.`,
+      `${path} has a \`version\` that is not a version: ${JSON.stringify(version)}. ` +
+        `Delete the Lockfile and run \`harv sync\` to write it again.`,
+    );
+  }
+  if (version > LOCK_VERSION) {
+    throw new LockfileError(
+      `${path} is version ${version}, and this harv reads up to version ${LOCK_VERSION}. ` +
+        `Upgrade harv — a newer Lockfile can pin Components this one would silently leave out.`,
     );
   }
 
   const skills = raw.skills ?? [];
   if (!Array.isArray(skills)) throw new LockfileError(`${path} has a \`skills\` that is not a list of entries.`);
+  const plugins = raw.plugins ?? [];
+  if (!Array.isArray(plugins)) throw new LockfileError(`${path} has a \`plugins\` that is not a list of entries.`);
 
-  return { version: LOCK_VERSION, skills: skills.map((entry) => readEntry(entry, root, path)) };
+  return {
+    version: LOCK_VERSION,
+    skills: skills.map((entry) => readEntry(entry, root, path)),
+    plugins: plugins.map((entry) => readPlugin(entry, path)),
+  };
 }
 
 /** Write the Lockfile. Entries are ordered by name so the file is a stable diff. */
-export function writeLockfile(root: string, skills: LockedSkill[]): void {
-  const ordered = [...skills].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  const body = stringifyToml({ version: LOCK_VERSION, skills: ordered.map(toTable) });
+export function writeLockfile(root: string, skills: LockedSkill[], plugins: LockedPlugin[] = []): void {
+  const body = stringifyToml({
+    version: LOCK_VERSION,
+    skills: byName(skills).map(toTable),
+    plugins: byName(plugins).map(toPluginTable),
+  });
   writeFileSync(lockfilePath(root), `${HEADER}${body}\n`);
 }
+
+const byName = <T extends { name: string }>(entries: T[]): T[] =>
+  [...entries].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
 /**
  * What the Manifest now says that the Lockfile does not yet reflect.
@@ -108,35 +158,50 @@ export function writeLockfile(root: string, skills: LockedSkill[]): void {
  * the one the Manifest describes.
  */
 export function driftAgainst(manifest: Manifest, lock: Lockfile | null): DriftEntry[] {
-  const locked = new Map((lock?.skills ?? []).map((entry) => [entry.name, entry]));
+  return [
+    ...driftOver(manifest.skills, lock?.skills ?? []),
+    ...driftOver(manifest.plugins, lock?.plugins ?? []),
+  ];
+}
+
+/**
+ * One comparison for both tables: a declared entry is drifted when the Lockfile
+ * does not hold it or holds it at another coordinate, and a locked entry is
+ * drifted when the Manifest has stopped declaring it.
+ */
+function driftOver(
+  declared: Array<{ name: string; source: Source | MarketplaceSource }>,
+  lockedEntries: Array<{ name: string; source: Source | MarketplaceSource }>,
+): DriftEntry[] {
+  const locked = new Map(lockedEntries.map((entry) => [entry.name, entry]));
   const drift: DriftEntry[] = [];
 
-  for (const skill of manifest.skills) {
-    const entry = locked.get(skill.name);
-    if (entry === undefined) {
-      drift.push({ name: skill.name, reason: `declared in the Manifest but not locked` });
+  for (const entry of declared) {
+    const pinned = locked.get(entry.name);
+    if (pinned === undefined) {
+      drift.push({ name: entry.name, reason: `declared in the Manifest but not locked` });
       continue;
     }
-    if (coordinate(skill.source) !== coordinate(entry.source)) {
+    if (coordinate(entry.source) !== coordinate(pinned.source)) {
       drift.push({
-        name: skill.name,
+        name: entry.name,
         // Described, not compared: the comparison needs the kind to tell a path
         // from a repository, and the reader does not need to read it.
-        reason: `Source changed: locked ${describeSource(entry.source)}, Manifest says ${describeSource(skill.source)}`,
+        reason: `Source changed: locked ${describeSource(pinned.source)}, Manifest says ${describeSource(entry.source)}`,
       });
     }
   }
 
-  const declared = new Set(manifest.skills.map((skill) => skill.name));
-  for (const entry of locked.keys()) {
-    if (!declared.has(entry)) drift.push({ name: entry, reason: `locked but no longer declared in the Manifest` });
+  const names = new Set(declared.map((entry) => entry.name));
+  for (const name of locked.keys()) {
+    if (!names.has(name)) drift.push({ name, reason: `locked but no longer declared in the Manifest` });
   }
 
   return drift;
 }
 
 /** The identity of a Source for drift purposes: kind and every coordinate part. */
-const coordinate = (source: Source): string => `${source.kind}:${describeSource(source)}`;
+const coordinate = (source: Source | MarketplaceSource): string => `${source.kind}:${describeSource(source)}`;
 
 function toTable(entry: LockedSkill): Record<string, unknown> {
   // Built key by key, in a fixed order, because the serialized order is the
@@ -154,6 +219,14 @@ function toTable(entry: LockedSkill): Record<string, unknown> {
   table.git = entry.source.repo;
   if (entry.source.ref !== undefined) table.ref = entry.source.ref;
   if (entry.source.subdir !== undefined) table.subdir = entry.source.subdir;
+  table.commit = entry.commit;
+  table.hash = entry.hash;
+  return table;
+}
+
+function toPluginTable(entry: LockedPlugin): Record<string, unknown> {
+  const table: Record<string, unknown> = { name: entry.name, marketplace: entry.source.repo };
+  if (entry.source.ref !== undefined) table.ref = entry.source.ref;
   table.commit = entry.commit;
   table.hash = entry.hash;
   return table;
@@ -192,6 +265,40 @@ function readEntry(value: unknown, root: string, path: string): LockedSkill {
   const hash = text(entry.hash, "hash", where);
   // This becomes a path under the Store, so its shape is checked before it is
   // ever joined onto one.
+  if (!HASH.test(hash)) {
+    throw new LockfileError(`${where} has a \`hash\` that is not a sha256 content hash: ${hash}`);
+  }
+
+  return { name, source, commit, hash };
+}
+
+/**
+ * A `[[plugins]]` entry. Read with the same suspicion as a skill: the name
+ * becomes a directory in the project tree and the hash becomes a path under the
+ * Store, and this file arrives from a clone.
+ */
+function readPlugin(value: unknown, path: string): LockedPlugin {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new LockfileError(`${path} has a [[plugins]] entry that is not a table.`);
+  }
+  const entry = value as Record<string, unknown>;
+  const name = entry.name;
+  if (typeof name !== "string" || !isComponentName(name)) {
+    throw new LockfileError(
+      `${path} locks the plugin ${JSON.stringify(name)}, which is not a usable plugin name: ${COMPONENT_NAME_RULE}. ` +
+        `Delete the Lockfile and run \`harv sync\`.`,
+    );
+  }
+  const where = `${path} plugin entry \`${name}\``;
+
+  const source: MarketplaceSource = { kind: "marketplace", repo: text(entry.marketplace, "marketplace", where) };
+  if (entry.ref !== undefined) source.ref = text(entry.ref, "ref", where);
+
+  const commit = text(entry.commit, "commit", where);
+  if (!COMMIT.test(commit)) {
+    throw new LockfileError(`${where} has a \`commit\` that is not a full 40-character SHA: ${commit}`);
+  }
+  const hash = text(entry.hash, "hash", where);
   if (!HASH.test(hash)) {
     throw new LockfileError(`${where} has a \`hash\` that is not a sha256 content hash: ${hash}`);
   }

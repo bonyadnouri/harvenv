@@ -2,7 +2,8 @@
 # teammate's Harvenv identical to yours. Change Sources in harvenv.toml and
 # re-run `harv sync` rather than editing this file.
 
-version = 1
+version = 2
+plugins = []
 
 [[skills]]
 name = "harvenv-ci-demo"

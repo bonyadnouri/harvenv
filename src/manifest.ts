@@ -3,17 +3,24 @@
  * contains. Discovery walks up from the working directory, so "switching
  * environments is just `cd`" (ADR 0001).
  *
- * Two of ADR 0004's Sources are readable here: git coordinates (repository,
- * optional ref, optional subdirectory) and local paths, which are allowed but
- * non-portable and flagged as such at Sync. Marketplace plugin pins parse far
- * enough to be rejected by name rather than ignored. Alongside the Components
- * are the two tables that configure the session itself: `[settings]` and
- * `[mcp]`.
+ * All three of ADR 0004's Sources are readable here: git coordinates
+ * (repository, optional ref, optional subdirectory) and local paths under
+ * `[skills]`, which are allowed but non-portable and flagged as such at Sync,
+ * and marketplace coordinates under `[plugins]`. Alongside the Components are
+ * the two tables that configure the session itself: `[settings]` and `[mcp]`.
+ *
+ * `[skills]` and `[plugins]` are separate because the Components they declare
+ * load by different mechanisms and answer to different names. A skill is
+ * materialized into project scope and keeps its bare name; a plugin is served
+ * through `--plugin-dir` and prefixes everything it carries with its own name
+ * (ADR 0008). Which table an entry sits in is therefore not a filing detail —
+ * it is the difference between `brainstorming` and `superpowers:brainstorming`.
  *
  * Parsing stops at shape: what a table has to *be* to be read at all. What its
  * contents have to *mean* — that a settings key is one a Manifest may bind, that
- * a server declares a transport Claude Code runs — belongs to the modules that
- * generate the payloads, next to the measurements those rules come from.
+ * a server declares a transport Claude Code runs, that a marketplace really
+ * publishes the plugin — belongs to the modules that act on them, next to the
+ * measurements those rules come from.
  */
 
 import { existsSync, readFileSync } from "node:fs";
@@ -24,11 +31,24 @@ import type { McpServerEntry } from "./mcp.ts";
 
 export const MANIFEST_FILENAME = "harvenv.toml";
 
-/** Sources ADR 0004 defines but this slice cannot yet fetch. */
-const DEFERRED_SOURCE_KEYS = ["marketplace", "version"];
+/** Keys a `[skills]` entry cannot carry, and where each of them belongs. */
+const MISPLACED_SKILL_KEYS: Record<string, string> = {
+  marketplace: "a marketplace coordinate declares a plugin, so it belongs in `[plugins]`",
+  version: "harv pins by commit and content hash, not by version — use `ref` to name a tag",
+};
 
 /** Keys that only mean something alongside `git`. */
 const GIT_MODIFIERS = ["ref", "subdir"] as const;
+
+/** Keys a `[plugins]` entry cannot carry, and why. */
+const MISPLACED_PLUGIN_KEYS: Record<string, string> = {
+  git: "a plugin is named inside a marketplace, so declare the marketplace repository as `marketplace`",
+  path: "a plugin pin is a marketplace coordinate; a local directory is a `[skills]` Source",
+  subdir:
+    "where a plugin lives inside its marketplace is a fact of the marketplace, not of the Manifest — " +
+    "harv reads it from `.claude-plugin/marketplace.json`",
+  version: "harv pins the marketplace commit and the plugin's content hash, not a version — use `ref`",
+};
 
 /**
  * A Component name is one path segment, and a conservative one.
@@ -68,6 +88,22 @@ export interface GitSource {
   subdir?: string;
 }
 
+/**
+ * A plugin marketplace: a repository carrying `.claude-plugin/marketplace.json`,
+ * optionally at a ref. There is no registry (ADR 0004), so a marketplace is
+ * addressed the only way a Manifest can address anything — as a repository you
+ * can already clone. Which plugin to take out of it is the entry's key.
+ *
+ * There is no `subdir`: where a plugin sits inside its marketplace is declared
+ * by the marketplace, and reading it from there is what makes `name@marketplace`
+ * the whole coordinate.
+ */
+export interface MarketplaceSource {
+  kind: "marketplace";
+  repo: string;
+  ref?: string;
+}
+
 export type Source = PathSource | GitSource;
 
 export interface SkillEntry {
@@ -76,11 +112,25 @@ export interface SkillEntry {
   source: Source;
 }
 
-/** A git coordinate as one line, for messages and Lockfile-drift reports. */
-export function describeSource(source: Source): string {
+export interface PluginEntry {
+  /**
+   * The plugin's name in its marketplace — and the prefix every Component it
+   * carries answers to, so `superpowers` here means `superpowers:brainstorming`
+   * in the session.
+   */
+  name: string;
+  source: MarketplaceSource;
+}
+
+/** A coordinate as one line, for messages and Lockfile-drift reports. */
+export function describeSource(source: Source | MarketplaceSource): string {
   if (source.kind === "path") return source.declared;
+  if (source.kind === "marketplace") return source.repo + (source.ref ? `@${source.ref}` : "");
   return source.repo + (source.ref ? `@${source.ref}` : "") + (source.subdir ? `#${source.subdir}` : "");
 }
+
+/** The native `name@marketplace` identity of a pin, for messages. */
+export const describePlugin = (entry: PluginEntry): string => `${entry.name}@${describeSource(entry.source)}`;
 
 export interface Manifest {
   /** Absolute path to `harvenv.toml`. */
@@ -88,6 +138,7 @@ export interface Manifest {
   /** The project root: the directory holding the Manifest. */
   root: string;
   skills: SkillEntry[];
+  plugins: PluginEntry[];
   /** The Manifest's settings table, injected via `--settings` at launch. */
   settings: Record<string, unknown>;
   /** The Manifest's MCP servers, injected via `--mcp-config` at launch. */
@@ -119,6 +170,7 @@ export function loadManifest(manifestPath: string): Manifest {
     path: manifestPath,
     root,
     skills: parseSkills(raw.skills, root, manifestPath),
+    plugins: parsePlugins(raw.plugins, manifestPath),
     settings: asTable(raw.settings, "settings", manifestPath) ?? {},
     mcpServers: parseMcpServers(raw.mcp, manifestPath),
   };
@@ -152,15 +204,63 @@ function parseSkills(value: unknown, root: string, manifestPath: string): SkillE
       throw new ManifestError(`${where} must be a table, e.g. ${name} = { git = "https://…" }`);
     }
 
-    const deferred = DEFERRED_SOURCE_KEYS.filter((key) => key in entry);
-    if (deferred.length > 0) {
+    const misplaced = Object.keys(MISPLACED_SKILL_KEYS).find((key) => key in entry);
+    if (misplaced !== undefined) {
       throw new ManifestError(
-        `${where} declares \`${deferred.join("`, `")}\`, which this version of harv cannot fetch yet. ` +
-          `Declare a git repository or a local path instead: ${name} = { git = "https://…" }`,
+        `${where} declares \`${misplaced}\`, which a skill entry cannot carry: ${MISPLACED_SKILL_KEYS[misplaced]}.`,
       );
     }
 
     return { name, source: parseSource(entry, name, where, root) };
+  });
+}
+
+/**
+ * `[plugins]` — one entry per pinned plugin, keyed by the plugin's own name.
+ *
+ * A plugin arrives whole: harv can pin one, and cannot take part of one. That
+ * is a property of the mechanism rather than a limitation of this parser — a
+ * plugin is one directory that Claude Code loads entire — so there is nothing
+ * here to select skills, hooks or servers out of it, and the Manifest reference
+ * says so.
+ */
+function parsePlugins(value: unknown, manifestPath: string): PluginEntry[] {
+  const plugins = asTable(value, "plugins", manifestPath);
+  if (!plugins) return [];
+
+  return Object.entries(plugins).map(([name, entry]) => {
+    const where = `[plugins] entry \`${name}\` in ${manifestPath}`;
+    if (!isComponentName(name)) {
+      throw new ManifestError(
+        `${where} is not a usable plugin name: ${COMPONENT_NAME_RULE}. ` +
+          `The key is the plugin's name in its marketplace, and the prefix its skills and commands answer to.`,
+      );
+    }
+    if (!isTable(entry)) {
+      throw new ManifestError(
+        `${where} must be a table, e.g. ${name} = { marketplace = "https://example.com/marketplace.git" }`,
+      );
+    }
+
+    const misplaced = Object.keys(MISPLACED_PLUGIN_KEYS).find((key) => key in entry);
+    if (misplaced !== undefined) {
+      throw new ManifestError(
+        `${where} declares \`${misplaced}\`, which a plugin entry cannot carry: ${MISPLACED_PLUGIN_KEYS[misplaced]}.`,
+      );
+    }
+    if (!("marketplace" in entry)) {
+      throw new ManifestError(
+        `${where} needs a \`marketplace\`: the repository whose \`.claude-plugin/marketplace.json\` lists ` +
+          `\`${name}\`, e.g. ${pluginExample(name)}`,
+      );
+    }
+
+    const source: MarketplaceSource = {
+      kind: "marketplace",
+      repo: requireString(entry.marketplace, "marketplace", where, pluginExample(name)),
+    };
+    if ("ref" in entry) source.ref = requireString(entry.ref, "ref", where, pluginExample(name));
+    return { name, source };
   });
 }
 
@@ -194,13 +294,15 @@ function parseSource(
           `repository to apply them to. Remove them, or declare a \`git\` Source.`,
       );
     }
-    const declared = requireString(entry.path, "path", where, name);
+    const declared = requireString(entry.path, "path", where, skillExample(name));
     return { kind: "path", declared, path: isAbsolute(declared) ? declared : join(root, declared) };
   }
 
-  const source: GitSource = { kind: "git", repo: requireString(entry.git, "git", where, name) };
-  if ("ref" in entry) source.ref = requireString(entry.ref, "ref", where, name);
-  if ("subdir" in entry) source.subdir = parseSubdir(requireString(entry.subdir, "subdir", where, name), where);
+  const source: GitSource = { kind: "git", repo: requireString(entry.git, "git", where, skillExample(name)) };
+  if ("ref" in entry) source.ref = requireString(entry.ref, "ref", where, skillExample(name));
+  if ("subdir" in entry) {
+    source.subdir = parseSubdir(requireString(entry.subdir, "subdir", where, skillExample(name)), where);
+  }
   return source;
 }
 
@@ -223,15 +325,21 @@ function parseSubdir(subdir: string, where: string): string {
   return subdir;
 }
 
-function requireString(value: unknown, key: string, where: string, name: string): string {
+/**
+ * The example is passed in rather than derived, because `ref` means something
+ * in both tables and the way out of a bad one differs by which table it is in.
+ */
+function requireString(value: unknown, key: string, where: string, example: string): string {
   if (typeof value !== "string" || value.length === 0) {
-    throw new ManifestError(
-      `${where} has a \`${key}\` that is not a non-empty string. ` +
-        `Example: ${name} = { git = "https://example.com/skills.git", subdir = "${name}" }`,
-    );
+    throw new ManifestError(`${where} has a \`${key}\` that is not a non-empty string. Example: ${example}`);
   }
   return value;
 }
+
+const skillExample = (name: string): string => `${name} = { git = "https://example.com/skills.git", subdir = "${name}" }`;
+
+const pluginExample = (name: string): string =>
+  `${name} = { marketplace = "https://example.com/marketplace.git", ref = "v1" }`;
 
 /**
  * `[mcp]` entries are named for the same reason skills are: the key becomes the

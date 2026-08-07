@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { basename, join } from "node:path";
 
 import type { Manifest } from "../src/manifest.ts";
 import { buildLaunchArgs, claudeBinary, LaunchError, launchEnv } from "../src/launch.ts";
@@ -15,6 +15,7 @@ function manifestWith(overrides: Partial<Manifest> = {}): Manifest {
     path: join(root, "harvenv.toml"),
     root,
     skills: [],
+    plugins: [],
     settings: {},
     mcpServers: [],
     ...overrides,
@@ -92,6 +93,40 @@ test("buildLaunchArgs never serves skills through --plugin-dir", () => {
   });
 
   assert.equal(buildLaunchArgs(manifest, [], {}).includes("--plugin-dir"), false);
+});
+
+const pinned = (...names: string[]): Manifest["plugins"] =>
+  names.map((name) => ({ name, source: { kind: "marketplace" as const, repo: "https://example.com/m.git" } }));
+
+test("buildLaunchArgs serves each pinned plugin through --plugin-dir", () => {
+  const manifest = manifestWith({ plugins: pinned("alpha-pack", "beta-pack") });
+
+  const args = buildLaunchArgs(manifest, [], {});
+
+  assert.deepEqual(args.slice(args.indexOf("--plugin-dir")), [
+    "--plugin-dir",
+    join(manifest.root, ".claude", "harv-plugins", "alpha-pack"),
+    "--plugin-dir",
+    join(manifest.root, ".claude", "harv-plugins", "beta-pack"),
+  ]);
+});
+
+test("buildLaunchArgs points --plugin-dir at the named link, never at the Store", () => {
+  const manifest = manifestWith({ plugins: pinned("alpha-pack") });
+
+  // The directory a plugin is served from is the name it answers to when it
+  // declares none of its own, so it has to be the plugin's name.
+  const args = buildLaunchArgs(manifest, [], {});
+  const served = args[args.indexOf("--plugin-dir") + 1] ?? "";
+
+  assert.equal(basename(served), "alpha-pack");
+  assert.equal(served.startsWith(manifest.root), true);
+});
+
+test("passthrough arguments still come last, after every --plugin-dir", () => {
+  const manifest = manifestWith({ plugins: pinned("alpha-pack") });
+
+  assert.deepEqual(buildLaunchArgs(manifest, ["-p", "hi"], {}).slice(-2), ["-p", "hi"]);
 });
 
 test("launchEnv marks the session, so the project's Tripwire stays quiet", () => {
