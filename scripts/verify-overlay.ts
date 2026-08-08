@@ -14,6 +14,23 @@
  *      warning naming the key — and the session runs the Manifest's value.
  *   4. `--no-overlay` starts a session composed from the Manifest alone.
  *
+ * …and then the same four claims for a plugin staple, which is issue #29:
+ *
+ *   5. A plugin declared once in the global Overlay file is served in two
+ *      different projects, out of one Store entry, pinned in the Overlay's own
+ *      Lockfile at the marketplace commit the committed Lockfile would name.
+ *   6. A project's extras file adds a plugin and disables a plugin staple, in
+ *      that project only.
+ *   7. An Overlay plugin whose name a Manifest `[plugins]` entry already pins is
+ *      rejected at Sync naming the entry — and the session loads the Manifest's
+ *      plugin, not the personal one.
+ *   8. `--no-overlay` serves no Overlay plugin at all.
+ *
+ * The last three of those are claims about *which* plugin, so the fixture
+ * publishes one name from two marketplaces whose plugins carry differently-named
+ * skills: `<plugin>:<skill>` in `init.skills` then says which tree won, rather
+ * than only that something loaded.
+ *
  * What the session loaded comes from the `system`/`init` event Claude Code emits
  * under `--output-format stream-json --verbose`, as in spikes 0001 and 0002:
  * `init.skills` names every skill by the name it answers to, and `init.model` is
@@ -36,7 +53,7 @@ import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -60,6 +77,16 @@ const EXTRA = "harvenv-extra";
 /** Declared by a Manifest, so it is the thing `--no-overlay` must keep. */
 const PROJECT_SKILL = "harvenv-project";
 
+/** A plugin staple: pinned once in the global file, and expected everywhere. */
+const STAPLE_PACK = "harvenv-staple-pack";
+/** Pinned by one project's extras file, and expected only there. */
+const EXTRA_PACK = "harvenv-extra-pack";
+/** Pinned by a Manifest *and* by that project's extras. ADR 0005 decides it. */
+const CONTESTED_PACK = "harvenv-contested-pack";
+/** The skill inside each side of the contested pin, so the winner is legible. */
+const PROJECT_SIDE = "harvenv-contested-project";
+const PERSONAL_SIDE = "harvenv-contested-personal";
+
 /** The Manifest binds this; the Overlay tries to move it and must not. */
 const BOUND_MODEL = "haiku";
 const BOUND_MODEL_FAMILY = /haiku/;
@@ -75,6 +102,7 @@ const PERSONAL_KEY = "statusLine";
 interface InitEvent {
   claude_code_version: string;
   skills: string[];
+  plugins: Array<{ name: string }>;
   model: string;
 }
 
@@ -190,19 +218,60 @@ interface Fixtures {
   /** A stand-in `claude` that records the argv it was handed. */
   fakeClaudeDir: string;
   fakeClaudeDump: string;
+  /** The commit each fixture marketplace is at, so a pin can be checked. */
+  marketplaces: { staples: string; project: string; personal: string };
   env: NodeJS.ProcessEnv;
 }
 
 const skillSource = (name: string) =>
   `---\nname: ${name}\ndescription: Fixture skill for harvenv Overlay verification. Never invoke it.\n---\n\nMarker.\n`;
 
-async function buildFixtures(): Promise<Fixtures> {
-  const dir = (...parts: string[]) => {
-    const p = join(FIXTURE_ROOT, ...parts);
-    mkdirSync(p, { recursive: true });
-    return p;
-  };
+const dir = (...parts: string[]) => {
+  const p = join(FIXTURE_ROOT, ...parts);
+  mkdirSync(p, { recursive: true });
+  return p;
+};
 
+/**
+ * A marketplace repository publishing one plugin per `[plugin, skill]` pair.
+ *
+ * A real repository with a real catalogue, because a plugin staple has to take
+ * the whole path a Manifest pin takes: resolve the marketplace, read where the
+ * plugin sits at that commit, hash the plugin's own tree, link it under its
+ * name. Two marketplaces may publish the same plugin name with a differently
+ * named skill inside, which is how a session says which one it loaded.
+ */
+async function marketplace(name: string, packs: Array<[string, string]>): Promise<{ url: string; commit: string }> {
+  const repo = dir(`marketplace-${name}`);
+  await git(["init", "--quiet"], repo);
+
+  const catalogue = {
+    name,
+    owner: { name: "harvenv verification" },
+    plugins: packs.map(([pack]) => ({
+      name: pack,
+      source: `./plugins/${pack}`,
+      description: `Fixture plugin ${pack} for harvenv Overlay verification.`,
+    })),
+  };
+  writeFileSync(join(dir(`marketplace-${name}`, ".claude-plugin"), "marketplace.json"), `${JSON.stringify(catalogue, null, 2)}\n`);
+
+  for (const [pack, skill] of packs) {
+    const manifest = { name: pack, version: "1.0.0", description: `Fixture plugin ${pack}.` };
+    writeFileSync(
+      join(dir(`marketplace-${name}`, "plugins", pack, ".claude-plugin"), "plugin.json"),
+      `${JSON.stringify(manifest, null, 2)}\n`,
+    );
+    writeFileSync(join(dir(`marketplace-${name}`, "plugins", pack, "skills", skill), "SKILL.md"), skillSource(skill));
+  }
+  writeFileSync(join(repo, "README.md"), "The rest of the marketplace, which resolving a plugin must leave behind.\n");
+
+  await git(["add", "--all"], repo);
+  await git(["commit", "--quiet", "--message", `the ${name} marketplace`], repo);
+  return { url: `file://${repo}`, commit: await git(["rev-parse", "HEAD"], repo) };
+}
+
+async function buildFixtures(): Promise<Fixtures> {
   // The staple comes from a real repository, so criterion 1 exercises the whole
   // path a personal skill actually takes: resolve, fetch, hash, Store, link.
   const repo = dir("staple-repo");
@@ -211,10 +280,19 @@ async function buildFixtures(): Promise<Fixtures> {
   await git(["add", "--all"], repo);
   await git(["commit", "--quiet", "--message", "the staple"], repo);
 
+  const packs = await marketplace("staples", [
+    [STAPLE_PACK, `${STAPLE_PACK}-skill`],
+    [EXTRA_PACK, `${EXTRA_PACK}-skill`],
+  ]);
+  // One plugin name, two publishers: the project's, and the user's own.
+  const theirs = await marketplace("project", [[CONTESTED_PACK, PROJECT_SIDE]]);
+  const mine = await marketplace("personal", [[CONTESTED_PACK, PERSONAL_SIDE]]);
+
   const home = dir("harv-home");
   writeFileSync(
     join(home, "overlay.toml"),
     `[skills]\n${STAPLE} = { git = "file://${repo}" }\n\n` +
+      `[plugins]\n${STAPLE_PACK} = { marketplace = "${packs.url}" }\n\n` +
       `[settings]\n` +
       // A key the Manifest binds. The Overlay must lose it, loudly.
       `model = "${OVERRIDDEN_MODEL}"\n` +
@@ -226,7 +304,14 @@ async function buildFixtures(): Promise<Fixtures> {
   writeFileSync(join(dir("alpha", "vendor", PROJECT_SKILL), "SKILL.md"), skillSource(PROJECT_SKILL));
   writeFileSync(
     join(alpha, "harvenv.toml"),
-    `[skills]\n${PROJECT_SKILL} = { path = "vendor/${PROJECT_SKILL}" }\n\n[settings]\nmodel = "${BOUND_MODEL}"\n`,
+    `[skills]\n${PROJECT_SKILL} = { path = "vendor/${PROJECT_SKILL}" }\n\n` +
+      `[plugins]\n${CONTESTED_PACK} = { marketplace = "${theirs.url}" }\n\n` +
+      `[settings]\nmodel = "${BOUND_MODEL}"\n`,
+  );
+  // The contested pin, kept local to this project so the others stay clean.
+  writeFileSync(
+    join(alpha, "harvenv.local.toml"),
+    `[plugins]\n${CONTESTED_PACK} = { marketplace = "${mine.url}" }\n`,
   );
 
   const beta = dir("beta");
@@ -237,7 +322,8 @@ async function buildFixtures(): Promise<Fixtures> {
   writeFileSync(join(dir("gamma", "vendor", EXTRA), "SKILL.md"), skillSource(EXTRA));
   writeFileSync(
     join(gamma, "harvenv.local.toml"),
-    `[skills]\n${EXTRA} = { path = "vendor/${EXTRA}" }\n${STAPLE} = { disable = true }\n`,
+    `[skills]\n${EXTRA} = { path = "vendor/${EXTRA}" }\n${STAPLE} = { disable = true }\n\n` +
+      `[plugins]\n${EXTRA_PACK} = { marketplace = "${packs.url}" }\n${STAPLE_PACK} = { disable = true }\n`,
   );
 
   const fakeClaudeDir = dir("fake-bin");
@@ -257,6 +343,7 @@ async function buildFixtures(): Promise<Fixtures> {
     gamma,
     fakeClaudeDir,
     fakeClaudeDump,
+    marketplaces: { staples: packs.commit, project: theirs.commit, personal: mine.commit },
     // HARV_HOME is both the Store and where the global staples file is read
     // from, so redirecting it keeps the whole run off the real machine's.
     env: { ...process.env, HARV_HOME: home },
@@ -294,12 +381,36 @@ function handedOverSettings(dump: string): Record<string, unknown> {
   return JSON.parse(argv[argv.indexOf("--settings") + 1] ?? "{}");
 }
 
-/** The content hash the project's Overlay Lockfile pins for one entry. */
-function lockedHash(root: string, name: string): string {
+/**
+ * What the project's Overlay Lockfile pins for one entry, by table.
+ *
+ * Split on the array-of-tables header rather than searched whole, because the
+ * file now carries two tables and a plugin's name is a prefix of nothing by
+ * accident: `harvenv-staple` and `harvenv-staple-pack` must not read as each
+ * other.
+ */
+function lockedEntry(root: string, table: "skills" | "plugins", name: string): { commit: string; hash: string } {
   const lock = join(root, ".harv", "overlay.lock");
-  if (!existsSync(lock)) return "";
-  const entry = readFileSync(lock, "utf8").split(/^\[\[skills\]\]$/m).find((block) => block.includes(`"${name}"`));
-  return /hash = "(sha256:[0-9a-f]{64})"/.exec(entry ?? "")?.[1] ?? "";
+  if (!existsSync(lock)) return { commit: "", hash: "" };
+  const block =
+    readFileSync(lock, "utf8")
+      .split(/^\[\[/m)
+      .find((chunk) => chunk.startsWith(`${table}]]`) && chunk.includes(`name = "${name}"`)) ?? "";
+  return {
+    commit: /commit = "([0-9a-f]{40})"/.exec(block)?.[1] ?? "",
+    hash: /hash = "(sha256:[0-9a-f]{64})"/.exec(block)?.[1] ?? "",
+  };
+}
+
+/** The content hash the project's Overlay Lockfile pins for one staple skill. */
+const lockedHash = (root: string, name: string): string => lockedEntry(root, "skills", name).hash;
+
+/** Every plugin directory `harv claude` handed to `--plugin-dir`, by name. */
+function servedPlugins(dump: string): string[] {
+  const { argv } = JSON.parse(readFileSync(dump, "utf8")) as { argv: string[] };
+  return argv
+    .map((arg, at) => (argv[at - 1] === "--plugin-dir" ? basename(arg) : null))
+    .filter((name): name is string => name !== null);
 }
 
 /** Run `harv claude` against the stand-in, so the payload can be read back. */
@@ -525,6 +636,213 @@ async function checkNoOverlay(fx: Fixtures): Promise<Check> {
 }
 
 // ---------------------------------------------------------------------------
+// Criterion 5 — a plugin staple, in two projects, pinned like a Manifest's
+// ---------------------------------------------------------------------------
+
+const pluginNames = (init: InitEvent): string[] => (init.plugins ?? []).map((plugin) => plugin.name);
+
+/** The skill a fixture plugin carries, under the prefix a plugin gives it. */
+const carried = (pack: string, skill: string): string => `${pack}:${skill}`;
+
+async function checkPluginStaples(fx: Fixtures): Promise<Check> {
+  await harv(["sync"], fx.alpha, fx.env);
+  await harv(["sync"], fx.beta, fx.env);
+
+  const alpha = await session(fx.alpha, fx.env);
+  const beta = await session(fx.beta, fx.env);
+
+  const alphaPin = lockedEntry(fx.alpha, "plugins", STAPLE_PACK);
+  const betaPin = lockedEntry(fx.beta, "plugins", STAPLE_PACK);
+  const committed = readFileSync(join(fx.alpha, "harvenv.lock"), "utf8");
+
+  return {
+    id: "plugin-staples-everywhere",
+    title: "A plugin declared once in the global Overlay is served in two different projects",
+    measurements: {
+      alphaPlugins: pluginNames(alpha),
+      betaPlugins: pluginNames(beta),
+      alphaPin,
+      betaPin,
+      marketplaceCommit: fx.marketplaces.staples,
+    },
+    expectations: [
+      expect(
+        `the first project's session loads \`${STAPLE_PACK}\``,
+        pluginNames(alpha).includes(STAPLE_PACK),
+        `plugins: ${summarize(pluginNames(alpha))}`,
+      ),
+      expect(
+        "the second project's session loads it too, pinning nothing itself",
+        pluginNames(beta).includes(STAPLE_PACK),
+        `${fx.beta}/harvenv.toml declares no plugins; plugins: ${summarize(pluginNames(beta))}`,
+      ),
+      expect(
+        "and what it carries is invocable, under the plugin's own name",
+        beta.skills.includes(carried(STAPLE_PACK, `${STAPLE_PACK}-skill`)),
+        `skills: ${summarize(beta.skills)}`,
+      ),
+      expect(
+        "the Overlay Lockfile pins the marketplace commit, exactly as the committed one does",
+        alphaPin.commit === fx.marketplaces.staples && alphaPin.commit === betaPin.commit,
+        `both pin commit ${alphaPin.commit || "(nothing)"}; the marketplace is at ${fx.marketplaces.staples}`,
+      ),
+      expect(
+        "beside a hash of the plugin's own tree, so both projects share one Store entry",
+        alphaPin.hash !== "" && alphaPin.hash === betaPin.hash,
+        `both pin ${alphaPin.hash || "(nothing)"} — the Store address is the content, so this is one directory`,
+      ),
+      expect(
+        "and none of it reaches the file the repository hands over",
+        !committed.includes(STAPLE_PACK),
+        `harvenv.lock does not mention it; .harv/overlay.lock does`,
+      ),
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Criterion 6 — extras add a plugin, and a disable takes one out, here only
+// ---------------------------------------------------------------------------
+
+async function checkPluginExtras(fx: Fixtures): Promise<Check> {
+  await harv(["sync"], fx.gamma, fx.env);
+  const gamma = await session(fx.gamma, fx.env);
+  // Re-read the project that declares no extras: "in that project only" is a
+  // claim about two projects, not one.
+  const alpha = await session(fx.alpha, fx.env);
+  const link = join(fx.gamma, ".claude", "harv-plugins", STAPLE_PACK);
+
+  return {
+    id: "plugin-project-extras",
+    title: "Project-local extras pin a plugin, and a disable removes a plugin staple in that project only",
+    measurements: { gammaPlugins: pluginNames(gamma), alphaPlugins: pluginNames(alpha), gammaSkills: gamma.skills },
+    expectations: [
+      expect(
+        `the extras file's \`${EXTRA_PACK}\` is served`,
+        pluginNames(gamma).includes(EXTRA_PACK),
+        `plugins: ${summarize(pluginNames(gamma))}`,
+      ),
+      expect(
+        "and what it carries is invocable here",
+        gamma.skills.includes(carried(EXTRA_PACK, `${EXTRA_PACK}-skill`)),
+        `skills: ${summarize(gamma.skills)}`,
+      ),
+      expect(
+        `the disabled \`${STAPLE_PACK}\` is absent from this project's session`,
+        !pluginNames(gamma).includes(STAPLE_PACK),
+        `plugins: ${summarize(pluginNames(gamma))}`,
+      ),
+      expect(
+        "and absent from the directory harv serves plugins out of, not merely from the session",
+        !existsSync(link),
+        `${link} does not exist`,
+      ),
+      expect(
+        "while the other project still has it",
+        pluginNames(alpha).includes(STAPLE_PACK),
+        `plugins: ${summarize(pluginNames(alpha))}`,
+      ),
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Criterion 7 — a Manifest `[plugins]` entry outranks an Overlay pin
+// ---------------------------------------------------------------------------
+
+async function checkPluginBindingWins(fx: Fixtures): Promise<Check> {
+  const synced = await harv(["sync"], fx.alpha, fx.env);
+  const alpha = await session(fx.alpha, fx.env);
+  const warning = synced.stderr;
+  const overlayPin = lockedEntry(fx.alpha, "plugins", CONTESTED_PACK);
+  const committed = readFileSync(join(fx.alpha, "harvenv.lock"), "utf8");
+
+  return {
+    id: "plugin-manifest-wins",
+    title: "An Overlay plugin whose name the Manifest pins is rejected at Sync, and the Manifest's is what loads",
+    measurements: {
+      syncStderr: warning.trim(),
+      plugins: pluginNames(alpha),
+      skills: alpha.skills.filter((skill) => skill.startsWith(`${CONTESTED_PACK}:`)),
+      overlayPin,
+    },
+    expectations: [
+      expect(
+        "`harv sync` warns rather than passing it on in silence",
+        /warning/i.test(warning) && warning.includes(CONTESTED_PACK),
+        warning.trim() || "(nothing on stderr)",
+      ),
+      expect(
+        "the warning names the entry, and the rule that decided it",
+        new RegExp(`\`${CONTESTED_PACK}\``).test(warning) && /ADR 0005/.test(warning),
+        warning.trim() || "(nothing on stderr)",
+      ),
+      expect(
+        "the Sync still succeeds — a personal file cannot fail a project",
+        synced.code === 0,
+        `exit ${synced.code}`,
+      ),
+      expect(
+        "the session loads the Manifest's plugin, by the skill only that marketplace publishes",
+        alpha.skills.includes(carried(CONTESTED_PACK, PROJECT_SIDE)),
+        `skills: ${summarize(alpha.skills.filter((skill) => skill.startsWith(`${CONTESTED_PACK}:`)))}`,
+      ),
+      expect(
+        "and not the Overlay's, which publishes a different skill under the same plugin name",
+        !alpha.skills.includes(carried(CONTESTED_PACK, PERSONAL_SIDE)),
+        `\`${PERSONAL_SIDE}\` is absent from the session`,
+      ),
+      expect(
+        "the rejected pin is not in the Overlay Lockfile either — it was dropped, not merely outranked at launch",
+        overlayPin.commit === "" && committed.includes(fx.marketplaces.project),
+        `.harv/overlay.lock holds no ${CONTESTED_PACK}; harvenv.lock pins ${fx.marketplaces.project}`,
+      ),
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Criterion 8 — --no-overlay serves no Overlay plugin
+// ---------------------------------------------------------------------------
+
+async function checkNoOverlayPlugins(fx: Fixtures): Promise<Check> {
+  const bare = await session(fx.alpha, fx.env, ["--no-overlay"]);
+  await handover(fx, fx.alpha, ["--no-overlay"]);
+  const served = servedPlugins(fx.fakeClaudeDump);
+
+  await handover(fx, fx.alpha);
+  const restored = servedPlugins(fx.fakeClaudeDump);
+
+  return {
+    id: "no-overlay-plugins",
+    title: "`--no-overlay` serves the Manifest's plugins and none of the Overlay's",
+    measurements: { barePlugins: pluginNames(bare), served, restored },
+    expectations: [
+      expect(
+        `the Manifest's \`${CONTESTED_PACK}\` is still served`,
+        pluginNames(bare).includes(CONTESTED_PACK),
+        `plugins: ${summarize(pluginNames(bare))}`,
+      ),
+      expect(
+        `the Overlay's \`${STAPLE_PACK}\` is not`,
+        !pluginNames(bare).includes(STAPLE_PACK),
+        `plugins: ${summarize(pluginNames(bare))}`,
+      ),
+      expect(
+        "and harv handed `--plugin-dir` nothing but the Manifest's own",
+        served.length === 1 && served[0] === CONTESTED_PACK,
+        `--plugin-dir carried: ${served.join(", ") || "(nothing)"}`,
+      ),
+      expect(
+        "the next launch without the flag has the Overlay's plugin back",
+        restored.includes(STAPLE_PACK),
+        `--plugin-dir carried: ${restored.join(", ") || "(nothing)"}`,
+      ),
+    ],
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Report
 // ---------------------------------------------------------------------------
 
@@ -572,6 +890,10 @@ async function main(): Promise<number> {
     ["project-extras", "Extras add a Component; a disable removes a staple in that project only", () => checkProjectExtras(fx)],
     ["binding-wins", "An Overlay override of a Manifest-bound key is rejected, naming the key", () => checkBindingWins(fx)],
     ["no-overlay", "`--no-overlay` launches a Manifest-only session", () => checkNoOverlay(fx)],
+    ["plugin-staples-everywhere", "A plugin staple reaches two different projects, pinned in the Overlay's Lockfile", () => checkPluginStaples(fx)],
+    ["plugin-project-extras", "Extras pin a plugin; a disable removes a plugin staple in that project only", () => checkPluginExtras(fx)],
+    ["plugin-manifest-wins", "An Overlay plugin the Manifest already pins is rejected, naming the entry", () => checkPluginBindingWins(fx)],
+    ["no-overlay-plugins", "`--no-overlay` serves no Overlay plugin", () => checkNoOverlayPlugins(fx)],
   ];
 
   const checks: Check[] = [];

@@ -38,14 +38,27 @@
  * outcome that matters, that the session runs what the Manifest says, is already
  * guaranteed by dropping the value. What must not happen is silence, and does
  * not: every rejection names the key or the Component and the file it came from.
+ *
+ * ## A plugin is a staple like any other
+ *
+ * `[plugins]` carries the same weight here as it does in a Manifest — a plugin
+ * is a very ordinary personal staple, and the whole coordinate is a marketplace
+ * repository, which an Overlay can name as readily as a project can. It is
+ * resolved at Sync, pinned in the Overlay's own Lockfile (ADR 0013), and served
+ * from the Store through the link the Launcher points `--plugin-dir` at. What it
+ * may not do is collide with a Manifest pin: a plugin's name is the prefix every
+ * skill and command it carries answers to, so two pins of one name would be two
+ * sets of Components claiming one namespace, and ADR 0005 decides that the way
+ * it decides everything else.
  */
 
 import { existsSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-import type { LockfileKind } from "./lockfile.ts";
+import { driftOver } from "./lockfile.ts";
+import type { DriftEntry, Lockfile, LockfileKind } from "./lockfile.ts";
 import { ManifestError, parseDeclarations } from "./manifest.ts";
-import type { Declarations, Manifest, SkillEntry } from "./manifest.ts";
+import type { Declarations, Manifest, PluginEntry, SkillEntry } from "./manifest.ts";
 import { McpError, validateMcpServers } from "./mcp.ts";
 import type { McpServerEntry } from "./mcp.ts";
 import { SettingsError, validateSettings } from "./settings.ts";
@@ -81,6 +94,7 @@ export class OverlayError extends Error {
 
 /** A Component that came from the Overlay, and which of its files declared it. */
 export type OverlaySkill = SkillEntry & { origin: string };
+export type OverlayPlugin = PluginEntry & { origin: string };
 export type OverlayMcpServer = McpServerEntry & { origin: string };
 
 export interface OverlayLayer {
@@ -93,6 +107,7 @@ export interface Overlay {
   /** The files that contributed, in precedence order: staples first. */
   layers: OverlayLayer[];
   skills: OverlaySkill[];
+  plugins: OverlayPlugin[];
   settings: Record<string, unknown>;
   mcpServers: OverlayMcpServer[];
   /** Which file set each settings leaf, keyed by its dotted path. */
@@ -105,6 +120,7 @@ export interface Overlay {
 export const NO_OVERLAY: Overlay = {
   layers: [],
   skills: [],
+  plugins: [],
   settings: {},
   mcpServers: [],
   settingsOrigin: new Map(),
@@ -116,6 +132,8 @@ export interface Session {
   manifest: Manifest;
   /** Overlay skills the Manifest did not already claim. Locked separately. */
   overlaySkills: OverlaySkill[];
+  /** Overlay plugins the Manifest did not already pin. Locked separately too. */
+  overlayPlugins: OverlayPlugin[];
   settings: Record<string, unknown>;
   mcpServers: McpServerEntry[];
   /** One line each: an Overlay entry the Manifest locked, or a stray disable. */
@@ -126,6 +144,12 @@ export interface Session {
 export const sessionSkills = (session: Session): SkillEntry[] => [
   ...session.manifest.skills,
   ...session.overlaySkills,
+];
+
+/** Every plugin the session is served, the Manifest's first. */
+export const sessionPlugins = (session: Session): PluginEntry[] => [
+  ...session.manifest.plugins,
+  ...session.overlayPlugins,
 ];
 
 // ---------------------------------------------------------------------------
@@ -160,6 +184,12 @@ export function loadOverlay(root: string, env: Env = process.env): Overlay {
     "skill",
     warnings,
   );
+  const plugins = combine(
+    layers.map((layer) => ({ path: layer.path, entries: layer.declarations.plugins })),
+    extras?.declarations.disabled.plugins ?? [],
+    "plugin",
+    warnings,
+  );
   const mcpServers = combine(
     layers.map((layer) => ({ path: layer.path, entries: layer.declarations.mcpServers })),
     extras?.declarations.disabled.mcpServers ?? [],
@@ -191,6 +221,7 @@ export function loadOverlay(root: string, env: Env = process.env): Overlay {
   return {
     layers: layers.map((layer) => ({ path: layer.path, scope: layer.scope })),
     skills,
+    plugins,
     settings,
     mcpServers,
     settingsOrigin,
@@ -211,12 +242,6 @@ function read(path: string, scope: OverlayLayer["scope"]): Layer | null {
         scope === "extras"
           ? null
           : `disabling a staple is something one project does, so it belongs in that project's ${OVERLAY_FILENAME}`,
-      // A plugin pin resolves through a marketplace catalogue and a Lockfile
-      // table the Overlay does not have yet. Refused by name rather than parsed
-      // and then quietly not loaded.
-      plugins:
-        "cannot be declared in an Overlay yet — pin it in the project's Manifest, where a plugin's " +
-        "marketplace coordinate is resolved and locked",
       // A tool is pinned into the *committed* Lockfile, so a personal staple
       // declaring one would put a version there for the whole team. Refused by
       // name for the same reason: silence would be worse than a message.
@@ -288,6 +313,17 @@ export function composeSession(manifest: Manifest, overlay: Overlay): Session {
     return false;
   });
 
+  // A plugin is the one Component whose name is also a namespace: everything it
+  // carries answers to `<plugin>:<name>`, so two pins of one name would be two
+  // sets of skills claiming the same prefix. ADR 0005 settles it the same way it
+  // settles a skill — the Manifest's stands, and the Overlay's is named.
+  const pinned = new Set(manifest.plugins.map((plugin) => plugin.name));
+  const overlayPlugins = overlay.plugins.filter((plugin) => {
+    if (!pinned.has(plugin.name)) return true;
+    warnings.push(locked(`the plugin \`${plugin.name}\``, manifest, plugin.origin));
+    return false;
+  });
+
   const servers = new Set(manifest.mcpServers.map((server) => server.name));
   const overlayServers = overlay.mcpServers.filter((server) => {
     if (!servers.has(server.name)) return true;
@@ -303,11 +339,27 @@ export function composeSession(manifest: Manifest, overlay: Overlay): Session {
   return {
     manifest,
     overlaySkills,
+    overlayPlugins,
     settings: settings.merged,
     mcpServers: [...manifest.mcpServers, ...overlayServers],
     warnings,
   };
 }
+
+/**
+ * What the Overlay now declares that its Lockfile does not yet pin.
+ *
+ * One table each, exactly as the committed Lockfile is compared — but under the
+ * Overlay's own rules: an entry the file still holds that nothing declares any
+ * more is not drift, because the file is rewritten by every Sync and nothing
+ * downstream reads it (ADR 0013). Only what the Launcher could not serve counts.
+ */
+export const overlayDrift = (session: Session, lock: Lockfile | null): DriftEntry[] => [
+  ...driftOver(session.overlaySkills, lock?.skills ?? [], OVERLAY_DRIFT),
+  ...driftOver(session.overlayPlugins, lock?.plugins ?? [], OVERLAY_DRIFT),
+];
+
+const OVERLAY_DRIFT = { source: "the Overlay", orphans: false } as const;
 
 const locked = (what: string, manifest: Manifest, origin: string): string =>
   `${origin} sets ${what}, which ${manifest.path} already declares. An Overlay adds, it never overrides ` +

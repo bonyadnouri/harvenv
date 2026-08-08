@@ -236,6 +236,15 @@ test("loadManifest rejects a plugin entry that is not a table", () => {
   assert.throws(() => loadManifest(path), ManifestError);
 });
 
+test("loadManifest refuses to disable a plugin, which is only an Overlay's to do", () => {
+  const path = manifestIn(tempDir(), "[plugins]\nsuperpowers = { disable = true }\n");
+
+  assert.throws(
+    () => loadManifest(path),
+    (err: Error) => err instanceof ManifestError && /only an Overlay/.test(err.message),
+  );
+});
+
 test("loadManifest rejects a skill entry that is not a table", () => {
   const path = manifestIn(tempDir(), '[skills]\nexample-skill = "vendor/example-skill"\n');
 

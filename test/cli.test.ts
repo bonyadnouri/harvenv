@@ -1271,6 +1271,134 @@ test("a path Source in the Overlay is not flagged non-portable — the Overlay i
   assert.doesNotMatch(err, /no clone of this project can resolve/);
 });
 
+// ---------------------------------------------------------------------------
+// Plugin staples — issue #29's criteria, at the command line
+// ---------------------------------------------------------------------------
+
+/** The link `--plugin-dir` is pointed at, and what it holds once it is served. */
+const servedPlugin = (root: string, name: string) =>
+  existsSync(join(root, ".claude", "harv-plugins", name, ".claude-plugin", "plugin.json"));
+
+/** Every plugin directory the Launcher was told to serve, in order. */
+const servedDirs = (session: Session, root: string): string[] =>
+  buildLaunchArgs(session, [], {})
+    .filter((arg) => arg.startsWith(join(root, ".claude", "harv-plugins")))
+    .map((arg) => arg.slice(join(root, ".claude", "harv-plugins").length + 1));
+
+test("a plugin staple declared once in the global Overlay is served in two different projects", async () => {
+  const home = tempDir();
+  const marketplace = gitRepo(marketplaceWith("alpha-pack"));
+  staples(home, `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+  const one = project();
+  const two = project();
+
+  await harv(one, { home })(["sync"]);
+  await harv(two, { home })(["sync"]);
+
+  assert.equal(servedPlugin(one, "alpha-pack"), true);
+  assert.equal(servedPlugin(two, "alpha-pack"), true);
+  const { launched } = await harv(one, { home })(["claude"]);
+  assert.deepEqual(servedDirs(launched[0]?.session as Session, one), ["alpha-pack"]);
+});
+
+test("project-local extras add a plugin, and a disable removes a plugin staple, in that project only", async () => {
+  const home = tempDir();
+  const staple = gitRepo(marketplaceWith("staple-pack"));
+  const local = gitRepo(marketplaceWith("extra-pack"));
+  staples(home, `[plugins]\nstaple-pack = { marketplace = "${staple.url}" }\n`);
+  const kept = project();
+  const tweaked = project();
+  extras(
+    tweaked,
+    `[plugins]\nextra-pack = { marketplace = "${local.url}" }\nstaple-pack = { disable = true }\n`,
+  );
+
+  await harv(kept, { home })(["sync"]);
+  await harv(tweaked, { home })(["sync"]);
+
+  assert.equal(servedPlugin(tweaked, "extra-pack"), true, "the extras file's plugin is served here");
+  assert.equal(servedPlugin(tweaked, "staple-pack"), false, "and the disabled staple is not");
+  assert.equal(servedPlugin(kept, "staple-pack"), true, "while the other project still has it");
+  assert.equal(servedPlugin(kept, "extra-pack"), false);
+});
+
+test("an Overlay plugin the Manifest already pins is rejected at sync, naming the entry", async () => {
+  const home = tempDir();
+  const mine = gitRepo(marketplaceWith("alpha-pack", "mine"));
+  const theirs = gitRepo(marketplaceWith("alpha-pack", "theirs"));
+  const root = project(`[plugins]\nalpha-pack = { marketplace = "${theirs.url}" }\n`);
+  staples(home, `[plugins]\nalpha-pack = { marketplace = "${mine.url}" }\n`);
+  const cli = harv(root, { home });
+
+  const { exit, err } = await cli(["sync"]);
+
+  assert.equal(exit, 0, "a personal file may not fail a project's sync");
+  assert.match(err, /warning/i);
+  assert.match(err, /alpha-pack/, "names the entry");
+  assert.match(err, /ADR 0005/, "names the rule");
+
+  const { launched } = await cli(["claude"]);
+  assert.deepEqual(launched[0]?.session.overlayPlugins, []);
+  assert.deepEqual(servedDirs(launched[0]?.session as Session, root), ["alpha-pack"]);
+  assert.match(
+    readFileSync(join(root, "harvenv.lock"), "utf8"),
+    new RegExp(theirs.commit),
+    "the Manifest's marketplace is the one that was fetched",
+  );
+});
+
+test("harv claude --no-overlay serves no plugin the Overlay declared", async () => {
+  const home = tempDir();
+  const marketplace = gitRepo(marketplaceWith("staple-pack"));
+  staples(home, `[plugins]\nstaple-pack = { marketplace = "${marketplace.url}" }\n`);
+  const root = project();
+  const cli = harv(root, { home });
+  await cli(["sync"]);
+
+  const { exit, launched } = await cli(["claude", "--no-overlay"]);
+
+  assert.equal(exit, 0);
+  assert.deepEqual(launched[0]?.session.overlayPlugins, []);
+  assert.deepEqual(servedDirs(launched[0]?.session as Session, root), []);
+  assert.equal(servedPlugin(root, "staple-pack"), false, "and it is gone from project scope too");
+});
+
+test("the Overlay's Lockfile pins a plugin's marketplace commit, as the committed one does", async () => {
+  const home = tempDir();
+  const marketplace = gitRepo(marketplaceWith("staple-pack"));
+  staples(home, `[plugins]\nstaple-pack = { marketplace = "${marketplace.url}" }\n`);
+  const root = project();
+
+  await harv(root, { home })(["sync"]);
+
+  const overlayLock = readFileSync(join(root, ".harv", "overlay.lock"), "utf8");
+  assert.match(overlayLock, /\[\[plugins]]/);
+  assert.match(overlayLock, new RegExp(`commit = "${marketplace.commit}"`));
+  assert.match(overlayLock, /hash = "sha256:[0-9a-f]{64}"/);
+  assert.doesNotMatch(
+    readFileSync(join(root, "harvenv.lock"), "utf8"),
+    /staple-pack/,
+    "and none of it reaches the file the repository hands over",
+  );
+});
+
+test("harv claude reports Overlay plugin drift rather than quietly fetching it", async () => {
+  const home = tempDir();
+  const root = project();
+  const cli = harv(root, { home });
+  await cli(["sync"]);
+
+  const marketplace = gitRepo(marketplaceWith("staple-pack"));
+  staples(home, `[plugins]\nstaple-pack = { marketplace = "${marketplace.url}" }\n`);
+  const { exit, err, launched } = await cli(["claude"]);
+
+  assert.notEqual(exit, 0);
+  assert.match(err, /Overlay/);
+  assert.match(err, /staple-pack/);
+  assert.match(err, /harv sync/);
+  assert.deepEqual(launched, []);
+});
+
 test("harv claude reports Overlay drift rather than quietly fetching it", async () => {
   const home = tempDir();
   const root = project();

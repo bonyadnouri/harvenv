@@ -39,6 +39,7 @@ import { generateMcpConfig } from "./mcp.ts";
 import { generateSettings } from "./settings.ts";
 import { resolveRealClaude } from "./shim.ts";
 import { LAUNCHER_ENV } from "./tripwire.ts";
+import { sessionPlugins } from "./overlay.ts";
 import type { Session } from "./overlay.ts";
 import { pluginDir } from "./materialize.ts";
 
@@ -71,8 +72,10 @@ export function buildLaunchArgs(
     generateMcpConfig(session.mcpServers, env),
     // The link, never the Store entry it points at: a plugin with no
     // `plugin.json` is named after the directory it is served from, and that
-    // directory has to be called what the Manifest calls it.
-    ...session.manifest.plugins.flatMap((plugin) => [
+    // directory has to be called what the Manifest calls it. An Overlay's own
+    // pins are served the same way and from the same directory — by this point
+    // the Manifest has already won every name they contested.
+    ...sessionPlugins(session).flatMap((plugin) => [
       "--plugin-dir",
       pluginDir(session.manifest.root, plugin.name),
     ]),

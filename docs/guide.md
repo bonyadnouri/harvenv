@@ -109,6 +109,9 @@ Inside a harvenv session the machine's user scope does not load ([ADR 0002](./ad
 [skills]
 grill-with-docs = { git = "https://github.com/you/skills.git", subdir = "grill-with-docs" }
 
+[plugins]
+superpowers = { marketplace = "https://github.com/anthropics/claude-plugins-official.git" }
+
 [settings]
 statusLine = { type = "command", command = "~/bin/my-status" }
 ```
@@ -118,11 +121,17 @@ statusLine = { type = "command", command = "~/bin/my-status" }
 [skills]
 scratch          = { path = "vendor/scratch" }   # add one here
 grill-with-docs  = { disable = true }            # or take a staple back out
+
+[plugins]
+gsap-skills      = { marketplace = "https://github.com/you/marketplace.git" }
+superpowers      = { disable = true }
 ```
 
-The extras file wins inside the Overlay: a name it declares replaces the staple of the same name, and `{ disable = true }` removes one for this project and no other. A disable that matches no staple is a warning, not a no-op — it is almost always a name that has moved. `[plugins]` is the one table an Overlay cannot carry yet ([#29](https://github.com/bonyadnouri/harvenv/issues/29)); a plugin pin resolves through a marketplace catalogue the Overlay's Lockfile does not have a table for, so it is refused by name rather than parsed and then quietly not loaded.
+The extras file wins inside the Overlay: a name it declares replaces the staple of the same name, and `{ disable = true }` removes one for this project and no other. A disable that matches no staple is a warning, not a no-op — it is almost always a name that has moved.
 
-**Overlays add, never override.** Everything in the Overlay is unioned on top of the Manifest, and anything the Manifest already declares wins: an Overlay value for a bound settings key, or an Overlay skill or MCP server the Manifest already names, is dropped with a warning naming what was locked and which file tried it. That is ADR 0005 again, enforced in harv's own merge rather than by flag precedence, because `--settings` merges per key and would have resolved the conflict silently ([spike 0001](./spikes/0001-launch-recipe-verification.md), finding 2). The conflict granularity is a leaf: a Manifest binding `permissions.deny` has not bound `permissions.allow`, so an Overlay may still add one.
+`[plugins]` means the same thing here as in a Manifest, and a plugin staple takes the same path a pinned skill does: resolved at `harv sync`, pinned in the Overlay's own Lockfile, served out of the Store through `--plugin-dir`. Everything in the [Plugin pins](#plugin-pins) section applies to it — including that a plugin arrives whole, hooks and all.
+
+**Overlays add, never override.** Everything in the Overlay is unioned on top of the Manifest, and anything the Manifest already declares wins: an Overlay value for a bound settings key, or an Overlay skill, plugin or MCP server the Manifest already names, is dropped with a warning naming what was locked and which file tried it. That is ADR 0005 again, enforced in harv's own merge rather than by flag precedence, because `--settings` merges per key and would have resolved the conflict silently ([spike 0001](./spikes/0001-launch-recipe-verification.md), finding 2). The conflict granularity is a leaf: a Manifest binding `permissions.deny` has not bound `permissions.allow`, so an Overlay may still add one. For a plugin it is the whole pin, because a plugin's name is the prefix everything it carries answers to — two pins of one name would be two sets of skills claiming `superpowers:`.
 
 It is a warning rather than an error because the Overlay is yours and the Manifest may not be — a personal file should not be able to stop you working in someone else's project — and because the outcome that matters is already guaranteed by dropping the value.
 
@@ -155,6 +164,8 @@ One part of "whole" is not delivered: a plugin's own MCP servers do **not** reac
 
 Pinned plugins are linked under `.claude/harv-plugins/<name>` and served with `--plugin-dir`. The link exists because a plugin with no `.claude-plugin/plugin.json` is named after the directory it is served from, and a Store entry is named after a hash — so harv gives it a directory named what the Manifest calls it. `harv init` gitignores that path along with the others.
 
+The same `[plugins]` table works in [your Overlay](#your-overlay), where it means what it means here — the difference is only which Lockfile the pin lands in, and that a Manifest entry of the same name outranks it.
+
 ## The Store
 
 Fetched content lands in `~/.harv/store`, addressed by a hash of the tree itself rather than by the commit it came from ([ADR 0010](./adr/0010-store-addressed-by-content-hash.md)). Tools live beside it in `~/.harv/store/tools`, addressed by version instead — a runtime is not reproducible byte for byte the way a fetched skill is, so hashing one would report a false alarm on every second machine ([ADR 0011](./adr/0011-tools-pinned-by-version-not-content-hash.md)). Two projects declaring the same skill share one copy, and the second one syncs with no network access at all — the Lockfile already says which bytes it needs, and the Store either has them or does not. `HARV_HOME` moves the whole thing, which is what CI and the verification scripts use.
@@ -185,7 +196,7 @@ It reads your user scope, groups what it finds, and asks one question per group 
 What it does decide, because these are not judgements:
 
 - **Sources are derived where they can be.** A skill that came from a repository is declared by its coordinate — repository, subdirectory, and the commit it is on right now — rather than by the path it happens to occupy on your disk. A plugin becomes its `name@marketplace` coordinate, read out of Claude Code's own registry and pinned at the commit you are running. What it cannot derive, it flags rather than guesses.
-- **A plugin can only go to the Manifest.** An Overlay refuses `[plugins]` by name, so the choice is not offered — and the group says why rather than leaving the gap to be discovered.
+- **A plugin is offered both, like everything else.** A plugin pin is as ordinary a personal staple as a skill, and an Overlay resolves and locks one exactly as a Manifest does — so the wizard asks rather than deciding.
 - **A skill that exists only on your machine is flagged**, with the push it needs spelled out ([ADR 0004](./adr/0004-git-native-addressing-no-registry.md)). It is still declarable — by `path`, which `harv sync` then warns about by name on every run — because a migration that refused half your skills is one nobody finishes. Sent to your Overlay instead, it is not flagged at all: nobody clones an Overlay.
 - **A credential is not copied into a committed file.** `~/.claude.json` holds tokens in the clear; a Manifest goes to a git remote. A server definition bound for the Manifest gets `${VAR}` where its token was, and the summary tells you what to export. The same definition sent to your Overlay is left exactly as it was — that file is uncommitted, and rewriting it would break a working server for nothing.
 
@@ -344,13 +355,13 @@ node scripts/verify-shim.ts              # exits non-zero if interception, unins
                                          # pass-through has stopped holding
 ```
 
-The eleventh is the Overlay's: that one staples file reaches two different projects, that a project's extras add a Component and a disable takes a staple out of that project alone, that an Overlay value for a Manifest-bound key is rejected with a warning while the session runs the Manifest's value, and that `--no-overlay` leaves the whole Overlay behind. It reads `init.skills` and `init.model` out of real sessions, and the one thing `init` cannot show — a resolved `statusLine` — out of the payload harv hands over:
+The eleventh is the Overlay's: that one staples file reaches two different projects, that a project's extras add a Component and a disable takes a staple out of that project alone, that an Overlay value for a Manifest-bound key is rejected with a warning while the session runs the Manifest's value, and that `--no-overlay` leaves the whole Overlay behind. It then makes the same four claims about a plugin staple — served in two projects out of one Store entry and pinned at the marketplace commit, added and disabled by a project's extras, outranked by name when a Manifest pins it too, and gone entirely under `--no-overlay`. It reads `init.skills`, `init.plugins` and `init.model` out of real sessions, and the one thing `init` cannot show — a resolved `statusLine` — out of the payload harv hands over. The contested pin is published from two fixture marketplaces whose plugins carry differently named skills, so the session says *which* tree won rather than only that something loaded:
 
 ```
 node scripts/verify-overlay.ts           # needs git and claude
 ```
 
-The twelfth is the import wizard's: that a fixture user scope's skills, plugins and MCP servers are inventoried and grouped, that each group lands where it was sent with the Sources that were derivable, that a Component which exists only on that machine is flagged with the push it needs, and that a second run asks nothing and writes nothing. It then syncs and launches what the wizard declared, because a Manifest that parses and does not resolve would pass every other check. The whole run is repeated through a real pseudo-terminal, since a pipe is not a terminal and the wizard's users are at one:
+The twelfth is the import wizard's: that a fixture user scope's skills, plugins and MCP servers are inventoried and grouped, that each group lands where it was sent with the Sources that were derivable — one plugin to the Manifest and another to the Overlay in the same run, which is what two fixture marketplaces are for — that a Component which exists only on that machine is flagged with the push it needs, and that a second run asks nothing and writes nothing. It then syncs and launches what the wizard declared, because a Manifest that parses and does not resolve would pass every other check. The whole run is repeated through a real pseudo-terminal, since a pipe is not a terminal and the wizard's users are at one:
 
 ```
 node scripts/verify-import.ts            # needs git and python3; needs no claude binary,

@@ -613,8 +613,11 @@ async function checkUserPluginsAbsent(fx: Fixtures, harvSession: InitEvent): Pro
 // ---------------------------------------------------------------------------
 
 function checkDocumented(): Check {
-  const readme = readFileSync(join(REPO_ROOT, "README.md"), "utf8");
-  const section = /##+ .*[Pp]lugin[\s\S]*?(?=\n## |$)/.exec(readme)?.[0] ?? "";
+  // The guide, not the README: the Manifest reference moved there when the
+  // README became a landing page, and a check that keeps reading the old file
+  // reports a caveat as undocumented while it sits one directory away.
+  const guide = readFileSync(join(REPO_ROOT, "docs", "guide.md"), "utf8");
+  const section = /##+ .*[Pp]lugin[\s\S]*?(?=\n## |$)/.exec(guide)?.[0] ?? "";
 
   const says = (pattern: RegExp): boolean => pattern.test(section);
 
