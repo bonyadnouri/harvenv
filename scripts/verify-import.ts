@@ -37,7 +37,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
@@ -50,8 +50,12 @@ const HARV = join(REPO_ROOT, "bin", "harv.ts");
  * running at once deleted each other's fixtures mid-run (issue #22). `mkdtemp`
  * is the whole fix: this script can run beside anything, including a second
  * copy of itself.
+ *
+ * Made when a run starts rather than when this file loads, because the
+ * regression test imports it for the runner alone and should not leave a
+ * fixture tree behind for doing so.
  */
-const FIXTURE_ROOT = mkdtempSync(join(realpathSync(tmpdir()), "harvenv-import-verify-"));
+let FIXTURE_ROOT = "";
 const TIMEOUT_MS = 120_000;
 
 /** In a git repository with a remote, so a coordinate is derivable. */
@@ -77,13 +81,21 @@ const OTHER_SERVER = "not-ours";
 // Running things
 // ---------------------------------------------------------------------------
 
-interface Completed {
+export interface Completed {
   code: number | null;
   stdout: string;
   stderr: string;
+  /**
+   * The child stopped reading before the driver had finished writing.
+   *
+   * Ordinary on its own — a wizard closes stdin once it has asked everything
+   * it is going to ask, and criterion 4 hands it more answers than there are
+   * questions on purpose. It is only news when the child also failed.
+   */
+  stdinClosedEarly: boolean;
 }
 
-function runToCompletion(
+export function runToCompletion(
   command: string,
   args: string[],
   options: { cwd: string; env?: NodeJS.ProcessEnv; stdin?: string },
@@ -99,6 +111,7 @@ function runToCompletion(
     });
     let stdout = "";
     let stderr = "";
+    let stdinClosedEarly = false;
     const timer = setTimeout(() => {
       child.kill("SIGKILL");
       reject(new Error(`\`${command} ${args.join(" ")}\` timed out after ${TIMEOUT_MS}ms`));
@@ -112,18 +125,62 @@ function runToCompletion(
     });
     child.on("exit", (code) => {
       clearTimeout(timer);
-      resolve({ code, stdout, stderr });
+      resolve({ code, stdout, stderr, stdinClosedEarly });
+    });
+
+    // The child decides when it stops reading, and the driver has to survive
+    // that decision. Writing to a pipe whose reader is gone raises EPIPE, and
+    // an EPIPE on a socket with no `error` listener is an unhandled event —
+    // which took a whole CI run down once, from the line below (issue #32).
+    // So a broken pipe is recorded rather than thrown: what the child printed
+    // and the code it exited with are the verdict, not the driver's write.
+    child.stdin.on("error", (err: NodeJS.ErrnoException) => {
+      if (err.code === "EPIPE" || err.code === "ECONNRESET" || err.code === "ERR_STREAM_DESTROYED") {
+        stdinClosedEarly = true;
+        return;
+      }
+      clearTimeout(timer);
+      child.kill("SIGKILL");
+      reject(new Error(`writing to \`${command} ${args.join(" ")}\`'s stdin failed: ${err.message}`));
     });
     child.stdin.end(options.stdin ?? "");
   });
 }
 
+/** Strip the dim/reset sequences, so an assertion — or a diagnostic — is about the words. */
+const plain = (text: string): string => text.replace(/\x1b\[[0-9;]*m/g, "");
+
+/**
+ * What to say about a child that failed before reading what it was given.
+ *
+ * `null` when there is nothing to say. A child that stops reading part-way
+ * through has usually just run out of questions, and only one that stopped
+ * *and* failed is worth raising — at which point the useful thing to print is
+ * what it said on its way out, rather than the broken pipe that followed.
+ */
+export const earlyExit = (label: string, run: Completed): string | null => {
+  if (!run.stdinClosedEarly || run.code === 0) return null;
+  // Indented under the message the way `report` indents a detail, because a
+  // wizard's output is several lines and all of them are the point.
+  const said = (stream: string, text: string): string =>
+    `      ${stream}:\n        ${plain(text).trim().replace(/\n/g, "\n        ") || "(nothing)"}`;
+  return [
+    `${label} exited ${run.code} before reading its answers.`,
+    said("stdout", run.stdout),
+    said("stderr", run.stderr),
+  ].join("\n");
+};
+
 const harv = (args: string[], cwd: string, env: NodeJS.ProcessEnv, stdin?: string) =>
   runToCompletion(process.execPath, [HARV, ...args], { cwd, env, stdin });
 
 /** The wizard, answered from a pipe — one line per question, in order. */
-const importInto = (cwd: string, env: NodeJS.ProcessEnv, answers: string[]) =>
-  harv(["init", "--import"], cwd, env, `${answers.join("\n")}\n`);
+async function importInto(cwd: string, env: NodeJS.ProcessEnv, answers: string[]): Promise<Completed> {
+  const run = await harv(["init", "--import"], cwd, env, `${answers.join("\n")}\n`);
+  const died = earlyExit("`harv init --import`", run);
+  if (died) throw new Error(died);
+  return run;
+}
 
 const GIT_FIXTURE = [
   "-c", "user.name=harvenv verification",
@@ -173,6 +230,7 @@ const skillSource = (name: string) =>
   `---\nname: ${name}\ndescription: Fixture skill for harvenv import verification. Never invoke it.\n---\n\nMarker.\n`;
 
 async function buildFixtures(): Promise<Fixtures> {
+  FIXTURE_ROOT = mkdtempSync(join(realpathSync(tmpdir()), "harvenv-import-verify-"));
   const dir = (...parts: string[]) => {
     const path = join(FIXTURE_ROOT, ...parts);
     mkdirSync(path, { recursive: true });
@@ -365,9 +423,6 @@ interface Check {
 }
 
 const expect = (label: string, ok: Outcome, detail: string): Expectation => ({ label, ok, detail });
-
-/** Strip the dim/reset sequences, so an assertion is about the words. */
-const plain = (text: string): string => text.replace(/\x1b\[[0-9;]*m/g, "");
 
 /**
  * How many entries a declaration file has for a name.
@@ -905,5 +960,13 @@ async function main(): Promise<number> {
   return failures.length === 0 ? 0 : 1;
 }
 
-if (!existsSync(HARV)) throw new Error(`harv entry point not found at ${HARV}`);
-process.exitCode = await main();
+// Importable for `runToCompletion` and `earlyExit`, which the regression test
+// drives directly, and runnable on its own — so the guard has to be exact
+// rather than a filename match.
+const invokedDirectly =
+  process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+
+if (invokedDirectly) {
+  if (!existsSync(HARV)) throw new Error(`harv entry point not found at ${HARV}`);
+  process.exitCode = await main();
+}
