@@ -9,7 +9,7 @@ import { loadManifest } from "../src/manifest.ts";
 import type { Manifest } from "../src/manifest.ts";
 import { hashTree, storePath, toolsRoot } from "../src/store.ts";
 import type { Env } from "../src/store.ts";
-import { composeSession, NO_OVERLAY } from "../src/overlay.ts";
+import { composeSession, loadOverlay, NO_OVERLAY, OVERLAY_LOCKFILE } from "../src/overlay.ts";
 import { plan, readLocks, sync, SyncError, toolPaths } from "../src/sync.ts";
 import type { SyncDeps } from "../src/sync.ts";
 import { ToolchainError } from "../src/tools.ts";
@@ -578,6 +578,110 @@ test("plan tells the user to sync when the Store does not hold a pinned plugin",
     () => plan(solo(manifest), readLocks(manifest.root), env),
     (err: Error) => err instanceof SyncError && /alpha-pack/.test(err.message) && /harv sync/.test(err.message),
   );
+});
+
+// ---------------------------------------------------------------------------
+// Plugin staples — the same three questions, pinned in the Overlay's own file
+// ---------------------------------------------------------------------------
+
+/** A Session whose Overlay is the staples file this test just wrote. */
+function withStaples(manifest: Manifest, env: Env, body: string) {
+  writeFileSync(join(env.HARV_HOME as string, "overlay.toml"), body);
+  return composeSession(manifest, loadOverlay(manifest.root, env));
+}
+
+test("sync pins an Overlay plugin outside the committed Lockfile", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const manifest = project("[settings]\n");
+  const session = withStaples(manifest, env, `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+
+  sync(session, counting(env));
+
+  assert.deepEqual(readLockfile(manifest.root)?.plugins, [], "nothing personal reaches the committed Lockfile");
+  const locked = readLockfile(manifest.root, OVERLAY_LOCKFILE)?.plugins[0];
+  assert.equal(locked?.name, "alpha-pack");
+  assert.equal(locked?.commit, marketplace.commit, "the marketplace's commit, as the committed Lockfile pins it");
+  assert.equal(locked?.hash, hashTree(realpathSync(pluginLink(manifest.root))), "and the plugin's own content hash");
+});
+
+test("sync serves an Overlay plugin through a link named after the plugin", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const manifest = project("[settings]\n");
+  const session = withStaples(manifest, env, `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+
+  const result = sync(session, counting(env));
+
+  assert.deepEqual(result.materialized.plugins, ["alpha-pack"]);
+  const hash = readLockfile(manifest.root, OVERLAY_LOCKFILE)?.plugins[0]?.hash ?? "";
+  assert.equal(readlinkSync(pluginLink(manifest.root)), storePath(hash, env));
+  assert.equal(existsSync(join(pluginLink(manifest.root), ".claude-plugin", "marketplace.json")), false);
+});
+
+test("an Overlay plugin is written to the Overlay's Lockfile even when no staple skill is", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const manifest = project("[settings]\n");
+  const session = withStaples(manifest, env, `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+
+  sync(session, counting(env));
+
+  assert.deepEqual(readLockfile(manifest.root, OVERLAY_LOCKFILE)?.skills, []);
+  assert.equal(readLockfile(manifest.root, OVERLAY_LOCKFILE)?.plugins.length, 1);
+});
+
+test("a second sync serves an Overlay plugin from the Store without reaching the remote", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const manifest = project("[settings]\n");
+  const body = `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`;
+  sync(withStaples(manifest, env, body), counting(env));
+
+  const result = sync(withStaples(manifest, env, body), offline(env));
+
+  assert.deepEqual(result.reused, ["alpha-pack"]);
+});
+
+test("plan resolves an Overlay plugin from the Overlay's Lockfile", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const manifest = project("[settings]\n");
+  const session = withStaples(manifest, env, `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+  sync(session, counting(env));
+
+  const resolved = plan(session, readLocks(manifest.root), env);
+
+  const hash = readLockfile(manifest.root, OVERLAY_LOCKFILE)?.plugins[0]?.hash ?? "";
+  assert.deepEqual(resolved.plugins, [{ name: "alpha-pack", path: storePath(hash, env) }]);
+});
+
+test("sync warns by name about MCP servers an Overlay plugin ships and the recipe suppresses", () => {
+  const env = home();
+  const files = marketplaceWith("alpha-pack", "fixtures");
+  files["plugins/alpha-pack/.mcp.json"] = JSON.stringify({ mcpServers: { docs: { command: "node" } } });
+  const marketplace = gitRepo(files);
+  const manifest = project("[settings]\n");
+  const session = withStaples(manifest, env, `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+
+  const result = sync(session, counting(env));
+
+  assert.equal(result.warnings.length, 1);
+  assert.match(result.warnings[0] ?? "", /alpha-pack/);
+  assert.match(result.warnings[0] ?? "", /docs/);
+});
+
+test("a plugin the Manifest pins is not synced twice when the Overlay pins it too", () => {
+  const env = home();
+  const marketplace = marketplaceRepo();
+  const manifest = project(`[plugins]\nalpha-pack = { marketplace = "${marketplace.url}" }\n`);
+  const session = withStaples(manifest, env, `[plugins]\nalpha-pack = { marketplace = "${marketplace.url}", ref = "main" }\n`);
+
+  const result = sync(session, counting(env));
+
+  assert.deepEqual(result.materialized.plugins, ["alpha-pack"]);
+  assert.deepEqual(readLockfile(manifest.root, OVERLAY_LOCKFILE)?.plugins ?? [], []);
+  assert.match(result.warnings[0] ?? "", /alpha-pack/);
 });
 
 // ---------------------------------------------------------------------------

@@ -434,7 +434,7 @@ function declaredNames(root: string, env: Env): Map<string, Declared> {
   const spoken = new Map<string, Declared>();
 
   const overlay = loadOverlay(root, env);
-  for (const skill of overlay.skills) spoken.set(`component:${skill.name}`, "overlay");
+  for (const entry of [...overlay.skills, ...overlay.plugins]) spoken.set(`component:${entry.name}`, "overlay");
   for (const server of overlay.mcpServers) spoken.set(`mcp:${server.name}`, "overlay");
 
   const manifestPath = join(root, MANIFEST_FILENAME);

@@ -11,7 +11,8 @@
  *      groups them so a person can answer a group at a time.
  *   2. Selections land in the Manifest or the global Overlay as chosen, with
  *      the Sources that were derivable — proved by syncing what it wrote and
- *      launching a session from it.
+ *      launching a session from it. Plugins included: the fixture publishes two
+ *      local marketplaces, so one plugin goes to each file in a single run.
  *   3. A Component that exists only on this machine is flagged, with the push
  *      it needs spelled out (ADR 0004's consequence).
  *   4. Re-running changes nothing: no duplicate entries, no second question.
@@ -64,6 +65,8 @@ const PORTABLE_SKILL = "team-style";
 const LOCAL_SKILL = "house-style";
 /** In a marketplace that is a real repository, so the pin can be synced. */
 const PLUGIN = "fixture-plugin";
+/** In a second real marketplace — so it is its own group, and can go elsewhere. */
+const STAPLE_PLUGIN = "fixture-staple";
 /** From a marketplace named the way Claude Code names GitHub ones. */
 const GITHUB_PLUGIN = "superpowers";
 /** Enabled = false in the user scope. Importing it would reverse a decision. */
@@ -254,28 +257,35 @@ async function buildFixtures(): Promise<Fixtures> {
   await git(["remote", "add", "origin", `file://${skillsRepo}`], skillsRepo);
 
   // A marketplace, as a repository — the other half of ADR 0004's coordinates.
-  const marketplaceRepo = dir("marketplace-repo");
-  await git(["init", "--quiet"], marketplaceRepo);
-  file(
-    join(marketplaceRepo, ".claude-plugin", "marketplace.json"),
-    `${JSON.stringify(
-      {
-        name: "fixture",
-        owner: { name: "harvenv verification" },
-        plugins: [{ name: PLUGIN, source: `./plugins/${PLUGIN}`, description: "Fixture plugin." }],
-      },
-      null,
-      2,
-    )}\n`,
-  );
-  file(
-    join(marketplaceRepo, "plugins", PLUGIN, ".claude-plugin", "plugin.json"),
-    `${JSON.stringify({ name: PLUGIN, version: "1.0.0", description: "Fixture plugin." }, null, 2)}\n`,
-  );
-  file(join(marketplaceRepo, "plugins", PLUGIN, "skills", `${PLUGIN}-skill`, "SKILL.md"), skillSource(`${PLUGIN}-skill`));
-  await git(["add", "--all"], marketplaceRepo);
-  await git(["commit", "--quiet", "--message", "the marketplace"], marketplaceRepo);
-  const marketplaceCommit = await git(["rev-parse", "HEAD"], marketplaceRepo);
+  // Two of them, because a group is a marketplace: one plugin can then be sent
+  // to the Manifest and another to the Overlay in the same run.
+  const buildMarketplace = async (at: string, name: string, plugin: string): Promise<[string, string]> => {
+    const repo = dir(at);
+    await git(["init", "--quiet"], repo);
+    file(
+      join(repo, ".claude-plugin", "marketplace.json"),
+      `${JSON.stringify(
+        {
+          name,
+          owner: { name: "harvenv verification" },
+          plugins: [{ name: plugin, source: `./plugins/${plugin}`, description: "Fixture plugin." }],
+        },
+        null,
+        2,
+      )}\n`,
+    );
+    file(
+      join(repo, "plugins", plugin, ".claude-plugin", "plugin.json"),
+      `${JSON.stringify({ name: plugin, version: "1.0.0", description: "Fixture plugin." }, null, 2)}\n`,
+    );
+    file(join(repo, "plugins", plugin, "skills", `${plugin}-skill`, "SKILL.md"), skillSource(`${plugin}-skill`));
+    await git(["add", "--all"], repo);
+    await git(["commit", "--quiet", "--message", `the ${name} marketplace`], repo);
+    return [repo, await git(["rev-parse", "HEAD"], repo)];
+  };
+
+  const [marketplaceRepo, marketplaceCommit] = await buildMarketplace("marketplace-repo", "fixture", PLUGIN);
+  const [staplesRepo, staplesCommit] = await buildMarketplace("staples-repo", "staples", STAPLE_PLUGIN);
 
   const alpha = dir("alpha");
   const beta = dir("beta");
@@ -294,6 +304,7 @@ async function buildFixtures(): Promise<Fixtures> {
         {
           enabledPlugins: {
             [`${PLUGIN}@fixture`]: true,
+            [`${STAPLE_PLUGIN}@staples`]: true,
             [`${GITHUB_PLUGIN}@official`]: true,
             [`${RETIRED_PLUGIN}@fixture`]: false,
           },
@@ -307,6 +318,7 @@ async function buildFixtures(): Promise<Fixtures> {
       `${JSON.stringify(
         {
           fixture: { source: { source: "git", url: `file://${marketplaceRepo}` } },
+          staples: { source: { source: "git", url: `file://${staplesRepo}` } },
           official: { source: { source: "github", repo: "anthropics/claude-plugins-official" } },
         },
         null,
@@ -320,6 +332,7 @@ async function buildFixtures(): Promise<Fixtures> {
           version: 2,
           plugins: {
             [`${PLUGIN}@fixture`]: [{ scope: "user", version: "1.0.0", gitCommitSha: marketplaceCommit }],
+            [`${STAPLE_PLUGIN}@staples`]: [{ scope: "user", version: "1.0.0", gitCommitSha: staplesCommit }],
             [`${GITHUB_PLUGIN}@official`]: [{ scope: "user", version: "6.2.0", gitCommitSha: "c".repeat(40) }],
           },
         },
@@ -397,6 +410,7 @@ const ALPHA_ANSWERS = [
   "m", // skills from a git repository      -> the Manifest
   "o", // skills that exist only here       -> the Overlay
   "m", // plugins from `fixture`            -> the Manifest
+  "o", // plugins from `staples`            -> the Overlay
   "s", // plugins from `official`           -> skipped (its marketplace is not local)
   "m", // MCP servers, everywhere           -> the Manifest
   "o", // MCP servers, this project         -> the Overlay
@@ -443,7 +457,7 @@ const declaresName = (text: string, name: string): boolean => declarations(text,
 async function checkInventory(fx: Fixtures): Promise<Check> {
   // Every group skipped: this criterion is about what the wizard *offers*, and
   // it must be answerable without writing anything.
-  const run = await importInto(fx.alpha, fx.env, ["s", "s", "s", "s", "s", "s"]);
+  const run = await importInto(fx.alpha, fx.env, ALPHA_ANSWERS.map(() => "s"));
   const out = plain(run.stdout);
   const groups = out.split("\n").filter((line) => /^ {2}\S.*\(\d+\)$/.test(line.replace(/\x1b\[[0-9;]*m/g, "")));
   const offers = (name: string) => new RegExp(`^ {4}${name}\\b`, "m").test(out);
@@ -454,7 +468,11 @@ async function checkInventory(fx: Fixtures): Promise<Check> {
     measurements: { exit: run.code, groups, stdout: out },
     expectations: [
       expect(`the user scope's skills are offered`, offers(PORTABLE_SKILL) && offers(LOCAL_SKILL), `groups: ${groups.join(" | ")}`),
-      expect(`the enabled plugins are offered`, offers(PLUGIN) && offers(GITHUB_PLUGIN), `groups: ${groups.join(" | ")}`),
+      expect(
+        `the enabled plugins are offered`,
+        offers(PLUGIN) && offers(STAPLE_PLUGIN) && offers(GITHUB_PLUGIN),
+        `groups: ${groups.join(" | ")}`,
+      ),
       expect(
         `the MCP servers are offered`,
         offers(GLOBAL_SERVER) && offers(PROJECT_SERVER),
@@ -468,6 +486,7 @@ async function checkInventory(fx: Fixtures): Promise<Check> {
       expect(
         "and separates plugins by marketplace, and global servers from this project's",
         /plugins from the `fixture` marketplace/.test(out) &&
+          /plugins from the `staples` marketplace/.test(out) &&
           /plugins from the `official` marketplace/.test(out) &&
           /MCP servers this machine runs everywhere/.test(out) &&
           /MCP servers this machine runs in this project/.test(out),
@@ -568,9 +587,9 @@ async function checkSelections(fx: Fixtures): Promise<Check> {
         `an Overlay carries an \`[mcp]\` table; this one now does`,
       ),
       expect(
-        `no plugin reached the Overlay, which cannot carry one`,
-        !overlay.includes("[plugins]") && !overlay.includes(PLUGIN),
-        `the wizard never offered the choice, and the file bears that out`,
+        `the plugin sent to the Overlay is in its \`[plugins]\`, and only there`,
+        declaresName(overlay, STAPLE_PLUGIN) && !declaresName(manifest, STAPLE_PLUGIN),
+        `${overlayPath(fx)} declares it as a marketplace coordinate; harvenv.toml does not`,
       ),
       expect(
         `the skipped plugin reached neither file`,
@@ -594,9 +613,13 @@ async function checkSelections(fx: Fixtures): Promise<Check> {
         `.claude/skills/ holds ${[PORTABLE_SKILL, LOCAL_SKILL].filter(linked).join(", ") || "nothing"}`,
       ),
       expect(
-        `the pinned plugin is served from the Store`,
-        existsSync(join(fx.alpha, ".claude", "harv-plugins", PLUGIN)),
-        join(fx.alpha, ".claude", "harv-plugins", PLUGIN),
+        `both plugins are served from the Store — the Manifest's pin and the Overlay's`,
+        existsSync(join(fx.alpha, ".claude", "harv-plugins", PLUGIN)) &&
+          existsSync(join(fx.alpha, ".claude", "harv-plugins", STAPLE_PLUGIN)),
+        `.claude/harv-plugins/ holds ${
+          [PLUGIN, STAPLE_PLUGIN].filter((name) => existsSync(join(fx.alpha, ".claude", "harv-plugins", name))).join(", ") ||
+          "nothing"
+        }`,
       ),
       expect(
         `a session composed from it carries both servers, with the credential resolved at launch`,
@@ -627,7 +650,7 @@ async function checkSelections(fx: Fixtures): Promise<Check> {
 async function checkLocalFlagged(fx: Fixtures): Promise<Check> {
   // `beta` sends the local-only skill to the Manifest — the choice ADR 0004
   // permits and calls non-portable. Everything else is skipped.
-  const run = await importInto(fx.beta, fx.env, ["s", "m", "s", "s", "s"]);
+  const run = await importInto(fx.beta, fx.env, ["s", "m", "s", "s", "s", "s"]);
   const out = plain(run.stdout);
   const synced = await harv(["sync"], fx.beta, fx.env);
 
@@ -732,15 +755,17 @@ async function checkIdempotent(fx: Fixtures): Promise<Check> {
         [PORTABLE_SKILL, PLUGIN, GLOBAL_SERVER].every(
           (name) => declarations(manifestAfter, name) === 1 && declarations(overlayAfter, name) === 0,
         ) &&
-          [LOCAL_SKILL, PROJECT_SERVER].every(
+          [LOCAL_SKILL, STAPLE_PLUGIN, PROJECT_SERVER].every(
             (name) => declarations(overlayAfter, name) === 1 && declarations(manifestAfter, name) === 0,
           ),
         `Manifest: ${[PORTABLE_SKILL, PLUGIN, GLOBAL_SERVER].map((n) => `${n}x${declarations(manifestAfter, n)}`).join(", ")}; ` +
-          `Overlay: ${[LOCAL_SKILL, PROJECT_SERVER].map((n) => `${n}x${declarations(overlayAfter, n)}`).join(", ")}`,
+          `Overlay: ${[LOCAL_SKILL, STAPLE_PLUGIN, PROJECT_SERVER]
+            .map((n) => `${n}x${declarations(overlayAfter, n)}`)
+            .join(", ")}`,
       ),
       expect(
         "and so a declared name cannot be moved into the other file by re-importing",
-        [LOCAL_SKILL, PROJECT_SERVER].every((name) => declarations(manifestAfter, name) === 0),
+        [LOCAL_SKILL, STAPLE_PLUGIN, PROJECT_SERVER].every((name) => declarations(manifestAfter, name) === 0),
         `the Overlay's two were never put on the table again, so there was no answer that could move them`,
       ),
       expect(
@@ -855,8 +880,10 @@ async function checkPseudoTerminal(fx: Fixtures): Promise<Check> {
         manifest.split("\n").filter((line) => /^(team|fixture|\[mcp)/.test(line)).join(" | ") || "(nothing declared)",
       ),
       expect(
-        `the Overlay it wrote holds the two it was told to keep personal`,
-        declarations(overlay, LOCAL_SKILL) === 1 && declarations(overlay, PROJECT_SERVER) === 1,
+        `the Overlay it wrote holds the three it was told to keep personal`,
+        declarations(overlay, LOCAL_SKILL) === 1 &&
+          declarations(overlay, STAPLE_PLUGIN) === 1 &&
+          declarations(overlay, PROJECT_SERVER) === 1,
         `${join(fx.ptyHome, ".harv", "overlay.toml")}: ${overlay.split("\n").filter((l) => /=|\[mcp/.test(l)).join(" | ")}`,
       ),
       expect(

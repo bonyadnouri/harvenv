@@ -5,7 +5,7 @@ import { join } from "node:path";
 
 import { loadManifest } from "../src/manifest.ts";
 import type { Manifest } from "../src/manifest.ts";
-import { composeSession, loadOverlay, OverlayError, sessionSkills } from "../src/overlay.ts";
+import { composeSession, loadOverlay, OverlayError, sessionPlugins, sessionSkills } from "../src/overlay.ts";
 import type { Overlay } from "../src/overlay.ts";
 import type { Env } from "../src/store.ts";
 import { tempDir } from "./helpers.ts";
@@ -334,9 +334,87 @@ test("composing with no Overlay leaves the Manifest exactly as it was", () => {
   assert.deepEqual(names(sessionSkills(session)), ["project-skill"]);
 });
 
-test("a plugin pin in an Overlay is refused by name rather than parsed and then not loaded", () => {
-  const fx = fixture();
-  fx.staples('[plugins]\ngsap-skills = { marketplace = "https://example.com/m.git" }\n');
+// ---------------------------------------------------------------------------
+// Plugin staples — the same rules as a skill, through a marketplace
+// ---------------------------------------------------------------------------
 
-  rejects(fx.overlay, /plugins/, /Manifest/);
+test("the global staples file contributes plugin pins", () => {
+  const fx = fixture();
+  fx.staples('[plugins]\nstaple-pack = { marketplace = "https://example.com/m.git", ref = "v1" }\n');
+
+  const plugins = fx.overlay().plugins;
+
+  assert.deepEqual(names(plugins), ["staple-pack"]);
+  assert.deepEqual(plugins[0]?.source, { kind: "marketplace", repo: "https://example.com/m.git", ref: "v1" });
+});
+
+test("the extras file wins over the staples on the same plugin name", () => {
+  const fx = fixture();
+  fx.staples('[plugins]\nshared-pack = { marketplace = "https://example.com/m.git" }\n');
+  fx.extras('[plugins]\nshared-pack = { marketplace = "https://example.com/m.git", ref = "next" }\n');
+
+  const plugins = fx.overlay().plugins;
+
+  assert.equal(plugins.length, 1);
+  assert.equal(plugins[0]?.source.ref, "next");
+});
+
+test("a disable entry in the extras file removes a plugin staple", () => {
+  const fx = fixture();
+  fx.staples('[plugins]\nstaple-pack = { marketplace = "https://example.com/m.git" }\n');
+  fx.extras("[plugins]\nstaple-pack = { disable = true }\n");
+
+  assert.deepEqual(fx.overlay().plugins, []);
+});
+
+test("a disable entry that matches no plugin staple is reported rather than ignored", () => {
+  const fx = fixture();
+  fx.extras("[plugins]\nnever-pinned = { disable = true }\n");
+
+  const overlay = fx.overlay();
+
+  assert.deepEqual(overlay.plugins, []);
+  assert.equal(overlay.warnings.length, 1);
+  assert.match(overlay.warnings[0] ?? "", /never-pinned/);
+  assert.match(overlay.warnings[0] ?? "", /plugin/);
+});
+
+test("disabling a plugin is refused in the global staples file, as it is for a skill", () => {
+  const fx = fixture();
+  fx.staples("[plugins]\nstaple-pack = { disable = true }\n");
+
+  rejects(fx.overlay, /staple-pack/, /harvenv\.local\.toml/);
+});
+
+test("a plugin staple declaring a git Source is refused the way a Manifest's is", () => {
+  const fx = fixture();
+  fx.staples('[plugins]\nstaple-pack = { git = "https://example.com/m.git" }\n');
+
+  rejects(fx.overlay, /staple-pack/, /marketplace/);
+});
+
+test("Overlay plugins join the Manifest's rather than replacing them", () => {
+  const fx = fixture();
+  const manifest = fx.manifest('[plugins]\nproject-pack = { marketplace = "https://example.com/project.git" }\n');
+  fx.staples('[plugins]\nstaple-pack = { marketplace = "https://example.com/mine.git" }\n');
+
+  const session = composeSession(manifest, fx.overlay());
+
+  assert.deepEqual(names(sessionPlugins(session)), ["project-pack", "staple-pack"]);
+  assert.deepEqual(session.warnings, []);
+});
+
+test("an Overlay plugin the Manifest already pins is rejected, and the warning names it", () => {
+  const fx = fixture();
+  const manifest = fx.manifest('[plugins]\nshared-pack = { marketplace = "https://example.com/project.git" }\n');
+  fx.staples('[plugins]\nshared-pack = { marketplace = "https://example.com/mine.git" }\n');
+
+  const session = composeSession(manifest, fx.overlay());
+
+  assert.deepEqual(session.overlayPlugins, [], "the Manifest's marketplace is the one that stands");
+  assert.deepEqual(names(sessionPlugins(session)), ["shared-pack"]);
+  assert.equal(sessionPlugins(session)[0]?.source.repo, "https://example.com/project.git");
+  assert.match(session.warnings[0] ?? "", /shared-pack/);
+  assert.match(session.warnings[0] ?? "", /ADR 0005/);
+  assert.match(session.warnings[0] ?? "", /overlay\.toml/, "names the file to edit");
 });

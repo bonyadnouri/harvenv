@@ -403,6 +403,47 @@ test("an Overlay staple the Store does not hold is a problem too", async () => {
   assert.match(said(report, "components"), /Overlay skill `staple`/);
 });
 
+test("an Overlay plugin the Store does not hold is a problem too", async () => {
+  const fixture = project();
+  writeFileSync(
+    join(fixture.manifest.root, "harvenv.local.toml"),
+    '[plugins]\nstaple-pack = { marketplace = "https://example.invalid/m.git" }\n',
+  );
+  writeLockfile(
+    fixture.manifest.root,
+    [],
+    [
+      {
+        name: "staple-pack",
+        source: { kind: "marketplace", repo: "https://example.invalid/m.git" },
+        commit: COMMIT,
+        hash: `sha256:${"d".repeat(64)}`,
+      },
+    ],
+    [],
+    OVERLAY_LOCKFILE,
+  );
+
+  const report = await run(fixture);
+
+  assert.equal(statusOf(report, "components"), "problem");
+  assert.match(said(report, "components"), /Overlay plugin `staple-pack`/);
+});
+
+test("an Overlay plugin nothing has locked yet is reported as Overlay drift", async () => {
+  const fixture = project();
+  writeFileSync(
+    join(fixture.manifest.root, "harvenv.local.toml"),
+    '[plugins]\nstaple-pack = { marketplace = "https://example.invalid/m.git" }\n',
+  );
+
+  const report = await run(fixture);
+
+  assert.equal(statusOf(report, "drift"), "problem");
+  assert.match(said(report, "drift"), /staple-pack/);
+  assert.match(said(report, "drift"), /the Overlay/);
+});
+
 test("--no-overlay leaves the Overlay's Components out of the diagnosis", async () => {
   const fixture = project();
   writeFileSync(

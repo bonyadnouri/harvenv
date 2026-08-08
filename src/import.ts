@@ -14,11 +14,11 @@
  * personal and is not (ADR 0002). Which of the two an item belongs in is a
  * judgement only its owner can make — `superpowers` is a team decision, a
  * statusline skill is not — so the wizard's job is to *ask* well rather than to
- * classify. What it does decide, because these are not judgements:
+ * classify. Every kind of item is offered both, plugins included: a plugin pin
+ * is as ordinary a personal staple as a skill, and an Overlay resolves and locks
+ * one exactly as a Manifest does (ADR 0013). What the wizard does decide,
+ * because these are not judgements:
  *
- *   - A plugin can only go to the Manifest. An Overlay refuses `[plugins]` by
- *     name (ADR 0013's Lockfile has no table for one), so offering the choice
- *     would be offering a write that cannot be read back.
  *   - A local-only skill routed to the Manifest is flagged, with the push it
  *     needs spelled out. ADR 0004 allows a `path` Source and calls it
  *     non-portable; this is the moment somebody can still do something about it.
@@ -128,11 +128,6 @@ export async function runImport(deps: ImportDeps): Promise<ImportResult> {
 
     const caveat = items.find((item) => item.local !== null)?.local;
     if (caveat !== undefined) deps.say(`    ${DIM}note: ${caveat}${RESET}`);
-    // Stated where the choice is made rather than in a summary nobody reaches:
-    // "why can I not put this in my Overlay" is the question being answered.
-    if (items[0]?.kind === "plugin") {
-      deps.say(`    ${DIM}note: an Overlay cannot carry a plugin pin, so these go to the Manifest or nowhere.${RESET}`);
-    }
 
     for (const [item, destination] of await choose(items, deps)) {
       if (destination === "skip") result.skipped.push(item);
@@ -168,13 +163,12 @@ const ANSWERS: Record<string, Destination | "choose"> = {
  * project. `c` is there for when the group really does need splitting.
  */
 async function choose(items: InventoryItem[], deps: ImportDeps): Promise<Array<[InventoryItem, Destination]>> {
-  const overlayable = items[0]?.kind !== "plugin";
-  const answer = await question(`  Where do these go?`, overlayable, true, deps);
+  const answer = await question(`  Where do these go?`, true, deps);
 
   if (answer !== "choose") return items.map((item) => [item, answer]);
   const chosen: Array<[InventoryItem, Destination]> = [];
   for (const item of items) {
-    chosen.push([item, (await question(`    ${item.name}`, overlayable, false, deps)) as Destination]);
+    chosen.push([item, (await question(`    ${item.name}`, false, deps)) as Destination]);
   }
   return chosen;
 }
@@ -187,15 +181,10 @@ async function choose(items: InventoryItem[], deps: ImportDeps): Promise<Array<[
  * nothing". Anything else unrecognised is asked again — a typo'd `mm` is
  * somebody meaning `m`, and guessing on their behalf writes to a committed file.
  */
-async function question(
-  prefix: string,
-  overlayable: boolean,
-  offerChoose: boolean,
-  deps: ImportDeps,
-): Promise<Destination | "choose"> {
+async function question(prefix: string, offerChoose: boolean, deps: ImportDeps): Promise<Destination | "choose"> {
   const options = [
     "[m]anifest (committed, the team baseline)",
-    ...(overlayable ? ["[o]verlay (personal, every project)"] : []),
+    "[o]verlay (personal, every project)",
     "[s]kip",
     ...(offerChoose ? ["[c]hoose one by one"] : []),
   ];
@@ -207,9 +196,7 @@ async function question(
     if (raw === "") return "skip";
 
     const answer = ANSWERS[raw];
-    const usable =
-      answer !== undefined && !(answer === "overlay" && !overlayable) && !(answer === "choose" && !offerChoose);
-    if (usable) return answer;
+    if (answer !== undefined && !(answer === "choose" && !offerChoose)) return answer;
 
     // Echoed back, because the question is about to be repeated verbatim and a
     // wizard that reprints itself without saying why reads as a broken prompt.

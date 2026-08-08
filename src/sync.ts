@@ -24,11 +24,11 @@
  * commit — so the Store ends up holding the plugin rather than the catalogue it
  * was listed in, and the hash covers exactly the tree a session will load.
  *
- * The Overlay's skills go through the same three questions and land in the same
- * Store — a personal staple is fetched, hashed and deduplicated exactly like a
- * project's own Component. What differs is where it is pinned: into an
- * uncommitted Lockfile of its own, because the resolution of somebody's staples
- * is not part of what the repository hands over (ADR 0013).
+ * The Overlay's Components — its skills and its plugin pins alike — go through
+ * the same questions and land in the same Store: a personal staple is fetched,
+ * hashed and deduplicated exactly like a project's own. What differs is where it
+ * is pinned: into an uncommitted Lockfile of its own, because the resolution of
+ * somebody's staples is not part of what the repository hands over (ADR 0013).
  */
 
 import { existsSync, rmSync } from "node:fs";
@@ -84,8 +84,8 @@ export function sync(session: Session, deps: Partial<SyncDeps> = {}): SyncResult
   const { env, resolveCommit, fetchSource } = withDefaults(deps);
   const { manifest } = session;
   const lock = readLockfile(manifest.root);
+  const overlayLock = readLockfile(manifest.root, OVERLAY_LOCKFILE);
   const drift = driftAgainst(manifest, lock);
-  const lockedPlugins = new Map((lock?.plugins ?? []).map((entry) => [entry.name, entry]));
 
   const result: SyncResult = {
     fetched: [],
@@ -139,57 +139,68 @@ export function sync(session: Session, deps: Partial<SyncDeps> = {}): SyncResult
     return { entries, resolved };
   };
 
+  const resolvePlugins = (declared: PluginEntry[], from: Lockfile | null) => {
+    const locked = new Map((from?.plugins ?? []).map((entry) => [entry.name, entry]));
+    const entries: LockedPlugin[] = [];
+    const resolved: Resolved[] = [];
+
+    for (const plugin of declared) {
+      const pin = pinFor(plugin.source, locked.get(plugin.name));
+      const marketplace = repositoryOf(plugin.source);
+
+      let path: string;
+      let commit: string;
+      let hash: string;
+
+      // A plugin pin has both halves or neither, so the Store can answer for it
+      // without a remote: the Lockfile already says which bytes are wanted.
+      if (pin.commit !== undefined && pin.hash !== undefined && isStored(pin.hash, env)) {
+        commit = pin.commit;
+        hash = pin.hash;
+        path = storePath(hash, env);
+        result.reused.push(plugin.name);
+      } else {
+        commit = pin.commit ?? resolveCommit(marketplace);
+        const fetched = fetchSource(marketplace, commit, env);
+        // The catalogue is read out of the fetched commit, not out of the
+        // coordinate: where a plugin sits is the marketplace's to state, and
+        // stating it at a commit is what keeps the answer the same everywhere.
+        const root = located(plugin, fetched.staged);
+
+        // The Store holds the plugin, not the marketplace that published it. A
+        // session loads one directory, ADR 0010 addresses exactly the tree a
+        // session loads, and pinning one plugin should not store a catalogue of
+        // the hundreds it was listed beside.
+        hash = hashTree(root);
+        if (pin.hash !== undefined && pin.hash !== hash) {
+          rmSync(fetched.staged, { recursive: true, force: true });
+          throw new SyncError(mismatch(`Plugin \`${plugin.name}\``, plugin.source, commit, pin.hash, hash));
+        }
+        path = insert(root, hash, env);
+        rmSync(fetched.staged, { recursive: true, force: true });
+        result.fetched.push(plugin.name);
+      }
+
+      entries.push({ name: plugin.name, source: plugin.source, commit, hash });
+      resolved.push({ name: plugin.name, path });
+
+      // Said for a staple as loudly as for a Manifest pin: the gap is a property
+      // of the launch recipe, not of which file declared the plugin.
+      const servers = declaredMcpServers(path);
+      if (servers.length > 0) result.warnings.push(unservedMcp(plugin.name, servers));
+    }
+    return { entries, resolved };
+  };
+
   const own = resolveSkills(manifest.skills, lock, true);
-  const overlay = resolveSkills(session.overlaySkills, readLockfile(manifest.root, OVERLAY_LOCKFILE), false);
+  const overlay = resolveSkills(session.overlaySkills, overlayLock, false);
   const entries = own.entries;
   const resolved = [...own.resolved, ...overlay.resolved];
 
-  const pinned: LockedPlugin[] = [];
-  const plugins: Resolved[] = [];
+  const pinned = resolvePlugins(manifest.plugins, lock);
+  const overlayPinned = resolvePlugins(session.overlayPlugins, overlayLock);
+  const plugins = [...pinned.resolved, ...overlayPinned.resolved];
 
-  for (const plugin of manifest.plugins) {
-    const pin = pinFor(plugin.source, lockedPlugins.get(plugin.name));
-    const marketplace = repositoryOf(plugin.source);
-
-    let path: string;
-    let commit: string;
-    let hash: string;
-
-    // A plugin pin has both halves or neither, so the Store can answer for it
-    // without a remote: the Lockfile already says which bytes are wanted.
-    if (pin.commit !== undefined && pin.hash !== undefined && isStored(pin.hash, env)) {
-      commit = pin.commit;
-      hash = pin.hash;
-      path = storePath(hash, env);
-      result.reused.push(plugin.name);
-    } else {
-      commit = pin.commit ?? resolveCommit(marketplace);
-      const fetched = fetchSource(marketplace, commit, env);
-      // The catalogue is read out of the fetched commit, not out of the
-      // coordinate: where a plugin sits is the marketplace's to state, and
-      // stating it at a commit is what keeps the answer the same everywhere.
-      const root = located(plugin, fetched.staged);
-
-      // The Store holds the plugin, not the marketplace that published it. A
-      // session loads one directory, ADR 0010 addresses exactly the tree a
-      // session loads, and pinning one plugin should not store a catalogue of
-      // the hundreds it was listed beside.
-      hash = hashTree(root);
-      if (pin.hash !== undefined && pin.hash !== hash) {
-        rmSync(fetched.staged, { recursive: true, force: true });
-        throw new SyncError(mismatch(`Plugin \`${plugin.name}\``, plugin.source, commit, pin.hash, hash));
-      }
-      path = insert(root, hash, env);
-      rmSync(fetched.staged, { recursive: true, force: true });
-      result.fetched.push(plugin.name);
-    }
-
-    pinned.push({ name: plugin.name, source: plugin.source, commit, hash });
-    plugins.push({ name: plugin.name, path });
-
-    const servers = declaredMcpServers(path);
-    if (servers.length > 0) result.warnings.push(unservedMcp(plugin.name, servers));
-  }
   // Read before anything is written into the project tree. A `requires`
   // declaration travels inside a skill, so this cannot happen until the skills
   // are fetched (ADR 0006) — but it needs the fetched directories, not the
@@ -214,9 +225,12 @@ export function sync(session: Session, deps: Partial<SyncDeps> = {}): SyncResult
   );
   result.warnings.push(...result.toolchain.warnings);
 
-  writeLockfile(manifest.root, entries, pinned, result.toolchain.tools);
-  if (overlay.entries.length > 0) writeLockfile(manifest.root, overlay.entries, [], [], OVERLAY_LOCKFILE);
-  else removeLockfile(manifest.root, OVERLAY_LOCKFILE);
+  writeLockfile(manifest.root, entries, pinned.entries, result.toolchain.tools);
+  if (overlay.entries.length > 0 || overlayPinned.entries.length > 0) {
+    writeLockfile(manifest.root, overlay.entries, overlayPinned.entries, [], OVERLAY_LOCKFILE);
+  } else {
+    removeLockfile(manifest.root, OVERLAY_LOCKFILE);
+  }
   return result;
 }
 
@@ -277,7 +291,6 @@ const mismatch = (
  */
 export function plan(session: Session, locks: Locks, env: Env = process.env): MaterializePlan {
   const { manifest } = session;
-  const lockedPlugins = new Map((locks.manifest?.plugins ?? []).map((entry) => [entry.name, entry]));
 
   const locate = (skills: SkillEntry[], lock: Lockfile | null): Resolved[] => {
     const locked = new Map((lock?.skills ?? []).map((entry) => [entry.name, entry]));
@@ -287,13 +300,21 @@ export function plan(session: Session, locks: Locks, env: Env = process.env): Ma
     });
   };
 
+  const locatePlugins = (plugins: PluginEntry[], lock: Lockfile | null): Resolved[] => {
+    const locked = new Map((lock?.plugins ?? []).map((entry) => [entry.name, entry]));
+    return plugins.map((plugin) => ({
+      name: plugin.name,
+      path: fromStore(`Plugin \`${plugin.name}\``, locked.get(plugin.name)?.hash, env),
+    }));
+  };
+
   return {
     root: manifest.root,
     skills: [...locate(manifest.skills, locks.manifest), ...locate(session.overlaySkills, locks.overlay)],
-    plugins: manifest.plugins.map((plugin) => ({
-      name: plugin.name,
-      path: fromStore(`Plugin \`${plugin.name}\``, lockedPlugins.get(plugin.name)?.hash, env),
-    })),
+    plugins: [
+      ...locatePlugins(manifest.plugins, locks.manifest),
+      ...locatePlugins(session.overlayPlugins, locks.overlay),
+    ],
   };
 }
 

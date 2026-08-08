@@ -21,7 +21,7 @@ import { readFileSync, writeFileSync } from "node:fs";
 import { AddError, entryLine, parseCoordinate, tableFor, validateName, withEntry } from "./add.ts";
 import { diagnose } from "./doctor.ts";
 import type { Finding, Report } from "./doctor.ts";
-import { driftAgainst, driftOver, LOCKFILE_FILENAME, LockfileError, toolDrift } from "./lockfile.ts";
+import { driftAgainst, LOCKFILE_FILENAME, LockfileError, toolDrift } from "./lockfile.ts";
 import type { DriftEntry } from "./lockfile.ts";
 import { findManifest, loadManifest, ManifestError, MANIFEST_FILENAME } from "./manifest.ts";
 import type { Manifest, MarketplaceSource, Source } from "./manifest.ts";
@@ -32,6 +32,7 @@ import {
   composeSession,
   loadOverlay,
   NO_OVERLAY,
+  overlayDrift,
   OVERLAY_FILENAME,
   OVERLAY_LOCKFILE,
   OverlayError,
@@ -337,11 +338,7 @@ async function claude(args: string[], deps: CliDeps): Promise<number> {
   // nothing declares any more is not drift — only what cannot be served is.
   const drift = [
     driftReport(driftAgainst(session.manifest, locks.manifest), "the Manifest", LOCKFILE_FILENAME),
-    driftReport(
-      driftOver(session.overlaySkills, locks.overlay?.skills ?? [], { source: "the Overlay", orphans: false }),
-      "the Overlay",
-      OVERLAY_LOCKFILE.filename,
-    ),
+    driftReport(overlayDrift(session, locks.overlay), "the Overlay", OVERLAY_LOCKFILE.filename),
   ].filter((report) => report !== null);
 
   if (drift.length > 0) {

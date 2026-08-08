@@ -95,6 +95,9 @@ Hermetic doesn't mean spartan. Declare your staples once, globally, and they joi
 # ~/.harv/overlay.toml — yours, in every project
 [skills]
 grill-with-docs = { git = "https://github.com/you/skills.git", subdir = "grill-with-docs" }
+
+[plugins]
+superpowers = { marketplace = "https://github.com/anthropics/claude-plugins-official.git" }
 ```
 
 Overlays **add, never override**: anything the manifest declares wins, with a warning. A gitignored `harvenv.local.toml` tunes single projects. Details in the [guide](./docs/guide.md#your-overlay).
@@ -116,7 +119,7 @@ Overlays **add, never override**: anything the manifest declares wins, with a wa
 
 ## Status
 
-v0.1.x — skills, plugin pins, tools, settings, MCP, overlay, doctor, shim, and CI all work end to end and are exercised on every push. Still ahead: standalone subagents and slash commands as first-class manifest entries, and plugin pins in overlays ([#29](https://github.com/bonyadnouri/harvenv/issues/29)). Issues are welcome — so are PRs; start with [Hacking on it](./docs/guide.md#hacking-on-it).
+v0.1.x — skills, plugin pins (in manifests and overlays alike), tools, settings, MCP, overlay, doctor, shim, and CI all work end to end and are exercised on every push. Still ahead: standalone subagents and slash commands as first-class manifest entries. Issues are welcome — so are PRs; start with [Hacking on it](./docs/guide.md#hacking-on-it).
 
 ## License
 

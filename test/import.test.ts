@@ -252,14 +252,36 @@ test("a plugin is declared in `[plugins]` by its marketplace coordinate", async 
   assert.deepEqual(manifest.skills, [], "a plugin is not a skill");
 });
 
-test("a plugin is never offered the Overlay, which cannot carry a plugin pin", async () => {
+test("a plugin is offered the Overlay like anything else, and lands in the staples file", async () => {
   const m = machine({ skills: [] });
   withPlugin(m.home);
 
-  const { asked, said } = await wizard(m, ["s"]);
+  const { asked } = await wizard(m, ["o"]);
 
-  assert.doesNotMatch(asked[0] ?? "", /\[o\]|overlay/i);
-  assert.match(said, /overlay/i, "and it says why, rather than leaving the gap unexplained");
+  assert.match(asked[0] ?? "", /\[o\]verlay/);
+  assert.deepEqual(loadOverlay(m.root, m.env).plugins, [
+    {
+      name: "superpowers",
+      source: {
+        kind: "marketplace",
+        repo: "https://github.com/anthropics/claude-plugins-official.git",
+        ref: "b".repeat(40),
+      },
+      origin: globalOverlayPath(m.env),
+    },
+  ]);
+  assert.deepEqual(manifestOf(m).plugins, [], "and nothing personal reaches the committed file");
+});
+
+test("a plugin the Overlay already pins is not offered a second time", async () => {
+  const m = machine({ skills: [] });
+  withPlugin(m.home);
+  await wizard(m, ["o"]);
+
+  const { asked, alreadyDeclared } = await wizard(m, []);
+
+  assert.deepEqual(asked, [], "a second run over an imported machine asks nothing");
+  assert.deepEqual(alreadyDeclared.map((item) => [item.name, item.declared]), [["superpowers", "overlay"]]);
 });
 
 test("an MCP server routed to the Manifest becomes an [mcp] section harv can read back", async () => {

@@ -182,7 +182,7 @@ export interface Declarations {
   /** The MCP servers, injected via `--mcp-config` at launch. */
   mcpServers: McpServerEntry[];
   /** Names this file removes rather than declares. Only an Overlay may. */
-  disabled: { skills: string[]; mcpServers: string[] };
+  disabled: { skills: string[]; plugins: string[]; mcpServers: string[] };
 }
 
 export interface DeclarationOptions {
@@ -194,13 +194,6 @@ export interface DeclarationOptions {
    * would have belonged — this reader knows the shape, not the policy.
    */
   disable: string | null;
-  /**
-   * Why `[plugins]` may not appear in this file, or null if it may. An Overlay
-   * cannot carry one yet: a plugin pin goes through a marketplace catalogue and
-   * a Lockfile table this slice did not extend, and a table that parsed and then
-   * loaded nothing would be exactly the silence harv exists to remove.
-   */
-  plugins: string | null;
   /**
    * Why `[tools]` may not appear in this file, or null if it may. An Overlay
    * cannot carry one: a tool is pinned into the committed Lockfile, and a
@@ -241,7 +234,6 @@ export function loadManifest(manifestPath: string): Manifest {
     root,
     disable:
       "a Manifest declares what a project's Harvenv contains, and only an Overlay can take something back out",
-    plugins: null,
     tools: null,
   });
   return { path: manifestPath, root, ...declarations };
@@ -255,22 +247,20 @@ export function loadManifest(manifestPath: string): Manifest {
 export function parseDeclarations(path: string, options: DeclarationOptions): Declarations {
   const raw = readTable(path);
   const skills = parseSkills(raw.skills, path, options);
+  const plugins = parsePlugins(raw.plugins, path, options);
   const mcpServers = parseMcpServers(raw.mcp, path, options);
 
-  if (options.plugins !== null && raw.plugins !== undefined) {
-    throw new ManifestError(`[plugins] in ${path} ${options.plugins}.`);
-  }
   if (options.tools !== null && raw.tools !== undefined) {
     throw new ManifestError(`[tools] in ${path} ${options.tools}.`);
   }
 
   return {
     skills: skills.declared,
-    plugins: parsePlugins(raw.plugins, path),
+    plugins: plugins.declared,
     tools: parseTools(raw.tools, path),
     settings: asTable(raw.settings, "settings", path) ?? {},
     mcpServers: mcpServers.declared,
-    disabled: { skills: skills.disabled, mcpServers: mcpServers.disabled },
+    disabled: { skills: skills.disabled, plugins: plugins.disabled, mcpServers: mcpServers.disabled },
   };
 }
 
@@ -386,11 +376,17 @@ function parseSkills(
  * here to select skills, hooks or servers out of it, and the Manifest reference
  * says so.
  */
-function parsePlugins(value: unknown, manifestPath: string): PluginEntry[] {
+function parsePlugins(
+  value: unknown,
+  manifestPath: string,
+  options: DeclarationOptions,
+): { declared: PluginEntry[]; disabled: string[] } {
   const plugins = asTable(value, "plugins", manifestPath);
-  if (!plugins) return [];
+  const declared: PluginEntry[] = [];
+  const disabled: string[] = [];
+  if (!plugins) return { declared, disabled };
 
-  return Object.entries(plugins).map(([name, entry]) => {
+  for (const [name, entry] of Object.entries(plugins)) {
     const where = `[plugins] entry \`${name}\` in ${manifestPath}`;
     if (!isComponentName(name)) {
       throw new ManifestError(
@@ -402,6 +398,10 @@ function parsePlugins(value: unknown, manifestPath: string): PluginEntry[] {
       throw new ManifestError(
         `${where} must be a table, e.g. ${name} = { marketplace = "https://example.com/marketplace.git" }`,
       );
+    }
+    if (isDisabled(entry, where, options)) {
+      disabled.push(name);
+      continue;
     }
 
     const misplaced = Object.keys(MISPLACED_PLUGIN_KEYS).find((key) => key in entry);
@@ -422,8 +422,9 @@ function parsePlugins(value: unknown, manifestPath: string): PluginEntry[] {
       repo: requireString(entry.marketplace, "marketplace", where, pluginExample(name)),
     };
     if ("ref" in entry) source.ref = requireString(entry.ref, "ref", where, pluginExample(name));
-    return { name, source };
-  });
+    declared.push({ name, source });
+  }
+  return { declared, disabled };
 }
 
 function parseSource(

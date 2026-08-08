@@ -39,13 +39,13 @@
 import { accessSync, constants, existsSync, readFileSync } from "node:fs";
 import { delimiter, join } from "node:path";
 
-import { driftAgainst, driftOver, LOCKFILE_FILENAME, LockfileError, readLockfile, toolDrift } from "./lockfile.ts";
+import { driftAgainst, LOCKFILE_FILENAME, LockfileError, readLockfile, toolDrift } from "./lockfile.ts";
 import type { DriftEntry, Lockfile } from "./lockfile.ts";
 import type { Manifest } from "./manifest.ts";
 import { generateMcpConfig, McpError } from "./mcp.ts";
 import type { McpServerEntry } from "./mcp.ts";
 import { hasBins, resolveBinPath } from "./mise.ts";
-import { composeSession, loadOverlay, NO_OVERLAY, OVERLAY_LOCKFILE, OverlayError } from "./overlay.ts";
+import { composeSession, loadOverlay, NO_OVERLAY, overlayDrift, OVERLAY_LOCKFILE, OverlayError } from "./overlay.ts";
 import type { Session } from "./overlay.ts";
 import { currentPlatform } from "./platform.ts";
 import { claudeCodeVersion, smokeTest, VERIFIED_CLAUDE_CODE } from "./recipe.ts";
@@ -395,7 +395,7 @@ function checkDrift(
 
   const entries: DriftEntry[] = [
     ...driftAgainst(manifest, locks.manifest),
-    ...driftOver(session.overlaySkills, locks.overlay?.skills ?? [], { source: "the Overlay", orphans: false }),
+    ...overlayDrift(session, locks.overlay),
   ];
 
   // The Toolchain's half needs the fetched skills, because a `requires:` line
@@ -509,9 +509,18 @@ function checkComponents(
     for (const skill of session.overlaySkills) {
       locate("Overlay skill", skill.name, staples.get(skill.name)?.hash, localPath(skill));
     }
+
+    const stapledPlugins = new Map((locks.overlay?.plugins ?? []).map((entry) => [entry.name, entry]));
+    for (const plugin of session.overlayPlugins) {
+      locate("Overlay plugin", plugin.name, stapledPlugins.get(plugin.name)?.hash, undefined);
+    }
   }
 
-  const declared = manifest.skills.length + manifest.plugins.length + session.overlaySkills.length;
+  const declared =
+    manifest.skills.length +
+    manifest.plugins.length +
+    session.overlaySkills.length +
+    session.overlayPlugins.length;
   return {
     resolved,
     check: check(

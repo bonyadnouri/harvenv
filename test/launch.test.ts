@@ -130,6 +130,31 @@ test("buildLaunchArgs points --plugin-dir at the named link, never at the Store"
   assert.equal(served.startsWith(session.manifest.root), true);
 });
 
+test("buildLaunchArgs serves an Overlay's plugin staple too, after the Manifest's own", () => {
+  const session = sessionWith(
+    { plugins: pinned("alpha-pack") },
+    {
+      ...NO_OVERLAY,
+      plugins: [
+        {
+          name: "staple-pack",
+          source: { kind: "marketplace", repo: "https://example.com/mine.git" },
+          origin: "/home/dev/.harv/overlay.toml",
+        },
+      ],
+    },
+  );
+
+  const args = buildLaunchArgs(session, [], {});
+
+  assert.deepEqual(args.slice(args.indexOf("--plugin-dir")), [
+    "--plugin-dir",
+    join(session.manifest.root, ".claude", "harv-plugins", "alpha-pack"),
+    "--plugin-dir",
+    join(session.manifest.root, ".claude", "harv-plugins", "staple-pack"),
+  ]);
+});
+
 test("passthrough arguments still come last, after every --plugin-dir", () => {
   const session = sessionWith({ plugins: pinned("alpha-pack") });
 
