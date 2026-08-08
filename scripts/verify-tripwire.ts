@@ -35,7 +35,7 @@
 
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -47,8 +47,19 @@ import { hasTripwire, LAUNCHER_ENV, TRIPWIRE_WARNING } from "../src/tripwire.ts"
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const HARV = join(REPO_ROOT, "bin", "harv.ts");
 
-/** Stable, so repeated runs reuse one entry under `~/.claude/projects`. */
-const FIXTURE_ROOT = join(realpathSync(tmpdir()), "harvenv-tripwire-verify");
+/**
+ * Salted per process, and cleaned up on the way out.
+ *
+ * Every verifier used to build at one fixed path, which is why two of them
+ * running at once deleted each other's fixtures mid-run (issue #22). `mkdtemp`
+ * is the whole fix: this script can run beside anything, including a second
+ * copy of itself.
+ *
+ * The cost is a fresh `~/.claude/projects` entry per run rather than one
+ * reused forever — the cheaper of the two, since Claude Code ages its own
+ * history out and a wiped fixture tree fails a run that was never wrong.
+ */
+const FIXTURE_ROOT = mkdtempSync(join(realpathSync(tmpdir()), "harvenv-tripwire-verify-"));
 
 const PROBE_TIMEOUT_MS = 180_000;
 /** Grace after `init` for hook events still in flight, before the session is killed. */
@@ -202,7 +213,6 @@ const PRIOR_SETTINGS = {
 const PRIOR_GITIGNORE = "node_modules/\ndist/\n";
 
 function buildFixtures(): Fixtures {
-  rmSync(FIXTURE_ROOT, { recursive: true, force: true });
   const dir = (...parts: string[]) => {
     const p = join(FIXTURE_ROOT, ...parts);
     mkdirSync(p, { recursive: true });
@@ -507,13 +517,14 @@ async function main(): Promise<number> {
     }
   }
 
-  if (!keep) rmSync(FIXTURE_ROOT, { recursive: true, force: true });
+  if (keep) log(`\n${DIM}fixtures kept at ${FIXTURE_ROOT}${RESET}`);
+  else rmSync(FIXTURE_ROOT, { recursive: true, force: true });
 
   const version = (checks.find((c) => c.measurements.claudeCodeVersion)?.measurements as { claudeCodeVersion?: string })?.claudeCodeVersion ?? "unknown";
   const failures = checks.filter(failed);
 
   if (asJson) {
-    console.log(JSON.stringify({ claudeCodeVersion: version, ok: failures.length === 0, checks }, null, 2));
+    console.log(JSON.stringify({ claudeCodeVersion: version, ok: failures.length === 0, fixtures: keep ? FIXTURE_ROOT : null, checks }, null, 2));
   } else {
     report(checks);
     console.log(
