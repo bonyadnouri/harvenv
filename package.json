@@ -3,6 +3,21 @@
   "version": "0.0.0",
   "private": true,
   "description": "Harness virtual environments for Claude Code",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bonyadnouri/harvenv.git"
+  },
+  "keywords": [
+    "claude-code",
+    "claude",
+    "ai-agents",
+    "skills",
+    "mcp",
+    "virtual-environment",
+    "reproducible",
+    "cli"
+  ],
   "type": "module",
   "bin": {
     "harv": "./bin/harv.ts"
