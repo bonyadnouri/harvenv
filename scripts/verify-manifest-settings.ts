@@ -37,7 +37,7 @@
 
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { existsSync, mkdirSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -45,7 +45,15 @@ import { fileURLToPath } from "node:url";
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const HARV = join(REPO_ROOT, "bin", "harv.ts");
 
-const FIXTURE_ROOT = join(realpathSync(tmpdir()), "harvenv-settings-verify");
+/**
+ * Salted per process, and cleaned up on the way out.
+ *
+ * Every verifier used to build at one fixed path, which is why two of them
+ * running at once deleted each other's fixtures mid-run (issue #22). `mkdtemp`
+ * is the whole fix: this script can run beside anything, including a second
+ * copy of itself.
+ */
+const FIXTURE_ROOT = mkdtempSync(join(realpathSync(tmpdir()), "harvenv-settings-verify-"));
 const PROBE_TIMEOUT_MS = 180_000;
 
 /** Pins the Manifest declares, and the session has to be seen honouring. */
@@ -223,7 +231,6 @@ createInterface({ input: process.stdin }).on("line", (line) => {
 `;
 
 function buildFixtures(): Fixtures {
-  rmSync(FIXTURE_ROOT, { recursive: true, force: true });
   const dir = (...parts: string[]) => {
     const p = join(FIXTURE_ROOT, ...parts);
     mkdirSync(p, { recursive: true });
@@ -624,13 +631,14 @@ async function main(): Promise<number> {
     }
   }
 
-  if (!keep) rmSync(FIXTURE_ROOT, { recursive: true, force: true });
+  if (keep) log(`\n${DIM}fixtures kept at ${FIXTURE_ROOT}${RESET}`);
+  else rmSync(FIXTURE_ROOT, { recursive: true, force: true });
 
   const version = (checks[0]?.measurements as { claudeCodeVersion?: string })?.claudeCodeVersion ?? "unknown";
   const failures = checks.filter(failed);
 
   if (asJson) {
-    console.log(JSON.stringify({ claudeCodeVersion: version, ok: failures.length === 0, checks }, null, 2));
+    console.log(JSON.stringify({ claudeCodeVersion: version, ok: failures.length === 0, fixtures: keep ? FIXTURE_ROOT : null, checks }, null, 2));
   } else {
     report(checks);
     console.log(

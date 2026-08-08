@@ -38,6 +38,7 @@ import {
   chmodSync,
   existsSync,
   mkdirSync,
+  mkdtempSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -51,7 +52,16 @@ import { fileURLToPath } from "node:url";
 
 const REPO_ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
 const HARV = join(REPO_ROOT, "bin", "harv.ts");
-const FIXTURE_ROOT = join(realpathSync(tmpdir()), "harvenv-toolchain-verify");
+
+/**
+ * Salted per process, and cleaned up on the way out.
+ *
+ * Every verifier used to build at one fixed path, which is why two of them
+ * running at once deleted each other's fixtures mid-run (issue #22). `mkdtemp`
+ * is the whole fix: this script can run beside anything, including a second
+ * copy of itself.
+ */
+const FIXTURE_ROOT = mkdtempSync(join(realpathSync(tmpdir()), "harvenv-toolchain-verify-"));
 
 /**
  * The engine comes from harv's own pin — `vendor/mise.lock.json` — rather than
@@ -208,7 +218,6 @@ interface Fixtures {
 }
 
 function buildFixtures(): Fixtures {
-  rmSync(FIXTURE_ROOT, { recursive: true, force: true });
   const dir = (...parts: string[]): string => {
     const path = join(FIXTURE_ROOT, ...parts);
     mkdirSync(path, { recursive: true });
@@ -766,11 +775,12 @@ async function main(): Promise<number> {
     }
   }
 
-  if (!keep) rmSync(FIXTURE_ROOT, { recursive: true, force: true });
+  if (keep) log(`\n${DIM}fixtures kept at ${FIXTURE_ROOT}${RESET}`);
+  else rmSync(FIXTURE_ROOT, { recursive: true, force: true });
 
   const failures = checks.filter(failed);
   if (asJson) {
-    console.log(JSON.stringify({ ok: failures.length === 0, checks }, null, 2));
+    console.log(JSON.stringify({ ok: failures.length === 0, fixtures: keep ? FIXTURE_ROOT : null, checks }, null, 2));
   } else {
     report(checks);
     console.log(

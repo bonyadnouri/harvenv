@@ -387,7 +387,7 @@ The last is Doctor's own: that a healthy synced project reports every check gree
 node scripts/verify-doctor.ts            # needs git; brings its own claude, so needs no credentials
 ```
 
-All thirteen take `--json` and `--keep` (to leave the fixture tree on disk). `harv doctor` does not shell out to them — a released harv is one file, with no repository around it — so it carries a two-probe short form of the launch-recipe check inside the binary, and these stay the full-width version: 13 probes for the recipe alone, including the questions that decided ADR 0008. None of them touch your Store, your Overlay, your `~/.claude`, your shell's startup files, or your own mise setup. The unit tests are separate and need no `claude` binary and no install engine:
+All thirteen take `--json` and `--keep` (to leave the fixture tree on disk, and say where it left it). Each builds that tree at a path salted per process, so any of them can run beside any other — or beside a second copy of itself — without deleting fixtures out from under a run in progress. `harv doctor` does not shell out to them — a released harv is one file, with no repository around it — so it carries a two-probe short form of the launch-recipe check inside the binary, and these stay the full-width version: 13 probes for the recipe alone, including the questions that decided ADR 0008. None of them touch your Store, your Overlay, your `~/.claude`, your shell's startup files, or your own mise setup. The unit tests are separate and need no `claude` binary and no install engine:
 
 ```
 npm test

@@ -481,13 +481,14 @@ async function main(argv: string[]): Promise<number> {
     }
   }
 
-  if (!keep) rmSync(scratch, { recursive: true, force: true });
+  if (keep) log(`\n${DIM}scratch kept at ${scratch}${RESET}`);
+  else rmSync(scratch, { recursive: true, force: true });
 
   const failures = checks.filter(failed);
   const skipped = checks.filter((c) => !failed(c) && c.expectations.some((e) => e.ok === null));
 
   if (asJson) {
-    console.log(JSON.stringify({ platform, installable, stable, ok: failures.length === 0, checks }, null, 2));
+    console.log(JSON.stringify({ platform, installable, stable, ok: failures.length === 0, fixtures: keep ? scratch : null, checks }, null, 2));
   } else {
     report(checks);
     console.log(

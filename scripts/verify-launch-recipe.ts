@@ -581,13 +581,14 @@ async function main(): Promise<number> {
     }
   }
 
-  if (!keep) rmSync(fx.root, { recursive: true, force: true });
+  if (keep) log(`\n${DIM}fixtures kept at ${fx.root}${RESET}`);
+  else rmSync(fx.root, { recursive: true, force: true });
 
   const version = (checks[0]?.measurements as { claudeCodeVersion?: string })?.claudeCodeVersion ?? "unknown";
   const failures = checks.filter(failed);
 
   if (asJson) {
-    console.log(JSON.stringify({ claudeCodeVersion: version, ok: failures.length === 0, checks }, null, 2));
+    console.log(JSON.stringify({ claudeCodeVersion: version, ok: failures.length === 0, fixtures: keep ? fx.root : null, checks }, null, 2));
   } else {
     report(checks);
     console.log(
